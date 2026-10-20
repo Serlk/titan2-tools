@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PS1='titan2-initramfs:\w\$ '
+export TERM=${TERM:-vt100}
+# an interactive session disarms the automatic reboot (/etc/t2/monitor)
+: >/run/t2-session 2>/dev/null
+cat /etc/motd 2>/dev/null

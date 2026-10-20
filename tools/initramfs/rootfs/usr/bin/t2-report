@@ -1,0 +1,96 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Summary of the kernel state on the phone in a single SSH call:
+#   ssh root@172.16.42.1 t2-report >t2-report.txt
+#   ssh root@172.16.42.1 t2-report --scan --input 15 >t2-report.txt
+# Writes to stdout and a copy to /tmp/t2-report.txt.
+#   --scan       also i2cdetect -y -r on every bus (reads a byte at every address;
+#                off by default: the buses carry PMIC neighbours, the display bias, the charger)
+#   --input N    record events from all /dev/input/event* for N seconds (evtest);
+#                press keys, touch the screen and the touchpad meanwhile
+#   --clk        also /sys/kernel/debug/clk/clk_summary. Off by default:
+#                the summary reads the registers of all clock controllers, and on the 4th boot
+#                this hung the bus (WDT reboot). Enable only on a kernel
+#                where controllers outside always-on domains are off or have power-domains.
+SCAN=
+INPUT=0
+CLK=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--scan) SCAN=1 ;;
+	--clk) CLK=1 ;;
+	--input) INPUT=$2; shift ;;
+	*) echo "usage: t2-report [--scan] [--clk] [--input SECONDS]" >&2; exit 2 ;;
+	esac
+	shift
+done
+OUT=/tmp/t2-report.txt
+D=/sys/kernel/debug
+mountpoint -q $D 2>/dev/null || mount -t debugfs debugfs $D 2>/dev/null
+
+sec() { printf '\n######## %s\n' "$*"; }
+run() { sec "$*"; sh -c "$*" 2>&1; }
+cat_if() { for f in "$@"; do [ -e "$f" ] && { sec "$f"; cat "$f" 2>&1; }; done; }
+
+report() {
+	run 'uname -a; cat /proc/uptime'
+	cat_if /proc/cmdline /proc/bootconfig
+	run 'dmesg'
+	cat_if /proc/interrupts /proc/iomem
+	cat_if $D/devices_deferred
+	cat_if $D/regulator/regulator_summary $D/pm_genpd/pm_genpd_summary
+	run 'for r in /sys/class/regulator/regulator.*; do
+		[ -e "$r/name" ] || continue
+		echo "$(basename $r) $(cat $r/name) state=$(cat $r/state 2>/dev/null) uV=$(cat $r/microvolts 2>/dev/null) users=$(cat $r/num_users 2>/dev/null)"
+	done'
+
+	sec 'i2c: adapters and clients'
+	for a in /sys/bus/i2c/devices/i2c-*; do
+		[ -e "$a" ] || continue
+		echo "$(basename $a): $(cat $a/name 2>/dev/null) <- $(basename "$(readlink -f $a/..)")"
+	done
+	for c in /sys/bus/i2c/devices/*-*; do
+		[ -e "$c/name" ] || continue
+		drv=-
+		[ -e "$c/driver" ] && drv=$(basename "$(readlink -f $c/driver)")
+		echo "$(basename $c): name=$(cat $c/name) driver=$drv of=$(cat $c/of_node/name 2>/dev/null)"
+	done
+	if [ -n "$SCAN" ]; then
+		for a in /dev/i2c-*; do
+			[ -e "$a" ] || continue
+			run "i2cdetect -y -r ${a#/dev/i2c-}"
+		done
+	fi
+
+	cat_if /proc/bus/input/devices
+	run 'for e in /sys/class/input/event*; do
+		[ -e "$e" ] || continue
+		echo "$(basename $e): $(cat $e/device/name) phys=$(cat $e/device/phys 2>/dev/null) key=$(cat $e/device/capabilities/key 2>/dev/null) abs=$(cat $e/device/capabilities/abs 2>/dev/null)"
+	done'
+	cat_if $D/gpio $D/pinctrl/*/pinmux-pins
+	run 'ls /sys/bus/platform/drivers/*/ 2>/dev/null | head -400'
+	run 'ls -l /sys/bus/spmi/devices/ 2>/dev/null; ls /sys/class/rtc 2>/dev/null'
+	cat_if /sys/fs/pstore/*
+
+	if [ "$INPUT" -gt 0 ] 2>/dev/null; then
+		sec "evtest, $INPUT s (press keys, touch the screen and the touchpad)"
+		for e in /dev/input/event*; do
+			[ -e "$e" ] || continue
+			timeout "$INPUT" evtest "$e" >/tmp/evtest.${e##*/} 2>&1 &
+		done
+		wait
+		for f in /tmp/evtest.event*; do
+			[ -e "$f" ] || continue
+			sec "$f"
+			# header (capabilities) in full, events: the first 400 lines
+			head -n 600 "$f"
+		done
+	fi
+	# at the very end: if it hangs, everything else has already been captured
+	[ -n "$CLK" ] && cat_if $D/clk/clk_summary
+	sec 'end'
+}
+
+report 2>&1 | tee $OUT
+echo "t2-report: copy in $OUT" >&2

@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# First-boot safety net (respawned from inittab):
+#   - every 2 s: read-only on new block devices (in case a uevent was missed);
+#   - if by T2_REBOOT_AFTER seconds of uptime (default 600 = 10 min) there has been no
+#     SSH session (a dropbear child process) and no login on ttyGS0, reboot:
+#     the phone goes back to LK, and once slot B runs out of attempts the bootloader falls back to A.
+#     Disable: t2.noreboot on the cmdline or t2-noreboot (/run/t2-noreboot).
+#     Timeout from t2.reboot_after=<seconds>.
+. /etc/t2/lib.sh
+
+limit=$(t2_cmdline reboot_after) || limit=600
+t2_cmdline noreboot >/dev/null && : >/run/t2-noreboot
+
+have_session() {
+	local p name pp
+	[ -e /run/t2-session ] && return 0
+	# the main dropbear is a direct child of init (exec from /etc/t2/dropbear), each
+	# connection is a dropbear child process of it
+	for p in /proc/[0-9]*; do
+		name= pp=
+		while read -r k v; do
+			case "$k" in
+			Name:) name=$v ;;
+			PPid:) pp=$v; break ;;
+			esac
+		done 2>/dev/null <"$p/status"
+		[ "$name" = dropbear ] && [ -n "$pp" ] && [ "$pp" != 1 ] && return 0
+	done
+	return 1
+}
+
+warned=
+while :; do
+	t2_ro_sweep
+	if [ ! -e /run/t2-armed-off ]; then
+		if [ -e /run/t2-noreboot ]; then
+			t2_log "monitor: auto reboot disabled"
+			: >/run/t2-armed-off
+		elif have_session; then
+			: >/run/t2-session
+			t2_log "monitor: session seen, auto reboot disarmed"
+			: >/run/t2-armed-off
+		else
+			up=$(cut -d. -f1 /proc/uptime)
+			if [ -z "$warned" ] && [ "$limit" -gt 120 ] && [ "$up" -ge $((limit - 60)) ]; then
+				t2_screen "titan2: no SSH/serial session yet, rebooting at ${limit}s uptime"
+				warned=1
+			fi
+			if [ "$up" -ge "$limit" ]; then
+				t2_screen "titan2: no session within ${limit}s, rebooting"
+				sync
+				sleep 2
+				reboot -f
+			fi
+		fi
+	fi
+	sleep 2
+done

@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# getty on ttyGS0 (ACM), respawned from inittab; waits until the gadget creates the tty.
+while [ ! -c /dev/ttyGS0 ]; do sleep 1; done
+exec /sbin/getty -n -l /etc/t2/serial-login 115200 ttyGS0 vt100

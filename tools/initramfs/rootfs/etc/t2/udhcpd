@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# DHCP for the PC on the NCM interface: hands out exactly 172.16.42.2, no gateway and no DNS
+# (the PC's default route is left alone). Respawned from inittab.
+while [ ! -s /run/t2-usb-if ]; do sleep 1; done
+ifname=$(cat /run/t2-usb-if)
+cat >/run/udhcpd.conf <<CONF
+interface $ifname
+start 172.16.42.2
+end 172.16.42.2
+max_leases 1
+lease_file /run/udhcpd.leases
+option subnet 255.255.255.0
+option lease 3600
+CONF
+: >/run/udhcpd.leases
+exec /bin/busybox-extras udhcpd -f /run/udhcpd.conf

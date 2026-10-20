@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Login over USB serial (physical cable): root shell after Enter. Pressing Enter
+# counts as a session and disarms the automatic reboot (/etc/t2/monitor).
+echo
+echo "Titan 2 mainline initramfs (ttyGS0). Press Enter for a root shell."
+read -r _
+: >/run/t2-session
+echo "<5>titan2-initramfs: serial: session on ttyGS0" >/dev/kmsg
+exec /bin/sh -l

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# busybox init for the Titan 2 initramfs (/init -> /bin/busybox)
+::sysinit:/etc/t2/rc.init
+::respawn:/etc/t2/monitor
+::respawn:/etc/t2/dropbear
+::respawn:/etc/t2/udhcpd
+::respawn:/etc/t2/serial-getty
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/sync

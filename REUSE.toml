@@ -1,0 +1,11 @@
+version = 1
+
+[[annotations]]
+path = ["tools/initramfs/rootfs/etc/passwd", "tools/initramfs/rootfs/etc/group", "tools/initramfs/rootfs/etc/shells", "tools/initramfs/rootfs/etc/hostname", "tools/initramfs/rootfs/etc/motd", "REUSE.toml", ".gitignore"]
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = "tools/initramfs/keys/*.pub"
+SPDX-FileCopyrightText = "Alpine Linux (alpine-keys)"
+SPDX-License-Identifier = "MIT"

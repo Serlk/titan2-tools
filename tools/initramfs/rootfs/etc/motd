@@ -1,0 +1,7 @@
+Titan 2 mainline initramfs. Nothing here is persistent; all block devices are read-only.
+  dmesg | grep -e titan2 -e mtu3 -e tphy    kernel log
+  t2-noreboot                               cancel the automatic reboot (10 min without sessions)
+  reboot                                    reboot (back to LK / slot rollback)
+  t2-report [--scan] [--input 15]           everything at once: dmesg, irq, regulators, clocks, domains, i2c, input
+                                            (from a PC: ssh root@172.16.42.1 t2-report >t2-report.txt)
+  evtest /dev/input/eventN, i2cdetect -l, i2cget -y BUS ADDR REG

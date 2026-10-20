@@ -1,0 +1,7 @@
+/out/
+/linux/
+/toolchains/
+/tools/mkbootimg/
+/tools/mini-init/init
+/tools/devmem/devmem
+__pycache__/

@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# sysinit for busybox init (/init -> busybox). Mounts pseudo filesystems only; block
+# devices are never mounted (see /etc/t2/lib.sh).
+/bin/busybox mount -t proc -o nosuid,nodev,noexec proc /proc
+# applet links; existing files (the /bin/mount wrapper) are not replaced
+/bin/busybox --install -s 2>/dev/null
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+mount -t devtmpfs -o nosuid,mode=0755 devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts -o gid=5,mode=620,ptmxmode=666 devpts /dev/pts
+mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
+mount -t configfs configfs /sys/kernel/config
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+
+. /etc/t2/lib.sh
+# markers in /dev/kmsg must not be lost to rate limiting (10 lines / 5 s)
+echo on >/proc/sys/kernel/printk_devkmsg 2>/dev/null
+
+t2_log "init: userspace up ($(cut -d' ' -f1 /proc/uptime)s)"
+
+# Read-only on all block devices: first new devices (hotplug), then the existing ones.
+[ -w /proc/sys/kernel/hotplug ] && echo /sbin/t2-hotplug >/proc/sys/kernel/hotplug ||
+	t2_log "init: no uevent helper, read-only only by polling"
+t2_ro_sweep
+
+hostname -F /etc/hostname
+ip link set lo up
+
+# Stubs for dropbear (we do not need utmp via utmpd)
+mkdir -p /run/dropbear /var/log /var/run /var/lib/udhcpd
+: >/var/log/lastlog
+
+# The USB gadget is set up in the background: it waits for the UDC and does not delay getty/dropbear
+/etc/t2/usb-gadget </dev/null >/dev/null 2>&1 &
+
+t2_screen "titan2: mainline initramfs up, USB gadget starting (serial $(t2_serial))"
+exit 0

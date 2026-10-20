@@ -1,0 +1,100 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# configfs gadget: NCM (network 172.16.42.1/24, as in postmarketOS) + ACM (ttyGS0).
+# UDC: t2.udc=<name> from the cmdline, otherwise the first non-dummy one (dummy_hcd is built in only for qemu).
+# No UDC for 30 s: message on the screen; keep waiting, /etc/t2/monitor decides about the reboot.
+. /etc/t2/lib.sh
+
+G=/sys/kernel/config/usb_gadget/t2
+ADDR=172.16.42.1
+
+pick_udc() {
+	local want u
+	want=$(t2_cmdline udc) || want=
+	for u in /sys/class/udc/*; do
+		[ -e "$u" ] || continue
+		u=${u##*/}
+		if [ -n "$want" ]; then
+			[ "$u" = "$want" ] && { echo "$u"; return 0; }
+		else
+			case "$u" in dummy_udc*) continue ;; esac
+			echo "$u"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# MAC from the serial: locally administered, stable across boots
+mac_of() {
+	local h
+	h=$(echo "$1-$2" | md5sum | cut -c1-10)
+	echo "02:$(echo "$h" | sed 's/\(..\)/\1:/g; s/:$//')"
+}
+
+t=0
+until udc=$(pick_udc); do
+	if [ "$t" = 30 ]; then
+		t2_screen "titan2: NO USB device controller (UDC) after 30 s: no USB console."
+		t2_screen "titan2: $(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')- see dmesg (mtu3/tphy)."
+		lim=$(t2_cmdline reboot_after) || lim=600
+		t2_cmdline noreboot >/dev/null ||
+			t2_screen "titan2: without an SSH/serial session the phone reboots at ${lim}s uptime."
+	fi
+	t=$((t + 1))
+	sleep 1
+done
+t2_log "usb: UDC $udc after ${t}s"
+
+serial=$(t2_serial)
+mkdir -p $G || { t2_screen "titan2: no configfs usb_gadget"; exit 1; }
+cd $G || exit 1
+echo 0x1d6b >idVendor	# Linux Foundation
+echo 0x0104 >idProduct	# Multifunction Composite Gadget
+echo 0x0100 >bcdDevice
+echo 0x0200 >bcdUSB
+# composite device with IAD (ACM): required by Windows
+echo 0xef >bDeviceClass
+echo 0x02 >bDeviceSubClass
+echo 0x01 >bDeviceProtocol
+mkdir -p strings/0x409
+echo Unihertz >strings/0x409/manufacturer
+echo "Titan 2 (mainline initramfs)" >strings/0x409/product
+echo "$serial" >strings/0x409/serialnumber
+
+mkdir -p configs/c.1/strings/0x409
+echo "NCM + ACM" >configs/c.1/strings/0x409/configuration
+echo 100 >configs/c.1/MaxPower
+
+funcs=
+if mkdir functions/ncm.usb0 2>/dev/null; then
+	mac_of "$serial" host >functions/ncm.usb0/host_addr
+	mac_of "$serial" dev >functions/ncm.usb0/dev_addr
+	ln -s functions/ncm.usb0 configs/c.1/
+	funcs="$funcs ncm"
+else
+	t2_log "usb: no NCM function"
+fi
+if mkdir functions/acm.GS0 2>/dev/null; then
+	ln -s functions/acm.GS0 configs/c.1/
+	funcs="$funcs acm"
+else
+	t2_log "usb: no ACM function"
+fi
+
+if ! echo "$udc" >UDC; then
+	t2_screen "titan2: binding the gadget to $udc failed"
+	exit 1
+fi
+t2_log "usb: gadget bound to $udc:$funcs"
+
+if [ -e functions/ncm.usb0/ifname ]; then
+	ifname=$(cat functions/ncm.usb0/ifname)
+	ip addr add $ADDR/24 dev "$ifname"
+	ip link set "$ifname" up
+	echo "$ifname" >/run/t2-usb-if
+	t2_log "usb: $ifname $ADDR/24"
+fi
+
+t2_screen "titan2: USB gadget on $udc:$funcs. On the PC: ssh root@$ADDR, or the ACM tty (serial $serial)"

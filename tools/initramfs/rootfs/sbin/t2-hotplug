@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# uevent helper (/proc/sys/kernel/hotplug): every new block device (UFS disk,
+# partition) becomes read-only right away, so the initramfs cannot write to partitions.
+[ "$SUBSYSTEM" = block ] && [ "$ACTION" = add ] && [ -n "$DEVNAME" ] || exit 0
+/bin/busybox blockdev --setro "/dev/$DEVNAME" 2>/dev/null &&
+	[ "$DEVTYPE" = disk ] &&
+	echo "<5>titan2-initramfs: read-only: /dev/$DEVNAME and its partitions (hotplug)" >/dev/kmsg
+exit 0

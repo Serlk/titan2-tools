@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# SSH on port 22 (respawned from inittab). Host keys are generated on the first connection
+# (-R, in tmpfs: they change on every boot). If /root/.ssh/authorized_keys exists,
+# login is key-only (-s); otherwise root has an empty password (-B), ONLY for this initramfs.
+. /etc/t2/lib.sh
+mkdir -p /etc/dropbear
+if [ -s /root/.ssh/authorized_keys ]; then
+	auth=-s
+else
+	auth=-B
+	t2_log "ssh: no authorized_keys, root with an EMPTY password"
+fi
+exec /usr/sbin/dropbear -F -E -R -P /run/dropbear.pid -p 22 $auth

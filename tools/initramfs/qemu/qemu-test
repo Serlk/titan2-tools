@@ -1,0 +1,95 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# initramfs test in qemu (virt + dummy_hcd): qemu only, never ends up on the phone.
+# The gadget host side (cdc_ncm, cdc-acm) is in the same kernel; its network is moved to a separate
+# netns so that SSH and DHCP go over USB and not over lo.
+. /etc/t2/lib.sh
+ok() { echo "T2TEST PASS: $*"; }
+bad() { echo "T2TEST FAIL: $*"; FAIL=1; }
+FAIL=
+exec >/dev/console 2>&1
+for m in mii usbnet cdc_ether cdc_ncm cdc-acm; do insmod /lib/t2-test/$m.ko || bad "insmod $m"; done
+
+i=0; while [ ! -s /run/t2-usb-if ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+[ -s /run/t2-usb-if ] && ok "gadget up: $(cat /sys/kernel/config/usb_gadget/t2/UDC) $(cat /run/t2-usb-if) $(ip -4 addr show dev $(cat /run/t2-usb-if) | grep -o 'inet [0-9./]*')" || bad "no gadget interface"
+ls /sys/kernel/config/usb_gadget/t2/configs/c.1/
+
+hif=
+i=0
+while [ -z "$hif" ] && [ $i -lt 20 ]; do
+	for n in /sys/class/net/*; do
+		[ "$(basename "$(readlink $n/device/driver 2>/dev/null)")" = cdc_ncm ] && hif=${n##*/}
+	done
+	sleep 1; i=$((i+1))
+done
+[ -n "$hif" ] && ok "host side cdc_ncm: $hif ($(cat /sys/class/net/$hif/address))" || bad "no host cdc_ncm netdev"
+for d in /sys/bus/usb/devices/*; do [ -e $d/idVendor ] && echo "usb: $(cat $d/idVendor):$(cat $d/idProduct) $(cat $d/product 2>/dev/null) serial=$(cat $d/serial 2>/dev/null)"; done
+
+# host side into a separate netns (kept alive by sleep)
+unshare -n sleep 600 &
+NSPID=$!
+sleep 1
+if ip link set dev "$hif" netns $NSPID; then
+	ok "host netdev moved to netns $NSPID"
+else
+	bad "ip link set netns"
+fi
+NS="nsenter -n -t $NSPID"
+$NS ip link set lo up
+$NS ip link set "$hif" up
+cat >/tmp/udhcpc.sh <<'S'
+#!/bin/sh
+[ "$1" = bound ] && ip addr add $ip/${mask:-24} dev $interface && echo "lease $ip"
+exit 0
+S
+chmod +x /tmp/udhcpc.sh
+if $NS udhcpc -i "$hif" -n -q -t 10 -T 1 -s /tmp/udhcpc.sh; then
+	ok "DHCP over NCM: $($NS ip -4 addr show dev $hif | grep -o 'inet [0-9./]*')"
+else
+	bad "DHCP over NCM"
+fi
+$NS ping -c 2 -W 2 172.16.42.1 >/dev/null && ok "ping 172.16.42.1 over NCM" || bad "ping over NCM"
+
+mkdir -p /root/.ssh
+if [ -s /root/.ssh/authorized_keys ]; then
+	/lib/t2-test/dropbearconvert openssh dropbear /lib/t2-test/id_test /tmp/id_db >/dev/null 2>&1 || bad "dropbearconvert"
+	KEY="-i /tmp/id_db"
+	out=$(DROPBEAR_PASSWORD= $NS dbclient -y -y -i /tmp/id_db root@172.16.42.1 'echo SSH-OK $(id -u) $(tty 2>/dev/null)' 2>&1)
+	echo "$out"
+	echo "$out" | grep -q SSH-OK && ok "ssh with key over NCM" || bad "ssh with key"
+	out=$(DROPBEAR_PASSWORD= $NS dbclient -y -y root@172.16.42.1 'echo SSH-NOKEY-OK' 2>&1 </dev/null)
+	echo "$out" | grep -q SSH-NOKEY-OK && bad "password login accepted with authorized_keys" || ok "password login refused with authorized_keys"
+else
+	out=$(DROPBEAR_PASSWORD= $NS dbclient -y -y root@172.16.42.1 'echo SSH-OK $(id -u); ls /dev/pts' 2>&1)
+	echo "$out"
+	echo "$out" | grep -q SSH-OK && ok "ssh (empty password) over NCM" || bad "ssh empty password"
+fi
+# pty session
+# pty session: dbclient -t needs a local tty, use the console (no input needed)
+out=$(DROPBEAR_PASSWORD= $NS dbclient -t -y -y $KEY root@172.16.42.1 'tty; echo PTY-$((6*7))' </dev/console 2>&1)
+echo "$out" | grep /dev/pts
+echo "$out" | grep -q PTY-42 && ok "ssh pty session" || { echo "$out"; bad "ssh pty session"; }
+
+# ACM: host side /dev/ttyACM0 -> getty -> serial-login
+i=0; while [ ! -c /dev/ttyACM0 ] && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+if [ -c /dev/ttyACM0 ]; then
+	stty -F /dev/ttyACM0 raw -echo 2>/dev/null
+	(sleep 2; printf '\r'; sleep 2; printf 'echo SERIAL-$((40+2))\r'; sleep 3) | timeout 10 microcom -t 9000 /dev/ttyACM0 >/tmp/acm.out 2>&1
+	cat /tmp/acm.out | tr -d '\r' | sed 's/^/acm| /'
+	grep -q SERIAL-42 /tmp/acm.out && ok "getty/shell on ttyGS0 via ACM" || bad "serial session"
+else
+	bad "no /dev/ttyACM0"
+fi
+
+sleep 3
+dmesg | grep -q 'session seen, auto reboot disarmed' && ok "monitor saw the session" || bad "monitor did not see a session"
+dmesg | grep titan2-initramfs | head -40
+# protection: virtio disk vda must become read-only, writes to it must be refused
+[ "$(cat /sys/class/block/vda/ro 2>/dev/null)" = 1 ] && ok "vda is read-only" || bad "vda not read-only"
+dd if=/dev/zero of=/dev/vda bs=512 count=1 2>/dev/null && bad "write to vda succeeded" || ok "write to vda refused"
+mount -o rw /dev/null /mnt 2>&1 | grep -q 'not allowed' && ok "mount wrapper refuses rw" || bad "mount wrapper rw"
+ps | grep -E 'dropbear|getty|udhcpd|monitor' | grep -v grep
+[ -z "$FAIL" ] && echo "T2TEST RESULT: ALL PASS" || echo "T2TEST RESULT: FAILURES"
+sync
+poweroff -f

@@ -1,0 +1,4 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+: >/run/t2-noreboot && echo "auto reboot disarmed"
