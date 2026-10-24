@@ -1,0 +1,51 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# First boot of the Titan 2 Alpine root (/etc/t2-netroot/firstboot). The rootfs is built on x86
+# with apk --root --arch aarch64 --no-scripts (scripts/netroot-serve.sh build): the package
+# scripts cannot run there. The initramfs runs this file in a chroot on the phone before
+# switch_root and deletes it on success. Same order as apk: busybox (links, /bin/sh), the
+# pre-install scripts of all packages, the post-install scripts of all, then the triggers.
+# Adding packages to an existing image (netroot-serve.sh build on an existing image) puts
+# /etc/t2-netroot/firstboot.pkgs next to it: then only the scripts of those (new) packages run;
+# all triggers run.
+set -e
+/bin/busybox mkdir -p /bin /sbin /usr/bin /usr/sbin
+/bin/busybox --install -s
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+S=/tmp/t2-apk-scripts
+rm -rf $S
+mkdir -p $S
+tar xzf /lib/apk/db/scripts.tar.gz -C $S
+# package order as in the apk database (dependencies before their dependants)
+pkgs=$(sed -n 's/^P://p' /lib/apk/db/installed)
+if [ -f /etc/t2-netroot/firstboot.pkgs ]; then
+	pkgs=$(for p in $pkgs; do grep -qxF "$p" /etc/t2-netroot/firstboot.pkgs && echo "$p"; done; true)
+	echo "== only new packages:" $pkgs
+fi
+run() { # <stage>
+	local p f v
+	for p in $pkgs; do
+		for f in $S/"$p"-[0-9]*."$1"; do
+			[ -e "$f" ] || continue
+			v=${f#$S/$p-}
+			v=${v%%.X*}
+			echo "== $p $v $1"
+			chmod +x "$f"
+			(cd / && "$f" "$v") || echo "!! $p $1: exit $?"
+		done
+	done
+}
+run pre-install
+run post-install
+# triggers: busybox (applet links: bbsuid, busybox-extras) and the others from the apk database
+for f in $S/*.trigger; do
+	[ -e "$f" ] || continue
+	echo "== trigger ${f##*/}"
+	chmod +x "$f"
+	(cd / && "$f" /bin /sbin /usr/bin /usr/sbin) || echo "!! trigger ${f##*/}: exit $?"
+done
+rm -rf $S
+rm -f /etc/t2-netroot/firstboot.pkgs
+echo "first boot OK"

@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2, network root or root on the linux partition: the UFS protection carried over from the
+# initramfs (installed by t2_install_guard from /etc/t2/rootlib.sh on every boot; edits here are
+# overwritten). All UFS block devices except the root partition (/run/t2-rw-part) are
+# read-only (BLKROSET); new ones through the uevent helper /sbin/t2-hotplug (or the rule in
+# /etc/mdev.conf if mdev is enabled); every 5 s another pass in case a uevent was missed.
+# /bin/mount is the wrapper /usr/lib/t2/mount-wrapper: UFS only ro, Android's data partitions
+# never.
+description="Titan 2: read-only for UFS (everything except nbd/loop/zram and the root partition)"
+command=/usr/lib/t2/roguard-loop
+command_background=yes
+pidfile=/run/t2-roguard.pid
+
+depend() {
+	before *
+	keyword -prefix
+}
+
+start_pre() {
+	. /usr/lib/t2/lib.sh
+	T2_LOG_TAG=titan2-netroot
+	[ -w /proc/sys/kernel/hotplug ] && echo /sbin/t2-hotplug >/proc/sys/kernel/hotplug
+	t2_ro_sweep
+	return 0
+}

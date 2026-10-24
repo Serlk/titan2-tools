@@ -1,0 +1,43 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2, network root: replacement for killprocs at shutdown (installed by the initramfs on
+# every boot, killprocs is removed from the shutdown runlevel). The stock kill_all (openrc)
+# first stops ALL processes with SIGSTOP, nbd-client too, even with -o: SIGSTOP interrupts its
+# ioctl NBD_DO_IT, the kernel closes the NBD socket, the root gets EIO and mount-ro fails.
+# Here signals are sent process by process, and nbd-client is not touched at all.
+# For the same reason killall5 / kill -STOP -1 must not be used in this system.
+description="Kill all processes except nbd-client (network root) before mount-ro"
+
+depend() {
+	after savecache
+	before mount-ro
+	keyword -prefix
+}
+
+others() {
+	local keep sid p s
+	keep=" 1 $$ $(pidof nbd-client) "
+	set -- $(sed 's/^.*) //' /proc/$$/stat)
+	sid=$4
+	for p in /proc/[0-9]*; do
+		p=${p#/proc/}
+		case "$keep" in *" $p "*) continue ;; esac
+		[ -n "$(tr -d '\0' 2>/dev/null </proc/$p/cmdline)" ] || continue # kernel threads
+		s=$(sed 's/^.*) //' /proc/$p/stat 2>/dev/null) || continue
+		set -- $s
+		[ "$4" = "$sid" ] && continue # our own session (openrc)
+		echo $p
+	done
+}
+
+start() {
+	ebegin "Terminating remaining processes (except nbd-client)"
+	kill -TERM $(others) 2>/dev/null
+	sleep 1
+	eend 0
+	ebegin "Killing remaining processes (except nbd-client)"
+	kill -KILL $(others) 2>/dev/null
+	eend 0
+}

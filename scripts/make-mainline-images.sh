@@ -11,8 +11,13 @@
 #               keyboard, touchscreen, touchpad, Func1/Func2; directory without suffix
 #     pd:      full + power domains (mt6878-unihertz-titan2-pd.dtb); directory ...-pd
 #   MINIMAL=1 / PD=1: old names for VARIANT=minimal / VARIANT=pd
+#     <name>:  any other board variant of the tree (dvfs, idle, gpu, wifi, drm, ...):
+#               mt6878-unihertz-titan2-<name>.dtb; directory ...-<name>
 #   USB=1:    "USB console" initramfs (tools/initramfs: NCM+ACM gadget, dropbear, getty on
 #               ttyGS0; titan2-docs: docs/hardware/usb-gadget.md); directory ...-usb[-minimal|-pd]
+#   NETROOT=1: the same initramfs (USB=1) + network root: t2.root=nbd:172.16.42.2:10809:t2root on
+#               the cmdline (root from the PC over NBD, scripts/netroot-serve.sh); another value is
+#               the spec itself (NETROOT=nfs:172.16.42.2:/srv/t2); directory ...-usb-netroot[-...]
 #   KO=out/mainline-build: kernel build directory (Image.gz and DTB)
 #   OUT=out/mainline-images: output directory prefix (e.g. OUT=out/mainline-stage2/images)
 #   CMDLINE:  boot.img cmdline (default 'console=tty0 loglevel=7 ignore_loglevel')
@@ -52,11 +57,21 @@ case "$VARIANT" in
 minimal) SUF=-minimal DTS=mt6878-unihertz-titan2 ;;
 full) SUF= DTS=mt6878-unihertz-titan2 ;;
 pd) SUF=-pd DTS=mt6878-unihertz-titan2-pd ;;
-*) echo "VARIANT: minimal, full or pd" >&2; exit 1 ;;
+# the other board variants of the tree: dvfs, idle, gpu, wifi, drm, ...
+*) [ -f "$ROOT/${KO:-out/mainline-build}/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-$VARIANT.dtb" ] ||
+	{ echo "VARIANT: minimal, full, pd or the name of a board variant (no mt6878-unihertz-titan2-$VARIANT.dtb)" >&2; exit 1; }
+   SUF=-$VARIANT DTS=mt6878-unihertz-titan2-$VARIANT ;;
 esac
-O=$ROOT/${OUT:-out/mainline-images}${USB:+-usb}$SUF
+NR_SPEC=
+if [ -n "${NETROOT:-}" ]; then
+	USB=1
+	NR_SPEC=$NETROOT
+	[ "$NR_SPEC" != 1 ] || NR_SPEC=nbd:172.16.42.2:10809:t2root
+	case "$NR_SPEC" in nbd:?*|nfs:?*:/*) ;; *) echo "NETROOT: nbd:<ip>[:port[:export]] or nfs:<ip>:/path" >&2; exit 1 ;; esac
+fi
+O=$ROOT/${OUT:-out/mainline-images}${USB:+-usb}${NR_SPEC:+-netroot}$SUF
 INITRD=${1:-}
-CMDLINE=${CMDLINE:-console=tty0 loglevel=7 ignore_loglevel}
+CMDLINE=${CMDLINE:-console=tty0 loglevel=7 ignore_loglevel}${NR_SPEC:+ t2.root=$NR_SPEC}
 mkdir -p "$O"
 cp "$B/dts/mediatek/$DTS.dtb" "$O/titan2.dtb"
 DTB=$O/titan2.dtb

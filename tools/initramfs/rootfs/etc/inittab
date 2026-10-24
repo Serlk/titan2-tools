@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
-# busybox init for the Titan 2 initramfs (/init -> /bin/busybox)
+# busybox init for the Titan 2 initramfs (/init -> /etc/t2/init -> busybox init)
 ::sysinit:/etc/t2/rc.init
 ::respawn:/etc/t2/monitor
 ::respawn:/etc/t2/dropbear
@@ -8,3 +8,5 @@
 ::respawn:/etc/t2/serial-getty
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/sync
+# t2-reboot <mode> (reboot bootloader/recovery): last, after sync
+::shutdown:/usr/lib/t2/reboot-mode

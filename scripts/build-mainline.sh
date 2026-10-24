@@ -7,7 +7,7 @@
 # SRC/O (relative to the repo root): the kernel tree (clone of titan2-linux, titan2 branch) and the build
 # directory. Requires the titan2-kbuild docker image (docker/Dockerfile) and AOSP clang r574158 in
 # toolchains/clang-r574158 (see README).
-#   SRC=linux O=out/mainline-build scripts/build-mainline.sh
+#   SRC=linux O=out/mainline-build [MODULES=0] scripts/build-mainline.sh   (MODULES=0: no modules)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=${SRC:-linux}
@@ -22,7 +22,18 @@ M='make O=/work/$O ARCH=arm64 LLVM=1 -j${JOBS:-4}'
 scripts/kconfig/merge_config.sh -m -O /work/$O /work/$O/.config /work/configs/mainline-titan2.config
 \$M olddefconfig
 \$M Image.gz mediatek/mt6878-unihertz-titan2.dtb
-# second stage (power domains), if that board file exists in the tree
-[ ! -f arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-pd.dts ] || \$M mediatek/mt6878-unihertz-titan2-pd.dtb
+# every board variant of the tree (pd, dvfs, gpu, drm, wifi, ...)
+for d in arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-*.dts; do
+	[ -f \"\$d\" ] && \$M mediatek/\$(basename \"\$d\" .dts).dtb
+done
+# modules (MODULES=0: skip) into O/modules (for the Alpine root: scripts/netroot-serve.sh MODULES=)
+if [ '${MODULES:-1}' = 1 ]; then
+	\$M modules
+	rm -rf /work/$O/modules
+	\$M INSTALL_MOD_PATH=/work/$O/modules INSTALL_MOD_STRIP=1 modules_install
+fi
 "
-ls -l "$ROOT/$O"/arch/arm64/boot/Image.gz "$ROOT/$O"/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2.dtb
+ls -l "$ROOT/$O"/arch/arm64/boot/Image.gz "$ROOT/$O"/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2*.dtb
+if [ "${MODULES:-1}" = 1 ]; then
+	ls -d "$ROOT/$O"/modules/lib/modules/*
+fi

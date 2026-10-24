@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Titan 2, installed system: another read-only pass every 5 s (service t2-roguard).
+# The udev service clears /proc/sys/kernel/hotplug at start (udevd listens on netlink): an empty
+# helper is set back to /sbin/t2-hotplug here (mdev, if someone enables it, writes its own: that
+# one is left alone; /etc/mdev.conf has the same rule). Plus the udev rule 00-t2-roguard.rules.
+. /usr/lib/t2/lib.sh
+T2_LOG_TAG=titan2-netroot
+while :; do
+	h=
+	read -r h 2>/dev/null </proc/sys/kernel/hotplug
+	[ -n "$h" ] || echo /sbin/t2-hotplug >/proc/sys/kernel/hotplug 2>/dev/null
+	t2_ro_sweep
+	sleep 5
+done

@@ -1,0 +1,41 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: default route and DNS through the PC over the USB network (internet only if the PC
+# has NAT enabled for 172.16.42.0/24; NAT on the PC is not set up here).
+# Installed by scripts/netroot-serve.sh build.
+# /etc/conf.d/t2-defroute:
+#   T2_GW=172.16.42.2      gateway (the PC's address)
+#   T2_DNS="1.1.1.1"       DNS servers for /etc/resolv.conf (space separated)
+#   T2_RESOLV=yes          no: leave resolv.conf alone
+description="Titan 2 netroot: default route and DNS via the PC"
+
+depend() {
+	after t2-usbnet networking
+	before chronyd ntpd
+}
+
+usb_if() {
+	local i
+	i=$(sed -n 's/^T2_ROOT_IF=//p' /run/t2-netroot 2>/dev/null)
+	[ -n "$i" ] || i=$(cat /run/t2-usb-if 2>/dev/null)
+	echo "$i"
+}
+
+start() {
+	local gw=${T2_GW:-172.16.42.2} dev d
+	dev=$(usb_if)
+	ebegin "Default route via $gw${dev:+ dev $dev}"
+	ip route replace default via "$gw" ${dev:+dev "$dev"}
+	eend $? || return 1
+	if yesno "${T2_RESOLV:-yes}"; then
+		for d in ${T2_DNS:-1.1.1.1}; do echo "nameserver $d"; done >/etc/resolv.conf
+	fi
+	return 0
+}
+
+stop() {
+	ip route del default via "${T2_GW:-172.16.42.2}" 2>/dev/null
+	return 0
+}

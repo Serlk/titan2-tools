@@ -9,3 +9,8 @@ SPDX-License-Identifier = "GPL-2.0-or-later"
 path = "tools/initramfs/keys/*.pub"
 SPDX-FileCopyrightText = "Alpine Linux (alpine-keys)"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["scripts/testdata/titan2-sdc-layout.txt", "tools/netroot/t2-defroute.conf"]
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"

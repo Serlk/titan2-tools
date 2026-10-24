@@ -1,0 +1,173 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Root on a UFS partition for the Titan 2 initramfs (called from /etc/t2/init after rc.init).
+#   diskroot part:<PARTNAME>     GPT partition by name; only names linux* (linux, linux2, ...)
+# Command line parameters:
+#   t2.root_wait=<s>   how long to wait for the partition (default 60)
+#   t2.root_if=<if>    use this interface instead of the USB gadget (qemu only: eth0)
+#   t2.root_unsafe     kernel without the read-only lock (CONFIG_BLK_DEV_RO_LOCK): boot anyway
+#                      with the old scheme (the disk is not read-only, see below); without it:
+#                      refuse
+# Success: the partition (ext4) is checked with e2fsck -p and mounted rw on /newroot, the UFS
+# ro protection is installed into the new system, exit 0; /etc/t2/init moves /dev /proc /sys /run
+# into the new root. Otherwise everything is undone, the partition and the disk are read-only
+# again, exit 1.
+#
+# SAFETY: only this partition is opened for writing (see the header of /etc/t2/lib.sh).
+# Kernel with the lock (CONFIG_BLK_DEV_RO_LOCK): partitions do not inherit the disk's flag. Every
+# sibling partition and the disk itself are marked read-only, only the root partition is opened,
+# then checked (partition ro=0, disk and siblings ro=1), one t2_ro_sweep pass and the lock
+# (ro_lock), all before e2fsck and mount. /run/t2-rw-part holds "partition - name": the disk is
+# no exception. From then on until the next boot not even root can make the other partitions
+# or the disk writable or get around it (dm, SG_IO, bsg, BLKPG).
+# Kernel without the lock, only with t2.root_unsafe, old scheme: partitions inherit the disk's
+# flag, so the siblings are marked one by one and the flag is cleared on the disk; raw writes
+# to the disk device (/dev/sdc) are then not refused by the kernel (the mount wrappers never
+# mount it).
+. /etc/t2/lib.sh
+. /etc/t2/rootlib.sh
+
+spec=$1
+wait=$(t2_cmdline root_wait) || wait=60
+rif=$(t2_cmdline root_if) || rif=
+part= disk=
+
+fail() {
+	t2_log "diskroot: $*"
+	cleanup
+	exit 1
+}
+
+cleanup() {
+	for m in $NR/proc $NR/sys $NR/dev $NR; do
+		mountpoint -q "$m" 2>/dev/null && umount -l "$m"
+	done
+	rm -f $T2_RW_FILE
+	[ -n "$part" ] && blockdev --setro "/dev/$part" 2>/dev/null
+	[ -n "$disk" ] && blockdev --setro "/dev/$disk" 2>/dev/null
+	t2_ro_sweep
+}
+
+name=${spec#part:}
+case "$name" in
+'' | *[!A-Za-z0-9_.-]*) fail "bad partition name in $spec" ;;
+linux*) ;;
+*) fail "$name: only partitions named linux* may hold the root" ;;
+esac
+for p in $T2_PROTECTED; do
+	[ "$name" = "$p" ] && fail "$name is protected"
+done
+t2_screen "titan2: root on partition $name: waiting up to ${wait}s"
+deadline=$(($(cut -d. -f1 /proc/uptime) + wait))
+left() { [ "$(cut -d. -f1 /proc/uptime)" -lt "$deadline" ]; }
+
+# 1. partition: exactly one with this PARTNAME (the kernel name in /dev comes from here, not
+# from the command line)
+while :; do
+	found=
+	for b in /sys/class/block/*; do
+		[ -f "$b/partition" ] && grep -qx "PARTNAME=$name" "$b/uevent" 2>/dev/null &&
+			found="$found ${b##*/}"
+	done
+	set -- $found
+	[ $# -gt 1 ] && fail "several partitions named $name:$found"
+	[ $# = 1 ] && break
+	left || fail "no partition named $name within ${wait}s"
+	sleep 1
+done
+part=$1
+disk=$(t2_blk_parent "$part") && [ -n "$disk" ] && [ -b "/dev/$disk" ] && [ -b "/dev/$part" ] ||
+	fail "$part: no parent disk"
+t2_log "diskroot: $name is /dev/$part on /dev/$disk"
+
+# 2. only this partition writable (see SAFETY)
+siblings_ro() {
+	local b n
+	for b in /sys/block/$disk/$disk*; do
+		n=${b##*/}
+		[ -f "$b/partition" ] && [ "$n" != "$part" ] || continue
+		[ "$(cat "$b/ro")" = 1 ] || fail "/dev/$n not read-only ($1)"
+	done
+}
+if ! t2_protected_blk "$disk"; then
+	# not UFS (SD card, USB storage): not protected, the lock is for the UFS
+	echo "$part - $name" >$T2_RW_FILE
+	t2_ro_lock || t2_log "diskroot: no read-only lock for the UFS"
+	t2_log "diskroot: /dev/$part on /dev/$disk (not UFS, left as is)"
+elif t2_ro_lock_supported; then
+	for b in /sys/block/$disk/$disk*; do
+		n=${b##*/}
+		[ -f "$b/partition" ] && [ "$n" != "$part" ] || continue
+		blockdev --setro "/dev/$n" || fail "setro /dev/$n"
+	done
+	blockdev --setro "/dev/$disk" || fail "setro /dev/$disk"
+	echo "$part - $name" >$T2_RW_FILE
+	blockdev --setrw "/dev/$part" || fail "setrw /dev/$part"
+	[ "$(cat /sys/class/block/$part/ro)" = 0 ] || fail "/dev/$part still read-only"
+	[ "$(cat /sys/block/$disk/ro)" = 1 ] || fail "/dev/$disk not read-only"
+	siblings_ro "after unlocking /dev/$part"
+	t2_ro_sweep
+	t2_ro_lock || fail "could not lock the read-only state (block.ro_lock)"
+	[ "$(cat /sys/class/block/$part/ro)" = 0 ] && [ "$(cat /sys/block/$disk/ro)" = 1 ] ||
+		fail "read-only state changed while locking"
+	siblings_ro "after the lock"
+	t2_log "diskroot: /dev/$part writable; /dev/$disk and its other partitions read-only, locked"
+else
+	t2_cmdline root_unsafe >/dev/null ||
+		fail "kernel without the read-only lock (CONFIG_BLK_DEV_RO_LOCK): refusing a root on /dev/$part (t2.root_unsafe to override)"
+	t2_screen "titan2: WARNING: kernel without the read-only lock; t2.root_unsafe: /dev/$disk stays writable as a whole"
+	for b in /sys/block/$disk/$disk*; do
+		n=${b##*/}
+		[ -f "$b/partition" ] && [ "$n" != "$part" ] || continue
+		blockdev --setro "/dev/$n" || fail "setro /dev/$n"
+	done
+	echo "$part $disk $name" >$T2_RW_FILE
+	blockdev --setrw "/dev/$disk" || fail "setrw /dev/$disk"
+	siblings_ro "after unlocking /dev/$disk"
+	blockdev --setrw "/dev/$part" || fail "setrw /dev/$part"
+	t2_log "diskroot: /dev/$part writable, other partitions of /dev/$disk read-only (UNSAFE: no lock)"
+fi
+
+# 3. ext4 check (e2fsck: 0 clean, 1 and 2 fixed, 4 and up not fixed)
+[ -e /etc/mtab ] || ln -s /proc/mounts /etc/mtab
+if [ -x /sbin/e2fsck ]; then
+	/sbin/e2fsck -p "/dev/$part" >/run/t2-fsck.log 2>&1
+	rc=$?
+	t2_log "diskroot: e2fsck -p /dev/$part: $rc"
+	[ $rc -lt 4 ] || fail "e2fsck: errors left on /dev/$part (code $rc, /run/t2-fsck.log)"
+else
+	t2_log "diskroot: no e2fsck in the initramfs, not checked"
+fi
+mkdir -p $NR
+/bin/busybox mount -t ext4 -o rw,noatime "/dev/$part" $NR || fail "mount /dev/$part"
+[ -x $NR/sbin/init ] || [ -e $NR/etc/t2-netroot/firstboot ] || fail "$name: no /sbin/init"
+
+# 4. first boot (/etc/t2/rootlib.sh)
+t2_firstboot || fail "first boot: mounts"
+[ -x $NR/sbin/init ] || fail "no /sbin/init after first boot"
+
+# 5. USB network for SSH in the new system: the interface before switch_root (the gadget script
+# will be killed). If it does not come up, the root boots anyway, just without USB network.
+if [ -n "$rif" ]; then
+	t2_root_if_setup "$rif"
+else
+	i=0
+	while [ ! -s /run/t2-usb-if ] && [ $i -lt 15 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	[ -s /run/t2-usb-if ] || t2_log "diskroot: no USB network interface, booting without it"
+fi
+
+# 6. UFS protection in the new system (on every boot: the versions from the initramfs)
+t2_install_guard part || t2_log "diskroot: install_guard failed"
+cat >/run/t2-root <<EOF
+T2_ROOT=$spec
+T2_ROOT_DEV=/dev/$part
+T2_ROOT_IF=$(cat /run/t2-usb-if 2>/dev/null)
+T2_ROOT_PROTO=part
+EOF
+t2_log "diskroot: root ready (/dev/$part)"
+exit 0

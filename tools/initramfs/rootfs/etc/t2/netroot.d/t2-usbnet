@@ -1,0 +1,34 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2, installed system: DHCP for the PC on the USB interface (gives out exactly
+# 172.16.42.2, no gateway, no DNS), like /etc/t2/udhcpd in the initramfs. The initramfs has set
+# up the interface and the address 172.16.42.1 (/run/t2-netroot); networking (ifupdown) does
+# not touch it, the network root goes through this interface. Installed by the initramfs on
+# every boot.
+description="Titan 2: DHCP for the PC on the USB network (netroot)"
+command=/bin/busybox-extras
+command_args="udhcpd -f /run/t2-udhcpd.conf"
+supervisor=supervise-daemon
+
+depend() {
+	after t2-roguard
+}
+
+start_pre() {
+	local ifname
+	ifname=$(sed -n 's/^T2_ROOT_IF=//p' /run/t2-netroot 2>/dev/null)
+	[ -n "$ifname" ] || ifname=$(cat /run/t2-usb-if 2>/dev/null)
+	[ -n "$ifname" ] || { eerror "no USB interface (/run/t2-netroot)"; return 1; }
+	cat >/run/t2-udhcpd.conf <<CONF
+interface $ifname
+start 172.16.42.2
+end 172.16.42.2
+max_leases 1
+lease_file /run/udhcpd.leases
+option subnet 255.255.255.0
+option lease 3600
+CONF
+	[ -e /run/udhcpd.leases ] || : >/run/udhcpd.leases
+}

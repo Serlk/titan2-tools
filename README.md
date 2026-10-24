@@ -102,7 +102,24 @@ from `boot_a`. A long press on Power reboots the phone; it does not switch it of
 
 **Never** flash or erase `preloader`, `lk`, `tee`, `seccfg`, `nvram`, `nvdata`, `nvcfg`,
 `proinfo`, `protect1/2` or `md*`, and do not lock the bootloader. Do not run `fastboot -w`. These
-images never write to the phone's storage: all block devices are read-only.
+images never write to the phone's storage: all UFS block devices are read-only.
+
+## Dual boot: Android and Linux on its own partition
+
+Since 2026-10-24: a boot menu ([titan2-boot](../titan2-boot)) in `boot_a` starts Android or
+mainline Linux; Linux lives on its own partition `linux`, carved from the end of `userdata`
+(Android's data is wiped once), and cannot write to Android's partitions (a one-way read-only
+lock in the kernel, `CONFIG_BLK_DEV_RO_LOCK`). The installation (with its own wipe order) and the
+way back are in titan2-docs: `docs/DUALBOOT.md` and `docs/DUALBOOT-ROLLBACK.md`. The scripts:
+
+| path | what it does |
+|---|---|
+| `scripts/make-bootmenu.sh` | `boot_a` image: titan2-boot (cloned into `titan2-boot/`) + the Android kernel + a fallback mainline kernel |
+| `scripts/make-linux-root.sh` | image of the `linux` partition: Alpine + `/boot/extlinux/extlinux.conf` (sparse, for `fastboot flash linux`) |
+| `scripts/netroot-serve.sh` | builds the Alpine root (also served over NBD for a network root) |
+| `scripts/dualboot-repartition.sh`, `scripts/gpt-carve.py` | from TWRP: shorten `userdata`, add `linux`, with a backup and `restore` |
+| `scripts/test-gpt-carve.sh`, `scripts/test-bootmenu-qemu.sh` | tests without the phone (the GPT of a real Titan 2, the menu in qemu) |
+| `tools/initramfs/qemu/diskroot.sh` | root on a partition in qemu: the lock and write attempts as root |
 
 ## Building
 
@@ -132,7 +149,9 @@ tests it in qemu. Nothing in this repository flashes the phone.
 | `scripts/make-mainline-images.sh` | builds boot/vendor_boot/init_boot/dtbo v4 images the way the stock LK expects them |
 | `scripts/lk-fdt-check.py` | offline check of a DTB or vendor_boot against the known LK requirements |
 | `scripts/restore-stock-boot.sh` | flashes your backup of slot A back |
-| `tools/initramfs/` | USB-console initramfs: Alpine packages, verified, plus our scripts |
+| `tools/initramfs/` | initramfs: USB console, network root (`t2.root=nbd:`), root on the `linux` partition (`t2.root=part:linux`), read-only protection of the UFS |
+| `tools/netroot/` | first boot and services of the Alpine root, qemu test of the network root |
+| `tools/t2-reboot/` | `reboot` with an argument (`t2-reboot bootloader`) |
 | `tools/mini-init/`, `tools/devmem/` | static aarch64 helpers without libc |
 | `configs/mainline-titan2.config` | kernel config fragment on top of arm64 `defconfig` |
 | `docker/Dockerfile` | the `titan2-kbuild` build container |

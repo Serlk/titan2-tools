@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# The last ::shutdown action in inittab (initramfs and, installed by the initramfs, Alpine:
+# after "openrc shutdown", i.e. after mount-ro of the root). If the reboot was started by
+# "t2-reboot <mode>", it left the mode in /run/t2-reboot-mode: reboot with that argument (the
+# kernel's reboot-mode driver writes it into TOPRGU 0x1c00a024[3:0], LK reads it at boot).
+# Otherwise nothing: busybox init finishes the normal reboot/poweroff itself.
+f=/run/t2-reboot-mode
+[ -s $f ] || { rm -f $f; exit 0; }
+m=$(cat $f)
+rm -f $f
+echo "t2-reboot: restarting with mode '$m'" >/dev/kmsg 2>/dev/null
+exec /usr/bin/t2-reboot -f "$m"

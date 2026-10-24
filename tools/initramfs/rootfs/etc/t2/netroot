@@ -1,0 +1,145 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Network root for the Titan 2 initramfs (called from /etc/t2/init after rc.init).
+#   netroot nbd:<ip>[:<port>[:<export>]]   NBD (default port 10809, export t2root)
+#   netroot nfs:<ip>:<path>                NFSv4 (kernel client)
+# Command line parameters:
+#   t2.root_wait=<s>   how long to wait for the network and the server (default 60)
+#   t2.root_if=<if>    use this interface instead of the USB gadget (qemu only: eth0)
+#   t2.root_ro         NBD: image read-only with a tmpfs on top (overlayfs), changes are not kept
+# Success: the root is mounted on /newroot (it is the only rw mount), the UFS ro protection is
+# installed into the new system, exit 0; /etc/t2/init moves /dev /proc /sys /run into the new
+# root. Otherwise everything is undone, exit 1.
+#
+# SAFETY: only the network device (/dev/nbd0 or NFS) is mounted; UFS partitions are never
+# mounted. The protection is carried over into the new system on every boot (t2_install_guard,
+# /etc/t2/rootlib.sh): /sbin/t2-hotplug, the openrc service t2-roguard (sysinit: BLKROSET on the
+# UFS), the udev/mdev rule and the /bin/mount wrapper (UFS only read-only, T2_PROTECTED
+# partitions never).
+. /etc/t2/lib.sh
+. /etc/t2/rootlib.sh
+
+spec=$1
+wait=$(t2_cmdline root_wait) || wait=60
+rif=$(t2_cmdline root_if) || rif=
+ro=
+t2_cmdline root_ro >/dev/null && ro=1
+
+fail() {
+	t2_log "netroot: $*"
+	cleanup
+	exit 1
+}
+
+cleanup() {
+	for m in $NR/proc $NR/sys $NR/dev $NR /run/t2-nr/root /run/t2-nr/rw /run/t2-nr; do
+		mountpoint -q "$m" 2>/dev/null && umount -l "$m"
+	done
+	[ -n "$nbd_up" ] && nbd-client -d /dev/nbd0 2>/dev/null
+	[ -n "$dhcp_pid" ] && kill "$dhcp_pid" 2>/dev/null
+}
+
+proto=${spec%%:*}
+rest=${spec#*:}
+case "$proto" in
+nbd)
+	IFS=: read -r host port export <<EOF
+$rest
+EOF
+	port=${port:-10809}
+	export=${export:-t2root}
+	;;
+nfs)
+	host=${rest%%:*}
+	path=${rest#*:}
+	[ "$path" != "$rest" ] && [ -n "$path" ] || fail "bad spec $spec (nfs:<ip>:<path>)"
+	;;
+*) fail "unknown root type in $spec" ;;
+esac
+[ -n "$host" ] || fail "no server in $spec"
+t2_screen "titan2: netroot $spec: waiting up to ${wait}s"
+deadline=$(($(cut -d. -f1 /proc/uptime) + wait))
+left() { [ "$(cut -d. -f1 /proc/uptime)" -lt "$deadline" ]; }
+
+# 1. network: the USB gadget interface (written by /etc/t2/usb-gadget) or t2.root_if
+if [ -n "$rif" ]; then
+	t2_root_if_setup "$rif"
+else
+	while [ ! -s /run/t2-usb-if ]; do
+		left || fail "no USB network interface"
+		sleep 1
+	done
+fi
+ifname=$(cat /run/t2-usb-if)
+# DHCP for the PC (gives it 172.16.42.2), like /etc/t2/udhcpd; in the new system t2-usbnet
+/etc/t2/udhcpd </dev/null >/dev/null 2>&1 &
+dhcp_pid=$!
+t2_log "netroot: $ifname up, server $host"
+
+# 2. connect
+mkdir -p $NR /run/t2-nr
+nbd_up=
+while :; do
+	left || fail "server $host not reachable within ${wait}s"
+	case "$proto" in
+	nbd)
+		# -persist: reconnect when TCP breaks (if the server is reachable again). No -timeout:
+		# requests wait as long as needed (cable pulled and plugged back: the root carries on)
+		if timeout 10 nbd-client -persist -N "$export" "$host" "$port" /dev/nbd0 \
+			>/run/t2-nr/nbd.log 2>&1; then
+			nbd_up=1
+			# the process holds the connection (ioctl NBD_DO_IT): keep the OOM killer away
+			for p in $(pidof nbd-client); do echo -1000 >/proc/$p/oom_score_adj; done
+			break
+		fi
+		;;
+	nfs)
+		/bin/busybox mount -t nfs4 -o "rw,noatime,vers=4.2,addr=$host,clientaddr=$T2_ADDR,proto=tcp,hard" \
+			"$host:$path" $NR 2>/run/t2-nr/nfs.log && break
+		;;
+	esac
+	sleep 2
+done
+
+if [ "$proto" = nbd ]; then
+	i=0
+	until [ "$(cat /sys/block/nbd0/size 2>/dev/null)" -gt 0 ] 2>/dev/null; do
+		i=$((i + 1))
+		[ $i -le 20 ] || fail "nbd0: no size"
+		sleep 0.5
+	done
+	t2_log "netroot: nbd0 $(($(cat /sys/block/nbd0/size) / 2048)) MiB from $host:$port/$export"
+	# network root only: the /bin/mount wrapper is bypassed on purpose
+	if [ -n "$ro" ]; then
+		blockdev --setro /dev/nbd0
+		mkdir -p /run/t2-nr/root /run/t2-nr/rw
+		/bin/busybox mount -t ext4 -o ro,noload /dev/nbd0 /run/t2-nr/root || fail "mount nbd0 ro"
+		/bin/busybox mount -t tmpfs -o mode=0755 tmpfs /run/t2-nr/rw
+		mkdir -p /run/t2-nr/rw/upper /run/t2-nr/rw/work
+		/bin/busybox mount -t overlay -o lowerdir=/run/t2-nr/root,upperdir=/run/t2-nr/rw/upper,workdir=/run/t2-nr/rw/work \
+			overlay $NR || fail "overlay"
+	else
+		blockdev --setrw /dev/nbd0
+		/bin/busybox mount -t ext4 -o rw,noatime /dev/nbd0 $NR || fail "mount nbd0 rw"
+	fi
+fi
+[ -x $NR/sbin/init ] || [ -e $NR/etc/t2-netroot/firstboot ] || fail "$spec: no /sbin/init"
+
+# 3. first boot: package scripts (/etc/t2/rootlib.sh)
+t2_firstboot || fail "first boot: mounts"
+[ -x $NR/sbin/init ] || fail "no /sbin/init after first boot"
+
+# 4. UFS protection and the network link in the new system (on every boot: the versions from
+# the initramfs)
+t2_install_guard "$proto" || t2_log "netroot: install_guard failed"
+cat >/run/t2-netroot <<EOF
+T2_ROOT=$spec
+T2_ROOT_IF=$ifname
+T2_ROOT_PROTO=$proto
+T2_ROOT_RO=$ro
+EOF
+kill "$dhcp_pid" 2>/dev/null
+t2_log "netroot: root ready ($spec)"
+exit 0

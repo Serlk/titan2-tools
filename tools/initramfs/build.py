@@ -41,6 +41,14 @@ PACKAGES = {
                   "usr/sbin/i2cdump": None, "usr/sbin/i2ctransfer": None,
                   "usr/lib/libi2c.so.0": None, "usr/lib/libi2c.so.0.1.1": None},
     "evtest": {"usr/bin/evtest": None},
+    # e2fsck: checks the root on the linux partition before the rw mount (/etc/t2/diskroot)
+    "e2fsprogs": {"sbin/e2fsck": None},
+    "e2fsprogs-libs": {"usr/lib/libext2fs.so.2": None, "usr/lib/libext2fs.so.2.4": None,
+                       "usr/lib/libe2p.so.2": None, "usr/lib/libe2p.so.2.3": None},
+    "libcom_err": {"usr/lib/libcom_err.so.2": None, "usr/lib/libcom_err.so.2.1": None},
+    "libblkid": {"usr/lib/libblkid.so.1": None, "usr/lib/libblkid.so.1.1.0": None},
+    "libuuid": {"usr/lib/libuuid.so.1": None, "usr/lib/libuuid.so.1.3.0": None},
+    "libeconf": {"usr/lib/libeconf.so.0": None, "usr/lib/libeconf.so.0.8.3": None},
 }
 
 DIRS = {
@@ -136,6 +144,10 @@ def main():
             else:
                 c.file(n, open(src, "rb").read(), 0o755 if st.st_mode & 0o111 else 0o644)
 
+    # t2-reboot (reboot with a reboot-mode argument): built by build.sh from tools/t2-reboot
+    t2r = os.path.join(HERE, "..", "t2-reboot", "t2-reboot")
+    c.file("usr/bin/t2-reboot", open(t2r, "rb").read(), 0o755)
+
     keys = os.environ.get("T2_AUTHORIZED_KEYS") or os.path.join(HERE, "authorized_keys")
     if os.path.isfile(keys) and open(keys, "rb").read().strip():
         c.file("root/.ssh/authorized_keys", open(keys, "rb").read(), 0o600)
@@ -146,7 +158,8 @@ def main():
         print("no authorized_keys: root with an EMPTY password", file=sys.stderr)
     c.file("etc/shadow", (shadow + "sshd:!:20454:0:::::\n").encode(), 0o600)
 
-    c.symlink("init", "bin/busybox")
+    # /init: picks the mode (plain: busybox init; t2.root=: network root or the linux partition)
+    c.symlink("init", "etc/t2/init")
     c.symlink("bin/sh", "busybox")
     c.chr("dev/console", 0o600, 5, 1)
     c.chr("dev/null", 0o666, 1, 3)

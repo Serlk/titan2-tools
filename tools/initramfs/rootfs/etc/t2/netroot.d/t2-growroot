@@ -1,0 +1,40 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2, root on the linux partition: the ext4 from the image is smaller than the partition,
+# grow it to the whole partition online (resize2fs from e2fsprogs-extra), once; marker
+# /var/lib/t2/growroot.done. Installed by t2_install_guard (/etc/t2/rootlib.sh) on every boot
+# with t2.root=part:...; the partition comes from /run/t2-rw-part (the one opened for writing).
+# Runs in the background: on a partition of hundreds of GB it takes a while, log in
+# /var/log/t2-growroot.log.
+description="Titan 2: grow the root ext4 to the whole linux partition (once)"
+
+depend() {
+	after t2-roguard
+}
+
+start() {
+	local p d n
+	[ -e /var/lib/t2/growroot.done ] && return 0
+	if ! command -v resize2fs >/dev/null; then
+		ewarn "t2-growroot: no resize2fs (apk add e2fsprogs-extra)"
+		return 0
+	fi
+	read -r p d n 2>/dev/null </run/t2-rw-part
+	if [ -z "$p" ] || ! awk -v d="/dev/$p" '$1 == d && $2 == "/" { f = 1 } END { exit !f }' /proc/mounts; then
+		ewarn "t2-growroot: the root is not the partition from /run/t2-rw-part"
+		return 0
+	fi
+	ebegin "Growing / on /dev/$p ($n) to the whole partition (background)"
+	mkdir -p /var/lib/t2 /var/log
+	(
+		if resize2fs "/dev/$p" >/var/log/t2-growroot.log 2>&1; then
+			: >/var/lib/t2/growroot.done
+			echo "<5>titan2: t2-growroot: /dev/$p done" >/dev/kmsg
+		else
+			echo "<4>titan2: t2-growroot: resize2fs /dev/$p failed" >/dev/kmsg
+		fi
+	) </dev/null >/dev/null 2>&1 &
+	eend 0
+}

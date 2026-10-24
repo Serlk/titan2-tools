@@ -1,10 +1,45 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
-# uevent helper (/proc/sys/kernel/hotplug): every new block device (UFS disk,
-# partition) becomes read-only right away, so the initramfs cannot write to partitions.
-[ "$SUBSYSTEM" = block ] && [ "$ACTION" = add ] && [ -n "$DEVNAME" ] || exit 0
-/bin/busybox blockdev --setro "/dev/$DEVNAME" 2>/dev/null &&
-	[ "$DEVTYPE" = disk ] &&
-	echo "<5>titan2-initramfs: read-only: /dev/$DEVNAME and its partitions (hotplug)" >/dev/kmsg
+# uevent helper (/proc/sys/kernel/hotplug): every new UFS block device (disk, partition; its
+# sysfs path is behind the UFS controller, as t2_protected_blk in /etc/t2/lib.sh:
+# */112b0000.ufshci/* or t2.protect=<glob>[,<glob>...] from the command line) becomes read-only
+# right away. Other devices (SD card, USB storage) are left alone.
+#   t2-hotplug           kernel uevent helper (SUBSYSTEM/ACTION/DEVNAME/DEVTYPE in the
+#                        environment), add
+#   t2-hotplug <name>    from the udev rule 00-t2-roguard.rules (add|change), kernel name (%k)
+# Exceptions: virtual devices (nbd for the network root, loop, zram), see t2_virtual_blk in
+# /etc/t2/lib.sh, and the root partition from /run/t2-rw-part (t2.root=part:linux, see
+# t2_rw_get), only while the partition's PARTNAME matches the recorded one; its disk only
+# without the read-only lock (there the disk field holds the name, with the lock it is "-").
+# Self-contained: lib.sh is not sourced.
+if [ -n "$1" ]; then
+	n=${1##*/}
+else
+	[ "$SUBSYSTEM" = block ] && [ "$ACTION" = add ] && [ -n "$DEVNAME" ] || exit 0
+	n=${DEVNAME##*/}
+fi
+case "$n" in nbd*|loop*|zram*|ram*|'') exit 0 ;; esac
+set -f # the globs of t2.protect are case patterns, not file names
+prot='*/112b0000.ufshci/*'
+for a in $(/bin/busybox cat /proc/cmdline); do
+	case "$a" in t2.protect=*) prot=${a#t2.protect=} ;; esac
+done
+path=$(/bin/busybox readlink -f "/sys/class/block/$n" 2>/dev/null)
+[ -n "$path" ] || exit 0
+match=
+IFS=,
+for g in $prot; do
+	case "$path" in $g) match=1 ;; esac
+done
+unset IFS
+[ -n "$match" ] || exit 0
+if read -r p d pn 2>/dev/null </run/t2-rw-part && [ -n "$pn" ] &&
+	{ [ "$n" = "$p" ] || [ "$n" = "$d" ]; } &&
+	/bin/busybox grep -qx "PARTNAME=$pn" "/sys/class/block/$p/uevent" 2>/dev/null; then
+	exit 0
+fi
+/bin/busybox blockdev --setro "/dev/$n" 2>/dev/null &&
+	[ -z "$1" ] && [ "$DEVTYPE" = disk ] &&
+	echo "<5>titan2-initramfs: read-only: /dev/$n (hotplug)" >/dev/kmsg
 exit 0

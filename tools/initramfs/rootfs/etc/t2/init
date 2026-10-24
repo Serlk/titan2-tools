@@ -1,0 +1,55 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# /init of the Titan 2 initramfs (PID 1).
+#   no t2.root= on the command line: as before, busybox init (inittab: SSH, getty, monitor);
+#   t2.root=nbd:<ip>[:<port>[:<export>]] or t2.root=nfs:<ip>:<path>: network root
+#     (/etc/t2/netroot): network over USB, connect, switch_root into the system on the PC.
+#   t2.root=part:<name>: root on the UFS partition with this PARTNAME (only linux*: part:linux,
+#     /etc/t2/diskroot): e2fsck -p, mount rw, switch_root.
+#     If that fails within t2.root_wait seconds (default 60), stay in the initramfs with SSH.
+# The initramfs mounts no other UFS partition; the ro protection (everything but the root
+# partition) is carried over into the new system. The read-only lock (t2_ro_lock,
+# /etc/t2/lib.sh) is set in every outcome: before switch_root, before busybox init on failure,
+# and without t2.root= at the end of rc.init.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+/bin/busybox mount -t proc -o nosuid,nodev,noexec proc /proc
+spec=
+for a in $(/bin/busybox cat /proc/cmdline); do
+	case "$a" in t2.root=*) spec=${a#t2.root=} ;; esac
+done
+[ -n "$spec" ] || exec /bin/busybox init
+
+/etc/t2/rc.init
+. /etc/t2/lib.sh
+case "$spec" in
+part:*) mode=diskroot keep=" 1 " ;;
+# nbd-client holds the NBD connection (ioctl NBD_DO_IT) and has to survive switch_root
+*) mode=netroot keep= ;;
+esac
+if /etc/t2/$mode "$spec"; then
+	# last read-only pass and the lock until the next boot (diskroot has set it already)
+	t2_ro_sweep
+	t2_ro_lock || t2_log "$mode: booting without the read-only lock"
+	# everything the initramfs started (gadget script, udhcpd) except nbd-client
+	[ -n "$keep" ] || keep=" 1 $(pidof nbd-client) "
+	for p in /proc/[0-9]*; do
+		p=${p#/proc/}
+		case "$keep" in *" $p "*) continue ;; esac
+		c=$(tr -d '\0' 2>/dev/null <"/proc/$p/cmdline")
+		[ -n "$c" ] || continue # kernel threads
+		kill -9 "$p" 2>/dev/null
+	done
+	t2_log "$mode: switch_root ($spec)"
+	# pseudo file systems into the new root (mounts under /sys and /run move with them)
+	for m in dev proc sys run; do
+		mount --move /$m /newroot/$m || echo "titan2: move /$m failed" >/dev/console
+	done
+	exec switch_root /newroot /sbin/init
+	echo "titan2: switch_root failed" >/newroot/dev/console
+fi
+t2_screen "titan2: root $spec unavailable: staying in initramfs (ssh root@172.16.42.1)"
+t2_ro_sweep
+t2_ro_lock
+exec /bin/busybox init

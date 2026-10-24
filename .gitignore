@@ -5,3 +5,7 @@
 /tools/mini-init/init
 /tools/devmem/devmem
 __pycache__/
+/tools/t2-reboot/t2-reboot
+/tools/initramfs/authorized_keys
+/titan2-boot/
+/backup/

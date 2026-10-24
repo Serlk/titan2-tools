@@ -101,7 +101,19 @@ scripts/restore-stock-boot.sh /путь/к/вашему/бэкапу     # жд�
 
 **Никогда** не прошивайте и не стирайте `preloader`, `lk`, `tee`, `seccfg`, `nvram`, `nvdata`,
 `nvcfg`, `proinfo`, `protect1/2`, `md*` и не блокируйте загрузчик. Не выполняйте `fastboot -w`.
-Эти образы ничего не пишут во внутреннюю память: все блочные устройства только для чтения.
+Эти образы ничего не пишут во внутреннюю память: все блочные устройства UFS только для чтения.
+
+## Две системы: Android и Linux на своём разделе
+
+С 2026-10-24: меню загрузки ([titan2-boot](../titan2-boot)) в `boot_a` запускает Android или
+mainline Linux; Linux живёт на своём разделе `linux`, отрезанном от конца `userdata` (данные
+Android стираются один раз), и не может писать в разделы Android (односторонняя блокировка
+read-only в ядре, `CONFIG_BLK_DEV_RO_LOCK`). Установка (со своим порядком стирания) и откат —
+titan2-docs: `docs/DUALBOOT.md` и `docs/DUALBOOT-ROLLBACK.md`. Скрипты: `scripts/make-bootmenu.sh`
+(образ `boot_a`), `scripts/make-linux-root.sh` (образ раздела `linux`), `scripts/netroot-serve.sh`
+(сборка Alpine), `scripts/dualboot-repartition.sh` и `scripts/gpt-carve.py` (переразметка из TWRP,
+с бэкапом и `restore`), проверки без телефона — `scripts/test-gpt-carve.sh`,
+`scripts/test-bootmenu-qemu.sh`, `tools/initramfs/qemu/diskroot.sh`.
 
 ## Сборка
 

@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# /bin/mount in a system with a network root or a root on the linux partition (Titan 2).
+# Installed by the initramfs (t2_install_guard in /etc/t2/rootlib.sh) on every boot.
+#   - a source that is not a block device (tmpfs, devpts, mqueue, proc, sysfs, cgroup, debugfs,
+#     configfs, --bind of a directory, ...): as it is, with all options (rw too);
+#   - virtual block devices (nbd for the root itself, loop, zram, ram): as they are;
+#   - UFS block devices (t2_protected_blk: the sysfs path is behind the UFS controller; also
+#     through /dev/block/..., /dev/disk/by-*, UUID=/LABEL=/PARTLABEL=/PARTUUID=): read-only only
+#     (forced -r -o ro, rw and remount,rw are refused);
+#   - other block devices (SD card, USB storage): as they are, rw too;
+#   - partitions listed in T2_PROTECTED (nvdata, nvram, persist, userdata, ...): never mounted,
+#     on any device;
+#   - root on the linux partition (t2.root=part:linux, /run/t2-rw-part): that partition as it
+#     is, and its disk (sdc) is never mounted.
+# t2_mount_parse (/usr/lib/t2/lib.sh) decides from the source itself whether it is a block
+# device, not from the mount point (/dev/shm, /dev/pts, /dev/mqueue used to be taken for
+# "devices" by mistake and mounted ro).
+# Second line of defence: the UFS is read-only anyway (BLKROSET, service t2-roguard) and locked
+# (block.ro_lock, see /usr/lib/t2/lib.sh).
+# The util-linux-misc package replaces /bin/mount with its own; the BLKROSET protection stays.
+. /usr/lib/t2/lib.sh
+T2_LOG_TAG=titan2-netroot
+die() { echo "mount: $*" >&2; t2_log "mount refused: $*"; exit 1; }
+
+t2_mount_parse "$@" || die "cannot resolve $T2M_SRC to a device"
+# not a block device (or mount without arguments, mount -a): as it is
+[ -n "$T2M_DEV" ] || exec /bin/busybox mount "$@"
+dev=$T2M_DEV
+n=${dev##*/}
+t2_virtual_blk "$n" && exec /bin/busybox mount "$@"
+pn=$(sed -n 's/^PARTNAME=//p' "/sys/class/block/$n/uevent" 2>/dev/null)
+for p in $T2_PROTECTED; do
+	[ "$pn" = "$p" ] && die "partition $pn ($dev) is protected"
+done
+# root on the linux partition: that partition as it is (openrc's remount,rw/ro of the root
+# too); its disk is never mounted (without the lock read-only is cleared on the disk for the
+# sake of the root partition)
+t2_rw_get
+[ -n "$T2_RW_PART" ] && [ "$n" = "$(t2_blk_parent "$T2_RW_PART")" ] &&
+	die "$dev holds the root partition: whole disk not mountable"
+[ -n "$T2_RW_PART" ] && [ "$n" = "$T2_RW_PART" ] && exec /bin/busybox mount "$@"
+# not UFS (SD card, USB storage): as usual
+t2_protected_blk "$n" || exec /bin/busybox mount "$@"
+[ -z "$T2M_RW" ] || die "$dev is on the UFS: read-only only"
+blockdev --setro "$dev" 2>/dev/null
+[ -n "$T2M_REMOUNT" ] && exec /bin/busybox mount "$@"
+exec /bin/busybox mount -r -o ro "$@"

@@ -1,43 +1,38 @@
 #!/bin/busybox sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
-# mount wrapper (Titan 2 initramfs). SAFETY: block devices are mounted ONLY
-# read-only (forced -o ro), rw/remount,rw are refused, partitions listed in T2_PROTECTED
-# (nvdata, nvram, persist, userdata, ...) are never mounted. Pseudo filesystems are passed through.
-# This is the second line of defence: all block devices are already marked read-only (BLKROSET).
+# mount wrapper (Titan 2 initramfs). SAFETY: UFS block devices (t2_protected_blk) are mounted
+# ONLY read-only (forced -o ro), rw/remount are refused for them; partitions listed in
+# T2_PROTECTED (nvdata, nvram, persist, userdata, ...) are not mounted at all, on any device.
+# Other devices (SD card, USB storage) as they are. A source that is not a block device (proc,
+# sysfs, devtmpfs, devpts, tmpfs, configfs, debugfs, --move, --bind of a directory) as it is:
+# t2_mount_parse decides from the source itself whether it is a block device, not from the
+# mount point (devpts on /dev/pts used to be mounted ro by mistake).
+# This is the second line of defence: UFS devices are marked read-only (BLKROSET) anyway.
+# Exception: the root partition from /run/t2-rw-part (t2.root=part:linux) is mounted as asked.
 . /etc/t2/lib.sh
 
 die() { echo "mount: $*" >&2; t2_log "mount refused: $*"; exit 1; }
 
-blk=
-for a in "$@"; do
-	case "$a" in
-	/dev/*|UUID=*|LABEL=*|PARTLABEL=*|PARTUUID=*) blk=$a ;;
-	esac
-	case ",$a," in
-	*,rw,*|*,remount,*) [ "$a" = "${a#-}" ] && die "rw/remount is not allowed here ($a)" ;;
-	esac
-	case "$a" in
-	-w|--rw|--read-write) die "rw is not allowed here" ;;
-	esac
-done
-# no arguments (listing) or no block device: plain mount
-if [ -z "$blk" ]; then
-	case " $* " in
-	*" -a "*|*" --all "*) die "mount -a is not allowed here" ;;
-	esac
+t2_mount_parse "$@" || die "cannot resolve $T2M_SRC to a device"
+if [ -z "$T2M_DEV" ]; then
+	[ -z "$T2M_ALL" ] || die "mount -a is not allowed here"
 	exec /bin/busybox mount "$@"
 fi
-case "$blk" in
-/dev/*)
-	dev=$(readlink -f "$blk")
-	n=${dev##*/}
-	pn=$(sed -n 's/^PARTNAME=//p' "/sys/class/block/$n/uevent" 2>/dev/null)
-	for p in $T2_PROTECTED; do
-		[ "$pn" = "$p" ] && die "partition $pn ($dev) is protected"
-	done
-	blockdev --setro "$dev" 2>/dev/null
-	;;
-*) die "only /dev/<node> is accepted here ($blk)" ;;
-esac
+dev=$T2M_DEV
+n=${dev##*/}
+pn=$(sed -n 's/^PARTNAME=//p' "/sys/class/block/$n/uevent" 2>/dev/null)
+for p in $T2_PROTECTED; do
+	[ "$pn" = "$p" ] && die "partition $pn ($dev) is protected"
+done
+# root on the linux partition (t2.root=part:linux): only this partition as asked, rw too;
+# its disk is never mounted (without the read-only lock the kernel does not refuse writes to it)
+t2_rw_get
+[ -n "$T2_RW_PART" ] && [ "$n" = "$(t2_blk_parent "$T2_RW_PART")" ] &&
+	die "$dev holds the root partition: whole disk not mountable"
+[ -n "$T2_RW_PART" ] && [ "$n" = "$T2_RW_PART" ] && exec /bin/busybox mount "$@"
+# not UFS (SD card, USB storage): as usual
+t2_protected_blk "$n" || exec /bin/busybox mount "$@"
+[ -z "$T2M_RW" ] && [ -z "$T2M_REMOUNT" ] || die "rw/remount is not allowed here ($dev)"
+blockdev --setro "$dev" 2>/dev/null
 exec /bin/busybox mount -r -o ro "$@"
