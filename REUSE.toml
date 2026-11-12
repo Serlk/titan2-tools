@@ -14,3 +14,14 @@ SPDX-License-Identifier = "MIT"
 path = ["scripts/testdata/titan2-sdc-layout.txt", "tools/netroot/t2-defroute.conf"]
 SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
 SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = ["tools/aports/titan2-vendor-runtime/tarball", "tools/mm-titan2/mm-mtk-ccci.patch", "tools/modemd/.gitignore", "tools/speechd/.gitignore", "tools/ccci-fsd/.gitignore", "tools/ccci-rpcd/.gitignore"]
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+# Patches against bionic_translation (Apache-2.0); they keep the license of the patched code.
+[[annotations]]
+path = "tools/titan2-vendor-runtime/patches/bionic_translation/*.patch"
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "Apache-2.0"

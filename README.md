@@ -6,8 +6,8 @@
 This repository has the tools that build and check boot images for the first mainline Linux
 (7.2) on the **Unihertz Titan 2** (MediaTek MT6878 / Dimensity 7300). The images are loaded by the
 **stock bootloader (LK), which is not modified**. The kernel itself is in
-[titan2-linux](../titan2-linux) (branch `titan2`). The documentation (LK requirements, boot
-attempts, hardware notes) is in [titan2-docs](../titan2-docs). The alpha1 images are attached to
+[titan2-linux](https://github.com/Serlk/titan2-linux) (branch `titan2`). The documentation (LK requirements, boot
+attempts, hardware notes) is in [titan2-docs](https://github.com/Serlk/titan2-docs). The alpha1 images are attached to
 the GitHub release `alpha1` of this repository.
 
 > **This is an alpha for developers.** It boots to a root shell over USB. There is no
@@ -106,7 +106,7 @@ images never write to the phone's storage: all UFS block devices are read-only.
 
 ## Dual boot: Android and Linux on its own partition
 
-Since 2026-10-24: a boot menu ([titan2-boot](../titan2-boot)) in `boot_a` starts Android or
+Since 2026-10-24: a boot menu ([titan2-boot](https://github.com/Serlk/titan2-boot)) in `boot_a` starts Android or
 mainline Linux; Linux lives on its own partition `linux`, carved from the end of `userdata`
 (Android's data is wiped once), and cannot write to Android's partitions (a one-way read-only
 lock in the kernel, `CONFIG_BLK_DEV_RO_LOCK`). The installation (with its own wipe order) and the
@@ -124,8 +124,8 @@ way back are in titan2-docs: `docs/DUALBOOT.md` and `docs/DUALBOOT-ROLLBACK.md`.
 ## Building
 
 ```
-git clone <titan2-tools> && cd titan2-tools
-git clone -b titan2 <titan2-linux> linux        # kernel tree (or kernel-source-alpha1.tar.gz + apply.sh)
+git clone https://github.com/Serlk/titan2-tools && cd titan2-tools
+git clone -b titan2 https://github.com/Serlk/titan2-linux linux        # kernel tree (or kernel-source-alpha1.tar.gz + apply.sh)
 # AOSP prebuilt clang r574158 (clang 21) into toolchains/clang-r574158:
 #   from https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 (directory clang-r574158)
 # AOSP mkbootimg (Apache-2.0, not included) into tools/mkbootimg:
@@ -156,6 +156,63 @@ tests it in qemu. Nothing in this repository flashes the phone.
 | `configs/mainline-titan2.config` | kernel config fragment on top of arm64 `defconfig` |
 | `docker/Dockerfile` | the `titan2-kbuild` build container |
 
+## Since alpha1: the Alpine system and its services
+
+The alpha1 tables above describe the first boot images. Since then this repository also builds
+the full Alpine system for the `linux` partition (or a network root) and carries the services
+that run on it. Hardware status and test notes are in titan2-docs.
+
+| path | what it does |
+|---|---|
+| `scripts/netroot-serve.sh` | builds the Alpine aarch64 root image (`build`), adds kernel modules (`modules`), serves it over NBD (`serve`); `GFX=1` adds niri, sensors and Bluetooth; `CAMERA=1`, `FP=1`, `GNSS=1` pull in the optional repositories (below) |
+| `scripts/linux-update.sh` | updates kernel, DTBs, initramfs and modules on the phone's `linux` partition over SSH, keeping the previous set as a fallback boot entry |
+| `scripts/t2-repo.sh` | builds our aports (`tools/aports`, plus aports of the optional repositories) and signs one local apk repository (`LOCAL_REPO=out/t2-repo`) |
+| `tools/netroot/` | services and settings of the Alpine system: default route over USB (`t2-defroute`), modem start (`t2-modem`), niri session (`t2-niri`, user set by `T2_NIRI_USER`), power and sleep tests (`t2-pmtest`, `t2-s2idle-test`), GPU/scheduler/thermal settings; `install.d/*.sh` install one service each |
+| `tools/mm-titan2/` | the `mtk-ccci` ModemManager plugin for the integrated MT6878 modem (MIPC + AT): data, SMS, VoLTE calls; `mm-mtk-ccci.patch` against ModemManager `fcc9d19f` |
+| `tools/ccci-fsd/`, `tools/ccci-rpcd/` | the modem's file server (NVRAM sandbox, never touches flash) and RPC server, needed before the modem reaches READY |
+| `tools/modemd/`, `tools/speechd/` | stand-alone modem daemon (the predecessor of the ModemManager plugin) and the voice-call speech path (modem PCM to ALSA) |
+| `tools/ucm/` | ALSA UCM configuration (HiFi, voice call) |
+| `tools/powerd/` | `t2-powerd`: suspend/resume broker with screen and maintenance hooks |
+| `tools/sensors/`, `tools/netroot/polkit/` | udev rules for iio-sensor-proxy (SCP sensor hub through `mtk-hf-iio`, accelerometer mount matrix) and the polkit rule for sensor claims |
+| `tools/charger/`, `tools/gpu-frequency/` | charger safety checks and GPU frequency table checks on the device |
+| `tools/titan2-vendor-runtime/`, `tools/aports/titan2-vendor-runtime/` | shared base for running the device's own closed HALs/daemons without containers (bionic loader, property and log services, file lists copied from **your** partitions at install time); used by titan2-fingerprint and titan2-gnss. No vendor files are in this repository |
+| `tools/aports/ada-libs3/` | repackages Alpine's `ada-libs` apk unchanged |
+
+Build helpers some READMEs mention: `toolchains/clang-r574158` is the AOSP clang from the
+"Building" section; `out/` holds every build output (never committed), for example a musl aarch64
+sysroot in `out/musl-aarch64/sysroot` for the static daemons.
+
+### Optional repositories
+
+Cameras, the fingerprint reader and GNSS live in their own repositories, each with its kernel
+series on a branch of titan2-linux. `scripts/netroot-serve.sh` takes them from `external/`
+(or `CAMERA_DIR=`, `FP_DIR=`, `GNSS_DIR=`):
+
+```
+git clone https://github.com/Serlk/titan2-camera external/titan2-camera
+git clone https://github.com/Serlk/titan2-fingerprint external/titan2-fingerprint
+git clone https://github.com/Serlk/titan2-gnss external/titan2-gnss
+CAMERA=1 FP=1 GNSS=1 LOCAL_REPO=out/t2-repo GFX=1 scripts/netroot-serve.sh build
+```
+
+Each enabled repository provides `netroot/packages` (packages added to the image),
+optionally `netroot/local-packages` (packages taken from `LOCAL_REPO`) and
+`netroot/install.d/*.sh` (sourced with `X` = that repository, mounted read-only at
+`/extra/<name>`, and `R` = the image root). titan2-fingerprint and titan2-gnss need the
+`titan2-vendor-runtime` package of this repository and `bionic_translation` built with the
+patches in `tools/titan2-vendor-runtime/patches/bionic_translation`.
+
+## Related repositories
+
+- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel. Branch `titan2` is the mainline port; branches `camera`, `fingerprint` and `gnss` carry the optional camera, fingerprint and GNSS series on top of it.
+- [titan2-boot](https://github.com/Serlk/titan2-boot): the boot menu in `boot_a` (Android and Linux side by side).
+- [titan2-tools](https://github.com/Serlk/titan2-tools): image builders, initramfs, network and disk root, modem, power and sensor services, and the shared `titan2-vendor-runtime`.
+- [titan2-docs](https://github.com/Serlk/titan2-docs): documentation and hardware notes.
+- [titan2-camera](https://github.com/Serlk/titan2-camera): cameras (libcamera patches, configuration, tests).
+- [titan2-fingerprint](https://github.com/Serlk/titan2-fingerprint): the fingerprint reader (FocalTech sensor through the TEE).
+- [titan2-gnss](https://github.com/Serlk/titan2-gnss): GNSS (navigation daemon, GPS HAL bridge, EPO assistance data).
+- [titan2-android](https://github.com/Serlk/titan2-android): Android builds for the Titan 2.
+
 ## How this project is made / affiliation
 
 - This project is developed with the help of AI coding assistants (Anthropic Claude). Commits
@@ -172,14 +229,17 @@ from the images and the device tree, register values) come from the phone itself
 its boot logs, readings on the device, the factory device tree, the phone's
 GPL-declared kernel modules and an analysis of the behaviour of the stock boot
 loader (no boot loader code is reproduced); public MediaTek GPL sources and
-upstream Linux were used for comparison. No proprietary code, firmware or blobs
-are included.
+upstream Linux were used for comparison. The modem file and RPC servers, the MIPC
+coding of the ModemManager plugin and the speech path were written from clean-room
+behavioural descriptions of the protocols; no code of the factory firmware was used.
+No proprietary code, firmware or blobs are included.
 
 ## License
 
 Copyright (c) 2026 serlk. GPL-2.0-or-later, see [LICENSE](LICENSE). Every file names its
 license in an `SPDX-License-Identifier` line. `tools/initramfs/keys/*.pub` is the Alpine Linux
-signing public key (from Alpine's `alpine-keys`, MIT). The kernel is GPL-2.0 (titan2-linux).
+signing public key (from Alpine's `alpine-keys`, MIT). AOSP headers in
+`tools/titan2-vendor-runtime/include/hardware` and the bionic_translation patches are Apache-2.0. The kernel is GPL-2.0 (titan2-linux).
 Third-party packages in the release initramfs, and where to get their sources:
 `initramfs-packages.md` in the release.
 

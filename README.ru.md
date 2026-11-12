@@ -6,8 +6,8 @@
 Здесь лежат инструменты, которые собирают и проверяют загрузочные образы для первого
 mainline-ядра Linux (7.2) на **Unihertz Titan 2** (MediaTek MT6878 / Dimensity 7300). Образы
 загружает **стоковый загрузчик LK, его мы не меняем**. Само ядро находится в
-[titan2-linux](../titan2-linux) (ветка `titan2`). Документация (требования LK, попытки загрузки,
-описание железа) — в [titan2-docs](../titan2-docs). Образы alpha1 приложены к GitHub-релизу
+[titan2-linux](https://github.com/Serlk/titan2-linux) (ветка `titan2`). Документация (требования LK, попытки загрузки,
+описание железа) — в [titan2-docs](https://github.com/Serlk/titan2-docs). Образы alpha1 приложены к GitHub-релизу
 `alpha1` этого репозитория.
 
 > **Это альфа для разработчиков.** Система загружается до root-консоли по USB. Графики, телефонии
@@ -105,7 +105,7 @@ scripts/restore-stock-boot.sh /путь/к/вашему/бэкапу     # жд�
 
 ## Две системы: Android и Linux на своём разделе
 
-С 2026-10-24: меню загрузки ([titan2-boot](../titan2-boot)) в `boot_a` запускает Android или
+С 2026-10-24: меню загрузки ([titan2-boot](https://github.com/Serlk/titan2-boot)) в `boot_a` запускает Android или
 mainline Linux; Linux живёт на своём разделе `linux`, отрезанном от конца `userdata` (данные
 Android стираются один раз), и не может писать в разделы Android (односторонняя блокировка
 read-only в ядре, `CONFIG_BLK_DEV_RO_LOCK`). Установка (со своим порядком стирания) и откат —
@@ -118,8 +118,8 @@ titan2-docs: `docs/DUALBOOT.md` и `docs/DUALBOOT-ROLLBACK.md`. Скрипты: 
 ## Сборка
 
 ```
-git clone <titan2-tools> && cd titan2-tools
-git clone -b titan2 <titan2-linux> linux        # дерево ядра (или kernel-source-alpha1.tar.gz + apply.sh)
+git clone https://github.com/Serlk/titan2-tools && cd titan2-tools
+git clone -b titan2 https://github.com/Serlk/titan2-linux linux        # дерево ядра (или kernel-source-alpha1.tar.gz + apply.sh)
 # AOSP clang r574158 (clang 21) в toolchains/clang-r574158:
 #   из https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 (каталог clang-r574158)
 # AOSP mkbootimg (Apache-2.0, не входит в репозиторий) в tools/mkbootimg:
@@ -147,6 +147,19 @@ i2c-tools, evtest, musl и другие) и проверяет их подпис
 | `tools/mini-init/`, `tools/devmem/` | статические утилиты aarch64 без libc |
 | `configs/mainline-titan2.config` | фрагмент конфигурации ядра поверх arm64 `defconfig` |
 | `docker/Dockerfile` | контейнер сборки `titan2-kbuild` |
+
+## После alpha1
+
+Описание всего, что добавилось после alpha1 (система Alpine для раздела `linux`, модем и
+плагин ModemManager, питание, датчики, общий `titan2-vendor-runtime`, необязательные
+репозитории камер, отпечатка и GNSS), есть только в английском [README.md](README.md):
+разделы «Since alpha1» и «Related repositories».
+
+## Связанные репозитории
+
+- [titan2-linux](https://github.com/Serlk/titan2-linux): ядро; ветка `titan2`, ветки `camera`, `fingerprint`, `gnss`.
+- [titan2-boot](https://github.com/Serlk/titan2-boot), [titan2-tools](https://github.com/Serlk/titan2-tools), [titan2-docs](https://github.com/Serlk/titan2-docs).
+- [titan2-camera](https://github.com/Serlk/titan2-camera), [titan2-fingerprint](https://github.com/Serlk/titan2-fingerprint), [titan2-gnss](https://github.com/Serlk/titan2-gnss), [titan2-android](https://github.com/Serlk/titan2-android).
 
 ## Как делается проект и с кем он связан
 
