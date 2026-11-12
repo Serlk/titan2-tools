@@ -254,3 +254,5 @@ Third-party packages in the release initramfs, and where to get their sources:
 - Alpine Linux, BusyBox and Dropbear.
 
 This project is not affiliated with Unihertz or MediaTek.
+
+Licensing: [LICENSE](LICENSE) (GPL-2.0), per-file details in [LICENSING.md](LICENSING.md).

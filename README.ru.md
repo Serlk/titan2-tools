@@ -198,3 +198,5 @@ Alpine Linux (из пакета Alpine `alpine-keys`, MIT). Ядро распр�
 - Alpine Linux, BusyBox и Dropbear.
 
 Проект не связан с Unihertz и MediaTek.
+
+Лицензии: [LICENSE](LICENSE) (GPL-2.0), подробности по файлам — в [LICENSING.md](LICENSING.md).
