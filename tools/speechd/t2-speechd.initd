@@ -1,0 +1,38 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: voice-call speech control (t2-speechd). Talks to the modem's speech engine over
+# /dev/ccci_aud and sets the modem side of the AP audio path (PCM 1 interconnect switches + the
+# hostless "Voice Call" PCM) on call-start/call-stop from its control socket. The codec is set by
+# the "Voice Call" UCM verb (PipeWire) unless T2_SPEECHD_CODEC_ROUTES=1. Needs the modem service (t2-modem) and the
+# mainline sound card (-audio DTB). Runs as root for now (/dev/ccci_aud is 0600 root, the
+# modem state file is in debugfs). Not added to a runlevel: rc-update add t2-speechd default.
+# Settings: /etc/conf.d/t2-speechd (T2_SPEECHD_ARGS, T2_SPEECHD_CODEC_ROUTES, T2_SPEECHD_LOG).
+description="Titan 2 voice-call speech control"
+
+: ${T2_SPEECHD_LOG:=/var/log/t2-speechd.log}
+: ${T2_SPEECHD_SOCK:=/run/t2-speechd.sock}
+: ${T2_SPEECHD_CODEC_ROUTES:=0}
+
+command=/usr/local/bin/t2-speechd
+command_args="${T2_SPEECHD_ARGS:--v} -r $T2_SPEECHD_CODEC_ROUTES -s $T2_SPEECHD_SOCK -d /dev/ccci_aud"
+command_background=yes
+pidfile=/run/t2-speechd.pid
+output_log="$T2_SPEECHD_LOG"
+error_log="$T2_SPEECHD_LOG"
+# SIGTERM: an active call is ended (call-stop) before the daemon exits
+retry="TERM/5/KILL/2"
+
+depend() {
+	need t2-modem
+	after alsasound
+}
+
+start_pre() {
+	if [ ! -c /dev/ccci_aud ]; then
+		eerror "no /dev/ccci_aud (mtk_ccci not probed?)"
+		return 1
+	fi
+	checkpath -f -m 0640 "$T2_SPEECHD_LOG"
+}

@@ -1,0 +1,51 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: modem control (t2-modemd). Owns the modem's AT port (/dev/wwan0at0) and the
+# MIPC data port (/dev/wwan0mipc1): radio, SIM, registration, mobile data (WWAN links),
+# voice calls (speech path via t2-speechd), SMS. Needs the modem service (t2-modem); runs
+# after t2-speechd so that call audio can be switched. Runs as root for now (debugfs state
+# file, ip link). Not added to a runlevel: rc-update add t2-modemd default.
+# Settings: /etc/conf.d/t2-modemd (T2_MODEMD_ARGS, T2_MODEMD_LOG) and /etc/t2-modemd.conf.
+description="Titan 2 modem control (AT/MIPC): radio, SIM, data, calls, SMS"
+
+: ${T2_MODEMD_LOG:=/var/log/t2-modemd.log}
+: ${T2_MODEMD_SOCK:=/run/t2-modemd.sock}
+: ${T2_MODEMD_AT:=/dev/wwan0at0}
+: ${T2_MODEMD_CONF:=/etc/t2-modemd.conf}
+
+command=/usr/local/bin/t2-modemd
+command_args="${T2_MODEMD_ARGS:--v} -s $T2_MODEMD_SOCK -d $T2_MODEMD_AT -c $T2_MODEMD_CONF"
+command_background=yes
+pidfile=/run/t2-modemd.pid
+output_log="$T2_MODEMD_LOG"
+error_log="$T2_MODEMD_LOG"
+# SIGTERM: calls are hung up (t2-speechd call-stop), data is taken down unless
+# keep_data_on_exit=1 in the configuration
+retry="TERM/10/KILL/2"
+
+depend() {
+	need t2-modem
+	after t2-speechd
+}
+
+start_pre() {
+	local i=0
+
+	# the WWAN ports appear shortly after the modem is READY
+	while [ ! -c "$T2_MODEMD_AT" ] && [ $i -lt 10 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	if [ ! -c "$T2_MODEMD_AT" ]; then
+		eerror "no $T2_MODEMD_AT (modem not ready / WWAN ports not enabled?)"
+		return 1
+	fi
+	if [ ! -e "$T2_MODEMD_CONF" ]; then
+		ewarn "no $T2_MODEMD_CONF, using the built-in defaults"
+		command_args="${T2_MODEMD_ARGS:--v} -s $T2_MODEMD_SOCK -d $T2_MODEMD_AT"
+	fi
+	checkpath -d -m 0755 /run/t2-modemd
+	checkpath -f -m 0640 "$T2_MODEMD_LOG"
+}
