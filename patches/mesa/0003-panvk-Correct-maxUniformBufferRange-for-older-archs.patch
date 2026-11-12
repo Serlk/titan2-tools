@@ -1,0 +1,33 @@
+From 8222022a742607d2cd276e3d5dc3877a1b2f8599 Mon Sep 17 00:00:00 2001
+From: Christian Gmeiner <cgmeiner@igalia.com>
+Date: Thu, 22 Oct 2026 11:47:47 +0200
+Subject: [PATCH] panvk: Correct maxUniformBufferRange for older archs
+
+The Entries field is 12 bits, so 4096 entries of 16 bytes give 64 KiB.
+
+Fixes: d5ed77800e0 ("panvk: Fix GetPhysicalDeviceProperties2() to report accurate info")
+Cc: mesa-stable
+Reported-by: Lorenzo Rossi <lorenzo.rossi@collabora.com>
+Signed-off-by: Christian Gmeiner <cgmeiner@igalia.com>
+Reviewed-by: Lorenzo Rossi <lorenzo.rossi@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45482>
+
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 1dc317512ff..7655893806d 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -876,9 +876,9 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxImageArrayLayers = (1 << 16),
+       .maxTexelBufferElements = UINT64_C(1) << (util_logbase2(panvk_get_max_buffer_size(device) / 16)),
+       /* Each uniform entry is 16-byte and the number of entries is encoded in a
+-       * 12-bit field, with the minus(1) modifier, which gives 2^20.
++       * 12-bit field, with the minus(1) modifier, which gives 2^16.
+        */
+-      .maxUniformBufferRange = 1 << 20,
++      .maxUniformBufferRange = 1 << 16,
+       /* Storage buffer access is lowered to globals, so there's no limit here,
+        * except for the SW-descriptor we use to encode storage buffer
+        * descriptors, where the size is a 32-bit field.
+-- 
+2.56.0
+

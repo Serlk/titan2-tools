@@ -1,0 +1,251 @@
+From 7165b383f0f0bf160e2502ff567594a54590ab3d Mon Sep 17 00:00:00 2001
+From: Faith Ekstrand <faith.ekstrand@collabora.com>
+Date: Mon, 2 Nov 2026 12:50:12 -0500
+Subject: [PATCH] panfrost,nir: Get rid of nir_downgrade_pls_vars()
+
+Downgrading an `inout` PLS var to `in` is fine but downgrading an
+`inout` PLS var to `out` may not be.  If an `inout` var has only a
+subset of the somponents updated, we still need to read the original
+value so we can mix it with the newly written component and write back
+out the full value.  If, on the other hand, the shader is writing all
+the components without reading any, dead code elimination will get rid
+of the copy inserted by nir_lower_io_vars_to_temporaries().
+
+Reviewed-by: Eric R. Smith <eric.smith@collabora.com>
+Fixes: 98bd0850da07 ("nir: Add a pass to downgrade inout PLS vars to {in,out} only ones")
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45863>
+(cherry picked from commit d6836e200304770b991e0a04f8629f166f4ecdcf)
+
+diff --git a/src/compiler/nir/meson.build b/src/compiler/nir/meson.build
+index 23e754e18ae..436e3714b4a 100644
+--- a/src/compiler/nir/meson.build
++++ b/src/compiler/nir/meson.build
+@@ -117,7 +117,6 @@ else
+   'nir_divergence_analysis.c',
+   'nir_dominance.c',
+   'nir_dominance_lca.c',
+-  'nir_downgrade_pls_vars.c',
+   'nir_fixup_is_exported.c',
+   'nir_format_convert.c',
+   'nir_format_convert.h',
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index ff240f7b442..5a908de99a0 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -5714,8 +5714,6 @@ bool nir_lower_indirect_var_derefs_to_if_else_trees(nir_shader *shader,
+ 
+ bool nir_lower_locals_to_regs(nir_shader *shader, uint8_t bool_bitsize);
+ 
+-bool nir_downgrade_pls_vars(nir_shader *shader);
+-
+ bool nir_lower_io_vars_to_temporaries(nir_shader *shader,
+                                       nir_function_impl *entrypoint,
+                                       nir_variable_mode modes);
+diff --git a/src/compiler/nir/nir_downgrade_pls_vars.c b/src/compiler/nir/nir_downgrade_pls_vars.c
+deleted file mode 100644
+index 5c337a2e9a4..00000000000
+--- a/src/compiler/nir/nir_downgrade_pls_vars.c
++++ /dev/null
+@@ -1,172 +0,0 @@
+-/*
+- * Copyright 2025 Collabora Ltd
+- * SPDX-License-Identifier: MIT
+- */
+-
+-#include "nir.h"
+-#include "nir_builder.h"
+-#include "nir_deref.h"
+-
+-/*
+- * Shaders might declare PLS vars as inout but might just use them as in or out
+- * but not both. This pass detects those cases and adjusts the variable/deref
+- * modes accordingly.
+- *
+- * Should be called before nir_lower_io_vars_to_temporaries(), otherwise the
+- * copy_derefs will be inserted, turning unused variables into used ones.
+- * Should ideally be called after DCE to make sure we don't leave PLS inout
+- * variables behind.
+- */
+-
+-static bool
+-update_pls_var_mode(struct nir_builder *b, nir_intrinsic_instr *intrin, void *_)
+-{
+-   nir_deref_instr *load_deref = NULL, *store_deref = NULL;
+-   bool progress = false;
+-
+-   if (intrin->intrinsic == nir_intrinsic_load_deref) {
+-      load_deref = nir_src_as_deref(intrin->src[0]);
+-   } else if (intrin->intrinsic == nir_intrinsic_store_deref) {
+-      store_deref = nir_src_as_deref(intrin->src[0]);
+-   } else if (intrin->intrinsic == nir_intrinsic_copy_deref) {
+-      store_deref = nir_src_as_deref(intrin->src[0]);
+-      load_deref = nir_src_as_deref(intrin->src[1]);
+-   } else {
+-      return false;
+-   }
+-
+-   if (load_deref && !(load_deref->modes & nir_var_any_pixel_local))
+-      load_deref = NULL;
+-
+-   if (store_deref && !(store_deref->modes & nir_var_any_pixel_local))
+-      store_deref = NULL;
+-
+-   nir_variable *in_var =
+-      load_deref ? nir_deref_instr_get_variable(load_deref) : NULL;
+-   nir_variable *out_var =
+-      store_deref ? nir_deref_instr_get_variable(store_deref) : NULL;
+-
+-   if (in_var) {
+-      if (in_var->data.mode == 0) {
+-         in_var->data.mode = nir_var_mem_pixel_local_in;
+-         progress = true;
+-      } else if (in_var->data.mode == nir_var_mem_pixel_local_out) {
+-         in_var->data.mode = nir_var_mem_pixel_local_inout;
+-         progress = true;
+-      }
+-   }
+-
+-   if (out_var) {
+-      if (out_var->data.mode == 0) {
+-         out_var->data.mode = nir_var_mem_pixel_local_out;
+-         progress = true;
+-      } else if (out_var->data.mode == nir_var_mem_pixel_local_in) {
+-         out_var->data.mode = nir_var_mem_pixel_local_inout;
+-         progress = true;
+-      }
+-   }
+-
+-   return progress;
+-}
+-
+-static bool
+-propagate_pls_var_mode(struct nir_builder *b, nir_intrinsic_instr *intrin, void *_)
+-{
+-   nir_deref_instr *load_deref = NULL, *store_deref = NULL;
+-   bool progress = false;
+-
+-   if (intrin->intrinsic == nir_intrinsic_load_deref) {
+-      load_deref = nir_src_as_deref(intrin->src[0]);
+-   } else if (intrin->intrinsic == nir_intrinsic_store_deref) {
+-      store_deref = nir_src_as_deref(intrin->src[0]);
+-   } else if (intrin->intrinsic == nir_intrinsic_copy_deref) {
+-      store_deref = nir_src_as_deref(intrin->src[0]);
+-      load_deref = nir_src_as_deref(intrin->src[1]);
+-   } else {
+-      return false;
+-   }
+-
+-   if (load_deref && !(load_deref->modes & nir_var_any_pixel_local))
+-      load_deref = NULL;
+-
+-   if (store_deref && !(store_deref->modes & nir_var_any_pixel_local))
+-      store_deref = NULL;
+-
+-   nir_variable *in_var =
+-      load_deref ? nir_deref_instr_get_variable(load_deref) : NULL;
+-   nir_variable *out_var =
+-      store_deref ? nir_deref_instr_get_variable(store_deref) : NULL;
+-
+-   if (in_var && in_var->data.mode != load_deref->modes) {
+-      nir_deref_path path;
+-      nir_deref_path_init(&path, load_deref, NULL);
+-
+-      for (unsigned i = 0; path.path[i]; i++) {
+-         if (path.path[i]->modes == in_var->data.mode)
+-            break;
+-
+-         path.path[i]->modes = in_var->data.mode;
+-      }
+-
+-      nir_deref_path_finish(&path);
+-      progress = true;
+-   }
+-
+-   if (out_var && out_var->data.mode != store_deref->modes) {
+-      nir_deref_path path;
+-      nir_deref_path_init(&path, store_deref, NULL);
+-
+-      for (unsigned i = 0; path.path[i]; i++) {
+-         if (path.path[i]->modes == out_var->data.mode)
+-            break;
+-
+-         path.path[i]->modes = out_var->data.mode;
+-      }
+-
+-      nir_deref_path_finish(&path);
+-      progress = true;
+-   }
+-
+-   return progress;
+-}
+-
+-bool
+-nir_downgrade_pls_vars(nir_shader *shader)
+-{
+-   bool progress = false;
+-
+-   /* First we reset the mode of PLS inout vars. */
+-   nir_foreach_variable_with_modes(var, shader,
+-                                   nir_var_mem_pixel_local_inout) {
+-      var->data.mode = 0;
+-      progress = true;
+-   }
+-
+-   if (!progress)
+-      return false;
+-
+-   /* Then we re-apply a mode based on the actual accesses and
+-    * we propagate the new mode to all PLS derefs.
+-    */
+-   progress = false;
+-   if (nir_shader_intrinsics_pass(shader,
+-                                  update_pls_var_mode,
+-                                  nir_metadata_all,
+-                                  NULL)) {
+-      nir_shader_intrinsics_pass(shader,
+-                                 propagate_pls_var_mode,
+-                                 nir_metadata_all,
+-                                 NULL);
+-      progress = true;
+-   }
+-
+-   /* Get rid of the PLS vars that were unused. */
+-   nir_foreach_variable_in_shader_safe(var, shader) {
+-      if (!var->data.mode) {
+-         exec_node_remove(&var->node);
+-         progress = true;
+-      }
+-   }
+-
+-   return progress;
+-}
+diff --git a/src/gallium/drivers/panfrost/pan_shader.c b/src/gallium/drivers/panfrost/pan_shader.c
+index 045e937834e..65a782c0328 100644
+--- a/src/gallium/drivers/panfrost/pan_shader.c
++++ b/src/gallium/drivers/panfrost/pan_shader.c
+@@ -517,12 +517,17 @@ panfrost_create_shader_state(struct pipe_context *pctx,
+    /* PLS lowering is not taken care of by glsl_to_nir(), so do it here. */
+    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+        nir->info.fs.accesses_pixel_local_storage) {
+-      /* Try to optimize the case where inout PLS vars are never
+-       * read/written to. Needs to be called before
+-       * nir_lower_io_vars_to_temporaries() because the copy_derefs
+-       * inserted there prevent us from detecting PLS usage.
++      /* Delete any unaccessed PLS vars.  If we never read or write it, we
++       * don't need it anymore.  The data will sit in tile memory untouched.
++       * This prevents us from inserting unnecessary loads and stores for
++       * untouched inout PLS vars.  For untouched out PLS vars, the garbage
++       * that's sitting there now is just as good as the garbage we'd write.
++       *
++       * This prevents nir_lower_io_vars_to_temporaries() from adding
++       * redundant copies to/from unused inout vars.
+        */
+-      NIR_PASS(_, nir, nir_downgrade_pls_vars);
++      NIR_PASS(_, nir, nir_remove_dead_variables,
++               nir_var_any_pixel_local, NULL);
+ 
+       /* Lower PLS vars to temporaries before we lower IOs. */
+       NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+-- 
+2.56.0
+

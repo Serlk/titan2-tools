@@ -25,3 +25,37 @@ SPDX-License-Identifier = "GPL-2.0-or-later"
 path = "tools/titan2-vendor-runtime/patches/bionic_translation/*.patch"
 SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
 SPDX-License-Identifier = "Apache-2.0"
+
+# Mesa build (scripts/build-mesa.sh). Mesa is MIT; the patches against it keep that license.
+# 0001 is ours; 0002-0005 are backports of upstream Mesa commits by their authors (see the
+# From: and Signed-off-by: lines of each patch).
+[[annotations]]
+path = "patches/mesa/0001-*.patch"
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "patches/mesa/0002-*.patch"
+SPDX-FileCopyrightText = "2026 Olivia Lee <olivia.lee@collabora.com>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "patches/mesa/0003-*.patch"
+SPDX-FileCopyrightText = "2026 Christian Gmeiner <cgmeiner@igalia.com>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "patches/mesa/0004-*.patch"
+SPDX-FileCopyrightText = "2026 Eric R. Smith <eric.smith@collabora.com>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "patches/mesa/0005-*.patch"
+SPDX-FileCopyrightText = "2026 Faith Ekstrand <faith.ekstrand@collabora.com>"
+SPDX-License-Identifier = "MIT"
+
+# Changes to Alpine's aports main/mesa APKBUILD; the context lines are from that APKBUILD.
+[[annotations]]
+path = "tools/mesa/APKBUILD.diff"
+SPDX-FileCopyrightText = ["2026 serlk <22211586+Serlk@users.noreply.github.com>", "Alpine Linux aports contributors"]
+SPDX-License-Identifier = "MIT"

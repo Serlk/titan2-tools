@@ -1,0 +1,61 @@
+From d9a1438ab7f36408a29640cf5bff068dce8f6744 Mon Sep 17 00:00:00 2001
+From: "Eric R. Smith" <eric.smith@collabora.com>
+Date: Wed, 4 Nov 2026 19:57:24 -0400
+Subject: [PATCH] panfrost: make sure render_target_mask is non-empty if PLS is
+ enabled
+
+If render_target_mask is 0 then the fragment shader is skipped, which
+we don't want if pixel local storage is enabled.
+
+Fixes: 298ad17b81e ("panfrost: enable EXT_shader_pixel_local_storage")
+Signed-off-by: Eric R. Smith <eric.smith@collabora.com>
+Reviewed-by: Lars-Ivar Hesselberg Simonsen <lars-ivar.simonsen@arm.com>
+Reviewed-by: Faith Ekstrand <faith.ekstrand@collabora.com>
+Reviewed-by: Daniel Stone <daniels@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45945>
+(cherry picked from commit bbb80b8154fbfac2dd71ca63d89c3de0eb833542)
+
+diff --git a/src/gallium/drivers/panfrost/pan_csf.c b/src/gallium/drivers/panfrost/pan_csf.c
+index 75474a671a6..83b2228c1d1 100644
+--- a/src/gallium/drivers/panfrost/pan_csf.c
++++ b/src/gallium/drivers/panfrost/pan_csf.c
+@@ -1558,8 +1558,10 @@ csf_emit_draw_flags(struct panfrost_context *ctx, enum mesa_prim mode,
+ 
+       if (fs_required) {
+          /* See JM Valhall equivalent code */
+-         flags_1->render_target_mask =
+-            (fs->info.outputs_written >> FRAG_RESULT_DATA0) & ctx->fb_rt_mask;
++         /* if PLS is enabled we may write to any output to store data */
++         flags_1->render_target_mask = ctx->fb_rt_mask;
++         if (!ctx->pipe_framebuffer.pls_enabled)
++            flags_1->render_target_mask &= fs->info.outputs_written >> FRAG_RESULT_DATA0;
+       }
+    }
+ }
+diff --git a/src/gallium/drivers/panfrost/pan_jm.c b/src/gallium/drivers/panfrost/pan_jm.c
+index 066b2f0f7ed..ce6e1d92620 100644
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -607,13 +607,16 @@ jm_emit_tiler_draw(struct mali_draw_packed *out, struct panfrost_batch *batch,
+           * target may be written if the fragment shader writes
+           * to it AND it actually exists. If the render target
+           * doesn't actually exist, the blend descriptor will be
+-          * OFF so it may be omitted from the mask.
++          * OFF so it may be omitted from the mask (unless pixel
++          * local storage is on).
+           *
+           * Only set when there is a fragment shader, since
+           * otherwise no colour updates are possible.
+           */
+-         cfg.flags_1.render_target_mask =
+-            (fs->info.outputs_written >> FRAG_RESULT_DATA0) & ctx->fb_rt_mask;
++         cfg.flags_1.render_target_mask = ctx->fb_rt_mask;
++         if (!ctx->pipe_framebuffer.pls_enabled)
++            cfg.flags_1.render_target_mask &=
++               fs->info.outputs_written >> FRAG_RESULT_DATA0;
+ 
+          /* Also use per-sample shading if required by the shader
+           */
+-- 
+2.56.0
+

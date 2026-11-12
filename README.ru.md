@@ -184,7 +184,8 @@ i2c-tools, evtest, musl и другие) и проверяет их подпис
 
 Copyright (c) 2026 serlk. GPL-2.0-or-later, см. [LICENSE](LICENSE). Лицензия каждого файла
 указана в строке `SPDX-License-Identifier`. `tools/initramfs/keys/*.pub` — открытый ключ подписи
-Alpine Linux (из пакета Alpine `alpine-keys`, MIT). Ядро распространяется под GPL-2.0
+Alpine Linux (из пакета Alpine `alpine-keys`, MIT). Патчи Mesa в `patches/mesa/` — MIT, как сама Mesa;
+0002–0005 — коммиты Mesa upstream, авторство сохранено. Ядро распространяется под GPL-2.0
 (titan2-linux). Сторонние пакеты в initramfs релиза и где взять их исходники — файл
 `initramfs-packages.md` в релизе.
 

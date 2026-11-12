@@ -1,0 +1,111 @@
+--- APKBUILD
++++ APKBUILD
+@@ -3,7 +3,7 @@
+ pkgname=mesa
+ pkgver=26.2.6
+ pkgrel=0
+-pkgdesc="Mesa DRI OpenGL library"
++pkgdesc="Mesa DRI OpenGL library (Titan 2: panfrost/panvk + Mali-G615 v11)"
+ url="https://www.mesa3d.org"
+ arch="all"
+ license="MIT AND SGI-B-2.0 AND BSL-1.0"
+@@ -11,16 +11,14 @@
+ 	$pkgname-dbg
+ 	$pkgname-dev
+ 	$pkgname-dri-gallium:_gallium
+-	$pkgname-va-gallium:_va
+ 	$pkgname-egl
+ 	$pkgname-gl
+ 	$pkgname-gles
+ 	$pkgname-gbm
+-	$pkgname-vulkan-ati:_vulkan
+ 	$pkgname-vulkan-swrast:_vulkan
+ 	$pkgname-vulkan-layers:_vulkan_layers
+ 	"
+-_llvmver=23
++_llvmver=22  # Titan 2: Alpine v3.24 ships LLVM 22 (edge: 23)
+ depends_dev="
+ 	libdrm-dev
+ 	libxdamage-dev
+@@ -76,7 +74,6 @@
+ 	rustc-hash-$_rustc_hash_version.tar.gz::https://static.crates.io/crates/rustc-hash/rustc-hash-$_rustc_hash_version.crate
+ 	23575.patch
+ 	riscv64-tls.patch
+-	llvm23.patch
+ 	"
+ builddir="$srcdir/mesa-${pkgver/_/-}"
+ options="!check" # TODO
+@@ -123,18 +120,19 @@
+ 	_vulkan_drivers="$_vulkan_drivers,asahi,broadcom,freedreno,imagination,intel,nouveau,panfrost,virtio"
+ 	subpackages="
+ 		$subpackages
+-		$pkgname-vulkan-asahi:_vulkan
+-		$pkgname-vulkan-broadcom:_vulkan
+-		$pkgname-vulkan-freedreno:_vulkan
+-		$pkgname-vulkan-imagination:_vulkan
+-		$pkgname-vulkan-intel:_vulkan
+-		$pkgname-vulkan-nouveau:_vulkan
+ 		$pkgname-vulkan-panfrost:_vulkan
+-		$pkgname-vulkan-virtio:_vulkan
+ 		"
+ 	;;
+ esac
+ 
++# Titan 2: only what the Mali-G615 (panthor) needs, plus the software fallback
++case "$CARCH" in
++aarch64)
++	_gallium_drivers="panfrost,llvmpipe,softpipe"
++	_vulkan_drivers="panfrost,swrast"
++	;;
++esac
++
+ _intel_rt=disabled
+ case "$CARCH" in
+ 	x86_64) _intel_rt=enabled ;;
+@@ -167,10 +165,14 @@
+ 		rust-bindgen
+ 		spirv-llvm-translator-dev
+ 		"
+-	subpackages="
+-		$subpackages
+-		$pkgname-rusticl
+-		"
++	if [ "$CARCH" = aarch64 ]; then
++		_rusticl=false  # Titan 2
++	else
++		subpackages="
++			$subpackages
++			$pkgname-rusticl
++			"
++	fi
+ 	;;
+ armhf)
+ 	# still requires clc for panfrost (https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/32720)
+@@ -246,8 +248,6 @@
+ 		-Dgallium-drivers=$_gallium_drivers \
+ 		-Dvulkan-drivers=$_vulkan_drivers \
+ 		-Dvulkan-layers=$_vulkan_layers \
+-		-Damdgpu-virtio=true \
+-		-Dfreedreno-kmds=msm,virtio \
+ 		-Dplatforms=x11,wayland \
+ 		-Dllvm=enabled \
+ 		-Dshared-llvm=enabled \
+@@ -259,10 +259,9 @@
+ 		-Degl=enabled \
+ 		-Dgallium-extra-hud=true \
+ 		-Dgallium-rusticl=$_rusticl \
+-		-Dgallium-rusticl-enable-drivers=auto,freedreno \
+-		-Dgallium-va=enabled \
++		-Dgallium-va=disabled \
+ 		-Drust_std=2021 \
+-		-Dvideo-codecs=all \
++		-Dvideo-codecs= \
+ 		. output
+ 
+ 	# Print config
+@@ -429,5 +428,4 @@
+ 87097d98d47f327d000041ab13acddc366f1500d9c3e5c82169c3358112c7a7c03701c9b3c2c81d9f9da65b7ebac1c479b179dfaf7c059cd0b929b4673e51084  rustc-hash-2.1.1.tar.gz
+ 91bdda3a4b5906963c8c0053ebb924b952dac3d50e66afee87a7abebf82141426b34dce7e1947fe18c54dedd33537792ec13a94504ff7ad890243507d57fdc88  23575.patch
+ ce1887fb7d425b94c375a0547bee40c308809c01f5ce1bcddabcc69a7fcb445efb9d5f5c7bac49b2778ab40687c7bce204d278b0bf028d124c75e59083107fba  riscv64-tls.patch
+-0ca39282aa42d0b10a5d88a49cc91aea94caa6a9785e7bf75071d101c09ec5debd63a4478053657e163c94007d765d1f05c98a12fe16ad044c3fc10ef1fc27e9  llvm23.patch
+ "

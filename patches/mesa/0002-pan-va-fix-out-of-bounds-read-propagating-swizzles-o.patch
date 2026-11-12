@@ -1,0 +1,33 @@
+From ea40598a68bab5690e0d08f845e2776ef9be2db9 Mon Sep 17 00:00:00 2001
+From: Olivia Lee <olivia.lee@collabora.com>
+Date: Mon, 26 Oct 2026 23:08:28 -0700
+Subject: [PATCH] pan/va: fix out-of-bounds read propagating swizzles on pseudo
+ instructions
+
+For variable src pseudo instructions (PHI and COLLECT.i32), src info is
+not recorded in the info.srcs array. The array is also statically sized,
+and there may be more than 4 srcs leading to an out-of-bounds access.
+
+Fixes: 67a662ed058a (pan/bi: Propagate MKVEC.v2i8 and V2X8_TO_V2X16 for replicate swizzle)
+Signed-off-by: Olivia Lee <olivia.lee@collabora.com>
+Reviewed-by: Eric R. Smith <eric.smith@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45650>
+
+diff --git a/src/panfrost/compiler/bifrost/valhall/va_optimize.c b/src/panfrost/compiler/bifrost/valhall/va_optimize.c
+index 617bc329b8d..8845f461abf 100644
+--- a/src/panfrost/compiler/bifrost/valhall/va_optimize.c
++++ b/src/panfrost/compiler/bifrost/valhall/va_optimize.c
+@@ -296,6 +296,10 @@ va_propagate_replicate_wide(bi_context *ctx, bi_instr **lut, bi_instr *I)
+    struct va_opcode_info info = valhall_opcodes[I->op];
+    bool progress = false;
+ 
++   bool variable_srcs = info.nr_srcs == 0;
++   if (variable_srcs)
++      return false;
++
+    bi_foreach_ssa_src(I, s) {
+       if (!info.srcs[s].widen)
+          continue;
+-- 
+2.56.0
+

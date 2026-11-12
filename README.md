@@ -167,6 +167,7 @@ that run on it. Hardware status and test notes are in titan2-docs.
 | `scripts/netroot-serve.sh` | builds the Alpine aarch64 root image (`build`), adds kernel modules (`modules`), serves it over NBD (`serve`); `GFX=1` adds niri, sensors and Bluetooth; `CAMERA=1`, `FP=1`, `GNSS=1` pull in the optional repositories (below) |
 | `scripts/linux-update.sh` | updates kernel, DTBs, initramfs and modules on the phone's `linux` partition over SSH, keeping the previous set as a fallback boot entry |
 | `scripts/t2-repo.sh` | builds our aports (`tools/aports`, plus aports of the optional repositories) and signs one local apk repository (`LOCAL_REPO=out/t2-repo`) |
+| `scripts/build-mesa.sh`, `tools/mesa/`, `patches/mesa/` | builds Mesa 26.3 for Alpine v3.24 aarch64 (panfrost/panvk for the Mali-G615, the first Mesa release with this GPU) from Alpine's aport plus our patches, signed with your `t2-repo` key; `t2-repo.sh build` indexes the packages. Without it the GPU is not used (software rendering) |
 | `tools/netroot/` | services and settings of the Alpine system: default route over USB (`t2-defroute`), modem start (`t2-modem`), niri session (`t2-niri`, user set by `T2_NIRI_USER`), power and sleep tests (`t2-pmtest`, `t2-s2idle-test`), GPU/scheduler/thermal settings; `install.d/*.sh` install one service each |
 | `tools/mm-titan2/` | the `mtk-ccci` ModemManager plugin for the integrated MT6878 modem (MIPC + AT): data, SMS, VoLTE calls; `mm-mtk-ccci.patch` against ModemManager `fcc9d19f` |
 | `tools/ccci-fsd/`, `tools/ccci-rpcd/` | the modem's file server (NVRAM sandbox, never touches flash) and RPC server, needed before the modem reaches READY |
@@ -240,7 +241,8 @@ No proprietary code, firmware or blobs are included.
 Copyright (c) 2026 serlk. GPL-2.0-or-later, see [LICENSE](LICENSE). Every file names its
 license in an `SPDX-License-Identifier` line. `tools/initramfs/keys/*.pub` is the Alpine Linux
 signing public key (from Alpine's `alpine-keys`, MIT). AOSP headers in
-`tools/titan2-vendor-runtime/include/hardware` and the bionic_translation patches are Apache-2.0. The kernel is GPL-2.0 (titan2-linux).
+`tools/titan2-vendor-runtime/include/hardware` and the bionic_translation patches are Apache-2.0. The Mesa patches in `patches/mesa/` are MIT, like Mesa;
+0002-0005 are upstream Mesa commits and keep their authors. The kernel is GPL-2.0 (titan2-linux).
 Third-party packages in the release initramfs, and where to get their sources:
 `initramfs-packages.md` in the release.
 
