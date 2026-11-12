@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Every wake-up, one line in syslog: class, sources, the SPM's word, how long.
+logger -t t2-powerd-hook "wake class=$T2_WAKE_CLASS sources=[$T2_WAKE_SOURCES] spm=[$T2_WAKE_SPM] slept_ms=$T2_SLEPT_MS"
+exit 0

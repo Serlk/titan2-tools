@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Keep the Wi-Fi association through system sleep: without a WoWLAN
+# configuration cfg80211 disconnects the station before suspend. The
+# MT6878 firmware wakes the host for every frame it passes up ("any").
+command -v iw >/dev/null 2>&1 || exit 0
+for phy in /sys/class/ieee80211/*; do
+	[ -d "$phy" ] || continue
+	p=${phy##*/}
+	iw phy "$p" wowlan show 2>/dev/null | grep -q 'enabled' && continue
+	iw phy "$p" wowlan enable any 2>/dev/null
+done
+exit 0

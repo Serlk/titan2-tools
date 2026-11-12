@@ -1,0 +1,32 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: the system sleep broker (t2-powerd). Suspends the phone (s2idle)
+# a while after the screen goes off unless a lease is held (t2-powerctl
+# inhibit, a call on ModemManager, an SSH session, a USB host), classifies
+# every wake-up, keeps the RTC alarm for user alarms and the maintenance
+# ("doze") windows. Settings: /etc/t2-powerd.conf, hooks: /etc/t2-powerd/hooks.
+# Not added to a runlevel by the image build: rc-update add t2-powerd default.
+description="Titan 2 system sleep broker"
+
+: ${T2_POWERD_ARGS:=}
+
+command=/usr/local/bin/t2-powerd
+command_args="$T2_POWERD_ARGS"
+command_background=yes
+pidfile=/run/t2-powerd.pid
+
+depend() {
+	need localmount
+	after dbus modemmanager udev-trigger syslog
+}
+
+start_pre() {
+	if [ -e /etc/init.d/t2-sleepd ] && rc-service -q t2-sleepd status 2>/dev/null; then
+		eerror "t2-sleepd is running: stop it, only one sleep policy at a time"
+		return 1
+	fi
+	checkpath -d -m 0755 /run/t2-powerd
+	[ -r /sys/power/wakeup_count ] || ewarn "no /sys/power/wakeup_count: the kernel has no CONFIG_PM_SLEEP"
+}

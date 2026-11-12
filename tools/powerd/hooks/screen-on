@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# /etc/t2-powerd/hooks/screen-on: the power key was pressed with the screen
+# off (or woke the phone). niri turns its outputs on by itself on input;
+# this makes sure of it.
+for s in /run/user/*/niri*.sock /run/user/*/niri/*.sock; do
+	[ -S "$s" ] || continue
+	NIRI_SOCKET=$s niri msg action power-on-monitors 2>/dev/null
+done
+exit 0
