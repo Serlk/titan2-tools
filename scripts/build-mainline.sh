@@ -2,24 +2,42 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
 # Build the mainline kernel for Titan 2 (titan2-linux, titan2 branch):
-# arm64 defconfig + configs/mainline-titan2.config -> out/mainline-build/arch/arm64/boot/Image.gz and the DTB.
+# arm64 defconfig + configs/mainline-titan2.config [+ FRAGMENTS] -> out/mainline-build/arch/arm64/boot/Image.gz
+# and the DTBs.
 # Flashes nothing. nice/ionice, JOBS=4 by default.
 # SRC/O (relative to the repo root): the kernel tree (clone of titan2-linux, titan2 branch) and the build
 # directory. Requires the titan2-kbuild docker image (docker/Dockerfile) and AOSP clang r574158 in
 # toolchains/clang-r574158 (see README).
 #   SRC=linux O=out/mainline-build [MODULES=0] scripts/build-mainline.sh   (MODULES=0: no modules)
+# FRAGMENTS="file ..." (or CONFIG_FRAGMENTS): more config fragments, merged after
+# configs/mainline-titan2.config in the order given (scripts/kconfig/merge_config.sh: a later
+# value of a symbol wins). A relative path is relative to the current directory; the files may be
+# outside this repository (each one is mounted read-only into the build container). The kernel
+# tree must carry the matching patch series, e.g. the camera (git am of
+# titan2-camera/kernel/patches/*.patch on the titan2 branch):
+#   SRC=linux FRAGMENTS=../titan2-camera/kernel/titan2-camera.config scripts/build-mainline.sh
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=${SRC:-linux}
 O=${O:-out/mainline-build}
+FRAGMENTS=${FRAGMENTS:-${CONFIG_FRAGMENTS:-}}
+FRAG_MOUNTS=() FRAG_FILES=
+i=0
+for f in $FRAGMENTS; do
+	[ -f "$f" ] || { echo "FRAGMENTS: no file $f" >&2; exit 1; }
+	i=$((i + 1))
+	FRAG_MOUNTS+=(-v "$(realpath "$f"):/fragments/$i-$(basename "$f"):ro")
+	FRAG_FILES="$FRAG_FILES /fragments/$i-$(basename "$f")"
+	echo "config fragment $i: $f"
+done
 nice -n 19 ionice -c 3 docker run --rm --name "titan2-mainline-$$" --cpu-shares 128 \
-	-u "$(id -u):$(id -g)" -v "$ROOT:/work" titan2-kbuild bash -euo pipefail -c "
+	-u "$(id -u):$(id -g)" -v "$ROOT:/work" "${FRAG_MOUNTS[@]}" titan2-kbuild bash -euo pipefail -c "
 # kernel 7.2 does not build with clang 17 (asm goto): AOSP clang 21 r574158
 export PATH=/work/toolchains/clang-r574158/bin:\$PATH
 cd /work/$SRC
 M='make O=/work/$O ARCH=arm64 LLVM=1 -j${JOBS:-4}'
 \$M defconfig
-scripts/kconfig/merge_config.sh -m -O /work/$O /work/$O/.config /work/configs/mainline-titan2.config
+scripts/kconfig/merge_config.sh -m -O /work/$O /work/$O/.config /work/configs/mainline-titan2.config$FRAG_FILES
 \$M olddefconfig
 \$M Image.gz mediatek/mt6878-unihertz-titan2.dtb
 # every board variant of the tree (pd, dvfs, gpu, drm, wifi, ...)

@@ -18,7 +18,9 @@
 #
 # An aport may have a file "tarball" naming a directory, relative to the root of the git
 # repository that holds the aport (e.g. tools/titan2-vendor-runtime); it is packed as
-# <pkgname>.tar.gz next to the APKBUILD and its sha512 is written into the APKBUILD.
+# <pkgname>.tar.gz next to the APKBUILD. The sha512 of every *.tar.gz next to the APKBUILD (that
+# one, or archives made beforehand: "make dist" in titan2-fingerprint and titan2-gnss) is written
+# into the staged APKBUILD.
 # "aport" runs abuild in an alpine aarch64 container (docker --platform linux/arm64): the host
 # needs qemu-user binfmt support for aarch64 (e.g. the qemu-user-static package).
 #
@@ -75,8 +77,12 @@ stage_aport() {
 			--exclude='*.orig' --exclude='*.rej' --exclude='*~' --exclude='build' \
 			--owner=0 --group=0 --mtime=@0 --sort=name \
 			-czf "$d/$p.tar.gz" "$(basename "$src")"
-		sum=$(sha512sum "$d/$p.tar.gz" | cut -d' ' -f1)
-		awk -v f="$p.tar.gz" -v s="$sum" '/^sha512sums="/ {print; print s "  " f; skip=1; next}
+	fi
+	# local source archives (the packed tarball, or one made beforehand, e.g. by "make dist" of
+	# titan2-fingerprint/titan2-gnss): their sha512 replaces the sha512sums of the APKBUILD
+	sum=$(cd "$d" && for f in *.tar.gz; do [ ! -f "$f" ] || sha512sum "$f"; done)
+	if [ -n "$sum" ]; then
+		awk -v s="$sum" '/^sha512sums="/ {print; print s; skip=1; next}
 			skip && /^"/ {skip=0} !skip {print}' "$d/APKBUILD" >"$d/APKBUILD.new" &&
 			mv "$d/APKBUILD.new" "$d/APKBUILD"
 	fi
@@ -86,6 +92,10 @@ stage_aport() {
 cmd_aport() {
 	[ $# -ge 1 ] || { echo "aport DIR..." >&2; exit 2; }
 	need_key
+	docker run --rm --platform linux/arm64 "$IMG" true 2>/dev/null || {
+		echo "cannot run arm64 containers: the host needs qemu-user binfmt support for aarch64" >&2
+		exit 1
+	}
 	local names=() a
 	for a in "$@"; do names+=("$(stage_aport "$a")"); done
 	mkdir -p "$PKG"

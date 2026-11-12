@@ -13,7 +13,11 @@
 # Variables:
 #   KO=out/mainline-build   kernel build (scripts/build-mainline.sh): Image.gz, dtb, modules
 #   SIZE=8G                 ext4 size (before it is grown on the phone)
-#   VARIANTS="full drm"     DT variants (default: all built mt6878-unihertz-titan2[-*].dtb)
+#   VARIANTS="all full"     DT variants, in menu order (default: all, all-fb, full, then the other
+#                           built mt6878-unihertz-titan2-*.dtb); "full" = mt6878-unihertz-titan2.dtb
+#   DEFAULT=all             default entry of extlinux.conf (the first variant when "all" is not
+#                           among VARIANTS); the labels are the variant names, as
+#                           scripts/linux-update.sh writes them
 #   CMDLINE                 as for scripts/make-bootmenu.sh (t2.root=part:linux is added)
 #   REUSE=1                 do not rebuild Alpine, take the existing out/netroot/linux-root.img
 #   GFX (default 1), EXTRA_PKGS, LOCAL_REPO (default: a Mesa build in out/mesa if there is one),
@@ -47,21 +51,31 @@ fi
 # 2. /boot
 "$ROOT/tools/initramfs/build.sh" "$O/boot/initramfs"
 cp "$B/Image.gz" "$O/boot/Image.gz"
+# the useful variants first (titan2-boot shows at most 24 entries of the partition), the
+# one-subsystem test variants after them
 if [ -z "${VARIANTS:-}" ]; then
-	VARIANTS=$(cd "$B/dts/mediatek" && ls mt6878-unihertz-titan2*.dtb |
-		sed 's/^mt6878-unihertz-titan2\.dtb$/full/; s/^mt6878-unihertz-titan2-\(.*\)\.dtb$/\1/' |
-		sort | awk '$0 == "full" { f = 1; next } { r = r " " $0 } END { if (f) printf "full"; print r }')
+	VARIANTS=$(cd "$B/dts/mediatek" && for v in all all-fb; do
+			[ ! -f mt6878-unihertz-titan2-$v.dtb ] || echo $v
+		done
+		[ ! -f mt6878-unihertz-titan2.dtb ] || echo full
+		ls mt6878-unihertz-titan2-*.dtb | sed 's/^mt6878-unihertz-titan2-\(.*\)\.dtb$/\1/' |
+			grep -vx 'all\|all-fb' | sort)
+	VARIANTS=$(echo $VARIANTS)
 fi
+DEFAULT=${DEFAULT:-all}
+case " $VARIANTS " in *" $DEFAULT "*) ;; *) DEFAULT=${VARIANTS%% *} ;; esac
 C=$O/boot/extlinux/extlinux.conf
 cat >"$C" <<EOF
 # linux partition: entries of the titan2-boot menu ("Linux partition"), make-linux-root.sh
-# New kernel: put Image.gz, initramfs, dtbs/ here (from Linux itself); boot_a does not change.
-DEFAULT linux
+# New kernel: scripts/linux-update.sh (or put Image.gz, initramfs, dtbs/ here from Linux itself);
+# boot_a does not change.
+DEFAULT $DEFAULT
 EOF
 for v in $VARIANTS; do
-	if [ "$v" = full ]; then dtb=mt6878-unihertz-titan2.dtb label=linux title="Linux $REL"
-	else dtb=mt6878-unihertz-titan2-$v.dtb label=linux-$v title="Linux $REL -$v"
+	if [ "$v" = full ]; then dtb=mt6878-unihertz-titan2.dtb
+	else dtb=mt6878-unihertz-titan2-$v.dtb
 	fi
+	label=$v title="Linux $REL -$v"
 	[ -f "$B/dts/mediatek/$dtb" ] || { echo "no $dtb" >&2; exit 1; }
 	cp "$B/dts/mediatek/$dtb" "$O/boot/dtbs/"
 	cat >>"$C" <<EOF

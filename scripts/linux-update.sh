@@ -52,8 +52,8 @@ mkdir -p "$O/boot/dtbs" "$O/boot/extlinux"
 "$ROOT/tools/initramfs/build.sh" "$O/boot/initramfs" >/dev/null
 cp "$B/Image.gz" "$O/boot/Image.gz"
 cp "$B"/dts/mediatek/mt6878-unihertz-titan2*.dtb "$O/boot/dtbs/"
-# titan2-boot shows at most CONF_MAX_ENTRIES of the partition's entries (12 in older packs, 32
-# in current ones): the useful variants first, the old one-subsystem tests after them
+# titan2-boot shows at most CONF_MAX_ENTRIES of the partition's entries (12 in packs before
+# 2026-11-12, 24 in current ones): the useful variants first, the old one-subsystem tests after them
 if [ -z "${VARIANTS:-}" ]; then
 	VARIANTS="all all-fb full $(cd "$B/dts/mediatek" && ls mt6878-unihertz-titan2-*.dtb |
 		sed 's/^mt6878-unihertz-titan2-\(.*\)\.dtb$/\1/' | grep -vx 'all\|all-fb' | sort | tr '\n' ' ')"

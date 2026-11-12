@@ -157,7 +157,7 @@ i2c-tools, evtest, musl и другие) и проверяет их подпис
 
 ## Связанные репозитории
 
-- [titan2-linux](https://github.com/Serlk/titan2-linux): ядро; ветка `titan2`, ветки `camera`, `fingerprint`, `gnss`.
+- [titan2-linux](https://github.com/Serlk/titan2-linux): ядро, ветка `titan2`. Ядерные части камеры, отпечатка и GNSS в него не входят: это серии патчей в `kernel/patches/` их собственных репозиториев (`git am` поверх `titan2`).
 - [titan2-boot](https://github.com/Serlk/titan2-boot), [titan2-tools](https://github.com/Serlk/titan2-tools), [titan2-docs](https://github.com/Serlk/titan2-docs).
 - [titan2-camera](https://github.com/Serlk/titan2-camera), [titan2-fingerprint](https://github.com/Serlk/titan2-fingerprint), [titan2-gnss](https://github.com/Serlk/titan2-gnss), [titan2-android](https://github.com/Serlk/titan2-android).
 

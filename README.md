@@ -185,7 +185,8 @@ sysroot in `out/musl-aarch64/sysroot` for the static daemons.
 ### Optional repositories
 
 Cameras, the fingerprint reader and GNSS live in their own repositories, each with its kernel
-series on a branch of titan2-linux. `scripts/netroot-serve.sh` takes them from `external/`
+patch series (`kernel/patches/`, `git am` on titan2-linux branch `titan2`) and config fragment
+(`kernel/<name>.config`, `FRAGMENTS=` of `scripts/build-mainline.sh`). `scripts/netroot-serve.sh` takes them from `external/`
 (or `CAMERA_DIR=`, `FP_DIR=`, `GNSS_DIR=`):
 
 ```
@@ -204,7 +205,7 @@ patches in `tools/titan2-vendor-runtime/patches/bionic_translation`.
 
 ## Related repositories
 
-- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel. Branch `titan2` is the mainline port; branches `camera`, `fingerprint` and `gnss` carry the optional camera, fingerprint and GNSS series on top of it.
+- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel, branch `titan2` (the mainline port). The optional camera, fingerprint and GNSS kernel parts are not in it: each lives as a patch series in `kernel/patches/` of its own repository below, applied with `git am` on `titan2`.
 - [titan2-boot](https://github.com/Serlk/titan2-boot): the boot menu in `boot_a` (Android and Linux side by side).
 - [titan2-tools](https://github.com/Serlk/titan2-tools): image builders, initramfs, network and disk root, modem, power and sensor services, and the shared `titan2-vendor-runtime`.
 - [titan2-docs](https://github.com/Serlk/titan2-docs): documentation and hardware notes.

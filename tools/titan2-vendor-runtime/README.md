@@ -78,7 +78,7 @@ Makefiles of titan2-fingerprint and titan2-gnss use as `VENDOR_RUNTIME`). It nee
 
 ## Related repositories
 
-- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel. Branch `titan2` is the mainline port; branches `camera`, `fingerprint` and `gnss` carry the optional camera, fingerprint and GNSS series on top of it.
+- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel, branch `titan2` (the mainline port). The optional camera, fingerprint and GNSS kernel parts are not in it: each lives as a patch series in `kernel/patches/` of its own repository below, applied with `git am` on `titan2`.
 - [titan2-boot](https://github.com/Serlk/titan2-boot): the boot menu in `boot_a` (Android and Linux side by side).
 - [titan2-tools](https://github.com/Serlk/titan2-tools): image builders, initramfs, network and disk root, modem, power and sensor services, and the shared `titan2-vendor-runtime`.
 - [titan2-docs](https://github.com/Serlk/titan2-docs): documentation and hardware notes.
