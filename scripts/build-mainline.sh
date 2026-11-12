@@ -6,8 +6,10 @@
 # and the DTBs.
 # Flashes nothing. nice/ionice, JOBS=4 by default.
 # SRC/O (relative to the repo root): the kernel tree (clone of titan2-linux, titan2 branch) and the build
-# directory. Requires the titan2-kbuild docker image (docker/Dockerfile) and AOSP clang r574158 in
-# toolchains/clang-r574158 (see README).
+# directory. Requires the titan2-kbuild docker image (docker/Dockerfile) and a clang 21 toolchain:
+# CLANG_DIR=<dir with bin/clang> (default toolchains/clang-r574158). Either the official LLVM 21
+# release from GitHub (llvm/llvm-project, LLVM-21.1.8-Linux-X64.tar.xz) or AOSP clang r574158;
+# clang 17 does not build kernel 7.2 (asm goto). See README.
 #   SRC=linux O=out/mainline-build [MODULES=0] scripts/build-mainline.sh   (MODULES=0: no modules)
 # FRAGMENTS="file ..." (or CONFIG_FRAGMENTS): more config fragments, merged after
 # configs/mainline-titan2.config in the order given (scripts/kconfig/merge_config.sh: a later
@@ -21,6 +23,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=${SRC:-linux}
 O=${O:-out/mainline-build}
 FRAGMENTS=${FRAGMENTS:-${CONFIG_FRAGMENTS:-}}
+CLANG_DIR=${CLANG_DIR:-$ROOT/toolchains/clang-r574158}
+[ -x "$CLANG_DIR/bin/clang" ] || { echo "CLANG_DIR: no $CLANG_DIR/bin/clang (clang 21: see README)" >&2; exit 1; }
+CLANG_DIR=$(realpath "$CLANG_DIR")
+echo "clang: $("$CLANG_DIR/bin/clang" --version | head -1)"
 FRAG_MOUNTS=() FRAG_FILES=
 i=0
 for f in $FRAGMENTS; do
@@ -31,9 +37,9 @@ for f in $FRAGMENTS; do
 	echo "config fragment $i: $f"
 done
 nice -n 19 ionice -c 3 docker run --rm --name "titan2-mainline-$$" --cpu-shares 128 \
-	-u "$(id -u):$(id -g)" -v "$ROOT:/work" "${FRAG_MOUNTS[@]}" titan2-kbuild bash -euo pipefail -c "
-# kernel 7.2 does not build with clang 17 (asm goto): AOSP clang 21 r574158
-export PATH=/work/toolchains/clang-r574158/bin:\$PATH
+	-u "$(id -u):$(id -g)" -v "$ROOT:/work" -v "$CLANG_DIR:/clang:ro" "${FRAG_MOUNTS[@]}" titan2-kbuild bash -euo pipefail -c "
+# kernel 7.2 does not build with clang 17 (asm goto): clang 21 from CLANG_DIR
+export PATH=/clang/bin:\$PATH
 cd /work/$SRC
 M='make O=/work/$O ARCH=arm64 LLVM=1 -j${JOBS:-4}'
 \$M defconfig

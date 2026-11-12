@@ -44,7 +44,7 @@ the GitHub release `alpha1` of this repository.
   **before** you flash anything, with `sha256sum *.img > SHA256SUMS`. You can take them from the
   official firmware package of the same version, or read them on a rooted phone
   (`dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a.img`, and so on).
-- A Linux PC with `fastboot` and `ssh`; for building: Docker, git, and AOSP clang r574158.
+- A Linux PC with `fastboot` and `ssh`; for building: Docker, git, and clang 21 (the official LLVM 21.1.8 release from GitHub, or AOSP clang r574158).
 
 ## Installing the alpha1 images
 
@@ -126,12 +126,15 @@ way back are in titan2-docs: `docs/DUALBOOT.md` and `docs/DUALBOOT-ROLLBACK.md`.
 ```
 git clone https://github.com/Serlk/titan2-tools && cd titan2-tools
 git clone -b titan2 https://github.com/Serlk/titan2-linux linux        # kernel tree (or kernel-source-alpha1.tar.gz + apply.sh)
-# AOSP prebuilt clang r574158 (clang 21) into toolchains/clang-r574158:
-#   from https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 (directory clang-r574158)
+# clang 21: the official LLVM release from GitHub (see titan2-docs BUILD-LINUX.md, section 4)
+mkdir -p toolchains/llvm-21.1.8
+curl -L https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-Linux-X64.tar.xz \
+  | tar -xJ -C toolchains/llvm-21.1.8 --strip-components=1
+export CLANG_DIR=$PWD/toolchains/llvm-21.1.8   # or AOSP clang r574158 in toolchains/clang-r574158
 # AOSP mkbootimg (Apache-2.0, not included) into tools/mkbootimg:
 git clone https://android.googlesource.com/platform/system/tools/mkbootimg tools/mkbootimg
 docker build -t titan2-kbuild docker/
-make -C tools CC=$PWD/toolchains/clang-r574158/bin/clang     # mini-init, devmem
+make -C tools CC=$CLANG_DIR/bin/clang                      # mini-init, devmem (host needs libxml2)
 scripts/build-mainline.sh                                   # -> out/mainline-build
 USB=1 VARIANT=minimal scripts/make-mainline-images.sh       # -> out/mainline-images-usb-minimal
 USB=1 scripts/make-mainline-images.sh                       # -> out/mainline-images-usb
