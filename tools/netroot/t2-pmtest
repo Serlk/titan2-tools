@@ -1,0 +1,155 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# t2-pmtest: one logged suspend attempt on the Titan 2 (mainline Linux).
+#
+# The attempt runs detached from the calling shell, so losing the SSH
+# session over USB (the gadget suspends with the system) does not kill
+# it. Everything is written under /var/log/t2-pmtest/<timestamp>/ and
+# the entry/exit markers also go to the kernel log, which pstore keeps
+# across a reboot: after a hang the markers tell whether the kernel came
+# back from the suspend at all, or only the transports were lost.
+#
+#   t2-pmtest [-l none|freezer|devices|platform] [-s SEC] [-a] [-f] [-n]
+#   t2-pmtest last          show the log of the last attempt
+#
+#   -l LEVEL   /sys/power/pm_test level (default none = a real s2idle).
+#              s2idle has no processors/core levels.
+#   -s SEC     RTC alarm SEC seconds ahead as the guaranteed wake source
+#              (default 60; 0 = no alarm, then only a key or the modem
+#              wakes the phone)
+#   -a         keep pm_async as it is (default: pm_async=0 while testing,
+#              so the callbacks run in order and a hang names a device)
+#   -f         go on although an RTC alarm is already set (it is replaced)
+#   -n         show the settings and the checks, do not suspend
+#
+# Settings changed for the attempt (pm_test, pm_async, pm_print_times,
+# pm_debug_messages, the alarm) are restored afterwards.
+
+LOGROOT=/var/log/t2-pmtest
+LEVEL=none
+ALARM=60
+ASYNC=0
+FORCE=0
+DRY=0
+DETACHED=0
+
+usage() { sed -n '/^#   t2-pmtest/,/^# Settings/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-l) LEVEL=$2; shift ;;
+	-s) ALARM=$2; shift ;;
+	-a) ASYNC=keep ;;
+	-f) FORCE=1 ;;
+	-n) DRY=1 ;;
+	--detached) DETACHED=1 ;;
+	last)
+		d=$(ls -1d "$LOGROOT"/*/ 2>/dev/null | tail -1)
+		[ -n "$d" ] || { echo "no attempts logged"; exit 1; }
+		echo "== $d"; cat "$d/summary" 2>/dev/null
+		[ -r "$d/result" ] || echo "NO RESULT: the attempt did not come back (check pstore: grep t2-pmtest /sys/fs/pstore/console-ramoops-0)"
+		exit 0 ;;
+	*) usage ;;
+	esac
+	shift
+done
+
+case "$LEVEL" in none|freezer|devices|platform) ;; *) echo "bad level $LEVEL"; usage ;; esac
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+
+# -- checks ------------------------------------------------------------
+grep -qw mem /sys/power/state || { echo "no 'mem' in /sys/power/state"; exit 1; }
+grep -q '\[s2idle\]' /sys/power/mem_sleep || echo "note: mem_sleep is $(cat /sys/power/mem_sleep)"
+if [ "$LEVEL" != none ]; then
+	grep -qw "$LEVEL" /sys/power/pm_test 2>/dev/null || { echo "pm_test level $LEVEL not offered: $(cat /sys/power/pm_test 2>/dev/null)"; exit 1; }
+fi
+RTC=/sys/class/rtc/rtc0
+if [ "$ALARM" != 0 ]; then
+	[ -w $RTC/wakealarm ] || { echo "no $RTC/wakealarm: use -s 0 (no guaranteed wake)"; exit 1; }
+	if [ -n "$(cat $RTC/wakealarm 2>/dev/null)" ] && [ $FORCE = 0 ]; then
+		echo "an RTC alarm is already set ($(cat $RTC/wakealarm)); -f replaces it"; exit 1
+	fi
+fi
+
+TS=$(date +%Y%m%d-%H%M%S)
+D=$LOGROOT/$TS
+echo "level=$LEVEL alarm=${ALARM}s pm_async=$ASYNC log=$D"
+[ $DRY = 1 ] && exit 0
+
+# -- detach ------------------------------------------------------------
+if [ $DETACHED = 0 ]; then
+	mkdir -p "$D"
+	setsid nohup "$0" --detached -l "$LEVEL" -s "$ALARM" $([ $ASYNC = keep ] && echo -a) -f >"$D/run.out" 2>&1 </dev/null &
+	echo "started in the background; result: t2-pmtest last (after ${ALARM}s + resume)"
+	exit 0
+fi
+D=$(ls -1d "$LOGROOT"/*/ | tail -1); D=${D%/}
+
+snap() {	# $1 = prefix
+	date +%s.%N >"$D/$1.time"
+	for f in /sys/power/suspend_stats/*; do printf '%s %s\n' "${f##*/}" "$(cat "$f")"; done >"$D/$1.suspend_stats" 2>/dev/null
+	cat /sys/kernel/debug/wakeup_sources >"$D/$1.wakeup_sources" 2>/dev/null
+	cat /sys/power/wakeup_count >"$D/$1.wakeup_count" 2>/dev/null
+	for f in /sys/kernel/debug/mtk_ccci*/fsm /sys/kernel/debug/*dpmaif*/*; do
+		[ -r "$f" ] && { echo "== $f"; cat "$f"; }
+	done >"$D/$1.modem" 2>/dev/null
+	ls /sys/class/net >"$D/$1.net" 2>/dev/null
+}
+
+restore() {
+	echo none >/sys/power/pm_test 2>/dev/null
+	[ -n "$OLD_ASYNC" ] && echo "$OLD_ASYNC" >/sys/power/pm_async 2>/dev/null
+	[ -n "$OLD_PT" ] && echo "$OLD_PT" >/sys/power/pm_print_times 2>/dev/null
+	[ -n "$OLD_DBG" ] && echo "$OLD_DBG" >/sys/power/pm_debug_messages 2>/dev/null
+	[ "$ALARM" != 0 ] && echo 0 >$RTC/wakealarm 2>/dev/null
+}
+trap restore EXIT
+
+# -- before ------------------------------------------------------------
+snap before
+dmesg >"$D/dmesg.before"
+OLD_ASYNC=$(cat /sys/power/pm_async 2>/dev/null)
+OLD_PT=$(cat /sys/power/pm_print_times 2>/dev/null)
+OLD_DBG=$(cat /sys/power/pm_debug_messages 2>/dev/null)
+[ $ASYNC = keep ] || echo 0 >/sys/power/pm_async 2>/dev/null
+echo 1 >/sys/power/pm_print_times 2>/dev/null
+echo 1 >/sys/power/pm_debug_messages 2>/dev/null
+echo "$LEVEL" >/sys/power/pm_test 2>/dev/null
+if [ "$ALARM" != 0 ]; then
+	echo 0 >$RTC/wakealarm
+	echo "+$ALARM" >$RTC/wakealarm || { echo "cannot set the alarm"; exit 1; }
+	echo "alarm set: $(cat $RTC/wakealarm) (now $(cat $RTC/since_epoch))" >"$D/alarm"
+fi
+{
+	echo "level $LEVEL alarm ${ALARM}s pm_async $(cat /sys/power/pm_async 2>/dev/null)"
+	echo "mem_sleep $(cat /sys/power/mem_sleep) kernel $(uname -r)"
+} >"$D/summary"
+
+echo "t2-pmtest: enter level=$LEVEL alarm=${ALARM}s log=$TS" >/dev/kmsg
+T0=$(date +%s)
+echo mem >/sys/power/state
+RC=$?
+T1=$(date +%s)
+echo "t2-pmtest: back rc=$RC after $((T1 - T0))s" >/dev/kmsg
+
+# -- after -------------------------------------------------------------
+snap after
+dmesg >"$D/dmesg.after"
+{
+	echo "rc=$RC wall=$((T1 - T0))s"
+	echo "pm_wakeup_irq $(cat /sys/power/pm_wakeup_irq 2>/dev/null)"
+	for f in last_failed_dev last_failed_errno last_failed_step last_hw_sleep total_hw_sleep success fail; do
+		[ -r /sys/power/suspend_stats/$f ] && echo "$f $(cat /sys/power/suspend_stats/$f | tr '\n' ' ')"
+	done
+	echo "wakeup_count before $(cat "$D/before.wakeup_count") after $(cat "$D/after.wakeup_count")"
+	echo "-- kernel log of the attempt:"
+	dmesg | sed -n '/t2-pmtest: enter/,$p'
+} >"$D/result"
+cat "$D/result" >>"$D/summary"
+
+# Transports: the USB gadget network and Wi-Fi come back by themselves
+# or not; a site hook can nudge them (e.g. bring the USB link up again).
+[ -x /etc/t2/pmtest-after ] && /etc/t2/pmtest-after "$D" >>"$D/after.hook" 2>&1
+exit $RC

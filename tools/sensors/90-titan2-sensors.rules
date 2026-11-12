@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: sensors of the SCP sensor hub as IIO devices (kernel module mtk-hf-iio).
+# iio-sensor-proxy finds its sensors by IIO_SENSOR_PROXY_TYPE (Alpine's package has no
+# rules of its own); all of them are polled, the driver enables a sensor at the hub only
+# while it is read.
+SUBSYSTEM=="iio", ATTR{name}=="hub-accel", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-accel"
+SUBSYSTEM=="iio", ATTR{name}=="hub-light", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-als"
+SUBSYSTEM=="iio", ATTR{name}=="hub-prox",  ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-proximity", ENV{PROXIMITY_NEAR_LEVEL}="4"
+# hub accelerometer: X and Y are opposite to what iio-sensor-proxy expects -> 180 deg about Z
+SUBSYSTEM=="iio", ATTR{name}=="hub-accel", ENV{ACCEL_MOUNT_MATRIX}="-1, 0, 0; 0, -1, 0; 0, 0, 1"

@@ -1,0 +1,114 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: the thermal measurement run: three scenarios of t2-perfstat (60 s each) with a state
+# snapshot before and after each: what the GPU, the CPUs, the thermal zones and the session
+# daemons do while the screen is on. Run as the session user
+# over SSH (root also works; the per-process files are world-readable):
+#   t2-perfrun                 all three scenarios, prompts between them
+#   t2-perfrun idle            one scenario: idle | camera | scroll
+#   T2_PERFRUN_SECS=30 t2-perfrun
+#   T2_NIRI_USER=<user>        the session user (default: as in /etc/conf.d/t2-niri, "user")
+#   T2_PERFRUN_DAEMONS=<regex> the processes listed in daemons.txt (pgrep -f; default: niri,
+#                              PipeWire, WirePlumber, iio-sensor-proxy)
+# Output: /var/log/t2-perf/<timestamp>/ (or $T2_PERFRUN_DIR): <scenario>.perfstat, snapshots
+# <scenario>-{before,after}.txt, daemons.txt (timers, D-Bus, RT threads, CPU placement).
+secs=${T2_PERFRUN_SECS:-60}
+out=${T2_PERFRUN_DIR:-/var/log/t2-perf/$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$out" 2>/dev/null || { out=/tmp/t2-perf-$(date +%Y%m%d-%H%M%S); mkdir -p "$out"; }
+G=/sys/class/devfreq/13000000.gpu
+P=/sys/devices/platform/soc@0/13000000.gpu/power
+[ -n "${T2_NIRI_USER:-}" ] || T2_NIRI_USER=$(sed -n 's/^T2_NIRI_USER=//p' /etc/conf.d/t2-niri 2>/dev/null | tail -1)
+uid=$(id -u "${T2_NIRI_USER:-user}" 2>/dev/null || id -u)
+daemons_re=${T2_PERFRUN_DAEMONS:-^niri|pipewire|wireplumber|iio-sensor-proxy}
+
+snapshot() {
+	echo "== $(date) uptime $(cut -d' ' -f1 /proc/uptime)"
+	echo "-- gpu"; for f in governor cur_freq min_freq max_freq polling_interval load; do
+		[ -r "$G/$f" ] && printf '%s=%s ' "$f" "$(cat "$G/$f")"; done
+	printf 'runtime=%s autosuspend_ms=%s\n' "$(cat $P/runtime_status 2>/dev/null)" "$(cat $P/autosuspend_delay_ms 2>/dev/null)"
+	[ -r $G/trans_stat ] && { echo "-- gpu trans_stat"; cat $G/trans_stat; }
+	echo "-- cpufreq"; for p in /sys/devices/system/cpu/cpufreq/policy*; do
+		printf '%s gov=%s cur=%s rate_limit_us=%s\n' "${p##*/}" "$(cat $p/scaling_governor)" "$(cat $p/scaling_cur_freq)" "$(cat $p/schedutil/rate_limit_us 2>/dev/null)"
+		printf '  time_in_state: '; tr '\n' ' ' < $p/stats/time_in_state; echo
+	done
+	echo "-- cpuidle (cpu state name usage time_ms rejected)"
+	for c in /sys/devices/system/cpu/cpu[0-7]; do for s in $c/cpuidle/state*; do
+		printf '%s %s %s %s %s %s\n' "${c##*/}" "${s##*/}" "$(cat $s/name)" "$(cat $s/usage)" "$(( $(cat $s/time) / 1000 ))" "$(cat $s/rejected 2>/dev/null)"
+	done; done
+	echo "-- thermal"; for z in /sys/class/thermal/thermal_zone*; do
+		printf '%s %s %s\n' "$(cat $z/type)" "$(cat $z/temp 2>/dev/null)" "$(cat $z/mode 2>/dev/null)"; done
+	echo "-- cooling"; for c in /sys/class/thermal/cooling_device*; do
+		printf '%s %s cur=%s max=%s\n' "${c##*/}" "$(cat $c/type)" "$(cat $c/cur_state)" "$(cat $c/max_state)"; done
+	echo "-- sched"; printf 'sched_energy_aware=%s uclamp_min_rt_default=%s\n' \
+		"$(cat /proc/sys/kernel/sched_energy_aware 2>/dev/null)" "$(cat /proc/sys/kernel/sched_util_clamp_min_rt_default 2>/dev/null)"
+	echo "-- RT threads"; ps -eLo pid,tid,cls,rtprio,pcpu,comm 2>/dev/null | awk 'NR==1 || $3=="FF" || $3=="RR"'
+	echo "-- /proc/stat"; head -9 /proc/stat
+	echo "-- loadavg $(cat /proc/loadavg)"
+	echo "-- meminfo"; grep -E 'MemAvailable|Cma|AnonHuge|Dirty' /proc/meminfo
+	echo "-- dmesg tail"; dmesg 2>/dev/null | tail -5
+}
+
+daemons() {
+	echo "== session daemons $(date)"
+	for pid in $(pgrep -u "$uid" -f "$daemons_re" 2>/dev/null); do
+		[ -r /proc/$pid/stat ] || continue
+		cmd=$(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-60)
+		# utime+stime in ticks, RSS, number of timerfd/eventfd descriptors, threads, last CPU
+		set -- $(awk '{print $14, $15, $20, $39}' /proc/$pid/stat)
+		tfd=$(ls -l /proc/$pid/fd 2>/dev/null | grep -c 'anon_inode:\[timerfd\]')
+		rss=$(awk '/VmRSS/{print $2}' /proc/$pid/status)
+		printf '%6s cpu_ticks=%s threads=%s last_cpu=%s rss_kB=%s timerfd=%s  %s\n' "$pid" "$(($1 + $2))" "$3" "$4" "$rss" "$tfd" "$cmd"
+	done
+	echo "-- iio-sensor-proxy / IIO sampling"
+	for d in /sys/bus/iio/devices/iio:device*; do
+		printf '%s %s freq=%s buffer_enable=%s\n' "${d##*/}" "$(cat $d/name 2>/dev/null)" "$(cat $d/sampling_frequency 2>/dev/null)" "$(cat $d/buffer/enable 2>/dev/null)"
+	done
+	echo "-- interrupts (top 12)"
+	awk 'NR>1 {s=0; for (i=2;i<=9;i++) s+=$i; printf "%8d %s\n", s, $0}' /proc/interrupts | sort -rn | head -12 | cut -c1-120
+}
+
+dbus_count() {
+	# session bus traffic in 10 s (needs the session bus address of the session user)
+	bus=$(tr '\0' '\n' < /proc/$(pgrep -u "$uid" -x niri | head -1)/environ 2>/dev/null | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
+	[ -n "$bus" ] && command -v dbus-monitor >/dev/null 2>&1 || { echo "dbus: no bus/monitor"; return; }
+	echo "-- D-Bus session messages in 10 s, by sender"
+	DBUS_SESSION_BUS_ADDRESS=$bus timeout 10 dbus-monitor --session 2>/dev/null | grep -E '^(signal|method call)' | sed 's/.*sender=\([^ ]*\).*/\1/' | sort | uniq -c | sort -rn | head -10
+}
+
+run() {
+	name=$1; shift
+	echo "### $name: $*"
+	[ -t 0 ] && [ "${T2_PERFRUN_NOPROMPT:-0}" != 1 ] && { printf 'Enter when ready...'; read -r _; }
+	snapshot > "$out/$name-before.txt"
+	[ -w $G/trans_stat ] && echo 0 > $G/trans_stat 2>/dev/null
+	t2-perfstat 2 $((secs / 2)) > "$out/$name.perfstat" 2>&1
+	snapshot > "$out/$name-after.txt"
+	# one-line digest: mean GPU MHz, share of samples at max, hottest temps, idle share
+	awk -v n="$name" '{
+		for (i = 1; i <= NF; i++) if ($i == "gpu") { f = $(i+1); sub(/MHz/, "", f); g += f; if (f + 0 >= 1000) m++; c++ }
+	} END { if (c) printf "%s: gpu mean %.0f MHz, %.0f%% of samples >=1000 MHz, %d samples\n", n, g / c, 100 * m / c, c }' "$out/$name.perfstat"
+}
+
+cat > "$out/README" <<EOF
+t2-perfrun $(date) secs=$secs kernel $(uname -r) cmdline: $(cat /proc/cmdline)
+scenarios: idle = screen on, home screen, hands off; camera = Snapshot preview 1080p30;
+scroll = scrolling the shell / home for the whole minute. Compare *.perfstat (t2-perfstat lines),
+*-before/after.txt (trans_stat, time_in_state, cpuidle, cooling cur_state), daemons.txt.
+EOF
+daemons > "$out/daemons.txt"; dbus_count >> "$out/daemons.txt"
+case "${1:-all}" in
+	idle) run idle "screen on, home screen, do not touch for $secs s" ;;
+	camera) run camera "open Snapshot, preview running, for $secs s" ;;
+	scroll) run scroll "scroll the shell / home continuously for $secs s" ;;
+	all)
+		run idle "screen on, home screen, do not touch for $secs s"
+		run camera "open Snapshot, preview running, for $secs s"
+		run scroll "scroll the shell / home continuously for $secs s"
+		;;
+	*) echo "usage: t2-perfrun [idle|camera|scroll|all]" >&2; exit 1 ;;
+esac
+daemons >> "$out/daemons.txt"
+echo "results in $out"
+exit 0

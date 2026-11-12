@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
 # boot.img for boot_a with the titan2-boot menu: Android and mainline Linux (several DT variants).
-# Flashes nothing. vendor_boot_a, init_boot_a, dtbo_a stay Android's: LK builds the stock FDT,
+# Flashes nothing. vendor_boot_a, init_boot_a, dtbo_a stay Android's: LK builds the factory FDT,
 # titan2-boot hands it to the Android kernel unchanged and, for mainline, carries LK's data over
 # into the mainline DTB (titan2-boot: src/fdtfix.c). The menu entries are an extlinux.conf in the
 # pack (titan2-boot: src/conf.c). The Android kernel is always in the pack: recovery (TWRP),
 # charging and a normal Android boot do not depend on titan2-boot reading the UFS.
 #   scripts/make-bootmenu.sh
+#   ANDROID_KERNEL=<Image>: a ready Android kernel (e.g. files/android/Image of the previous pack:
+#                  exactly what boot_a holds now); otherwise the kernel is taken from ANDROID_BOOT
 #   ANDROID_BOOT: the Android boot.img the kernel is taken from (required; the boot.img of the
 #                  Android that is installed, i.e. what boot_a holds before the menu). New Android
 #                  kernel = rebuild the pack with ANDROID_BOOT=<boot.img> and flash boot_a
@@ -58,11 +60,17 @@ args=(--loader "$(w "$TB/out/titan2-boot.bin")" --conf "$(w "$C")"
 
 # Android: the kernel from the boot.img as it is (lz4/gzip, titan2-boot unpacks it)
 [ -z "${ANDROID_PART:-}" ] || { echo "ANDROID_PART is gone: the Android kernel is always in the pack" >&2; exit 1; }
-[ -f "$ANDROID_BOOT" ] || { echo "no $ANDROID_BOOT" >&2; exit 1; }
-[ "$(head -c 8 "$ANDROID_BOOT")" = "ANDROID!" ] || { echo "$ANDROID_BOOT: not a boot.img" >&2; exit 1; }
-ksize=$(od -An -t u4 -j 8 -N 4 "$ANDROID_BOOT" | tr -d ' ')
-dd if="$ANDROID_BOOT" of="$O/files/android/Image" iflag=skip_bytes,count_bytes skip=4096 \
-	count="$ksize" status=none
+if [ -n "${ANDROID_KERNEL:-}" ]; then
+	# a ready kernel (e.g. files/android/Image of the previous pack: what boot_a holds now)
+	[ -f "$ANDROID_KERNEL" ] || { echo "no $ANDROID_KERNEL" >&2; exit 1; }
+	cp "$ANDROID_KERNEL" "$O/files/android/Image"
+else
+	[ -f "$ANDROID_BOOT" ] || { echo "no $ANDROID_BOOT" >&2; exit 1; }
+	[ "$(head -c 8 "$ANDROID_BOOT")" = "ANDROID!" ] || { echo "$ANDROID_BOOT: not a boot.img" >&2; exit 1; }
+	ksize=$(od -An -t u4 -j 8 -N 4 "$ANDROID_BOOT" | tr -d ' ')
+	dd if="$ANDROID_BOOT" of="$O/files/android/Image" iflag=skip_bytes,count_bytes skip=4096 \
+		count="$ksize" status=none
+fi
 printf 'LABEL android\n  MENU LABEL Android\n  ANDROID /android/Image\n' >>"$C"
 args+=(--file "android/Image=$(w "$O/files/android/Image")" --android-boot "$(w "$ANDROID_BOOT")")
 

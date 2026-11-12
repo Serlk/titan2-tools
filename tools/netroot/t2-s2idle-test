@@ -1,0 +1,193 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# One real s2idle on the Titan 2 with everything logged to disk:
+# WoWLAN on, USB gadget detached (mtu3 refuses to sleep while a host holds it),
+# t2-pmtest with an RTC alarm, then: lpm/last_wake, links, gadget back, syslog-safe log.
+#   t2-s2idle-test [ALARM_SEC]   (default 60); log: /var/log/t2-s2idle/<ts>/
+#   LEVEL=devices|platform|freezer  pm_test level instead of a real sleep (driver callbacks only)
+#   REBOOT_AFTER=SEC  warm reboot when neither link answers SEC s after the resume (default 120;
+#                     0 = never): a warm reboot keeps the kernel console in pstore (ramoops),
+#                     a long press of the power key does not
+#   MODEM=on|off      off: radio low power (mmcli --set-power-state-low) for the sleep, to
+#                     tell the modem's part in the SPM requests; on again afterwards
+#   WIFI=on|off       off: nmcli radio wifi off for the sleep (CONNSYS requests)
+#   SAFETY=on|off     on (default, only for the run; undone once the link is back): lockups, hung tasks and oopses panic, a panic reboots after
+#                     10 s (dmesg-ramoops in pstore), and the hardware watchdog (31 s) is fed
+#                     from a background loop that outlives this script: a hang of the whole
+#                     system resets the phone. The feeder closes the watchdog (magic close)
+#                     before the sleep and opens it again after the resume (a run with a 30 s
+#                     alarm was reset in the sleep otherwise). A watchdog reset seems to lose
+#                     pstore, so it only brings the phone back. Stop the feeder
+#                     (and the watchdog) with: touch /run/t2-wdog.stop
+#   WDT_SLEEP=on     keep the hardware watchdog (31 s) running through the sleep
+#                     (mtk_wdt.keep_in_sleep): a hang in the sleep resets the phone. Needs
+#                     SAFETY=on; the alarm is cut to 25 s. For risky experiments.
+#   T2_GW=<address>   gateway to ping after the resume (default: the default route before the sleep)
+#   REBOOT_MODE=panic|reboot  what REBOOT_AFTER does: panic (default; sysrq w + c, no shutdown
+#                     path, full dmesg in pstore) or a normal reboot (the watchdog still resets
+#                     the phone if the shutdown hangs)
+set -u
+MODEM=${MODEM:-on}
+WIFI=${WIFI:-on}
+A=${1:-60}
+LEVEL=${LEVEL:-none}
+REBOOT_AFTER=${REBOOT_AFTER:-120}
+REBOOT_MODE=${REBOOT_MODE:-panic}
+SAFETY=${SAFETY:-on}
+WDT_SLEEP=${WDT_SLEEP:-off}
+GW=${T2_GW:-$(ip route | awk '/default/{print $3; exit}')}
+KIS=/sys/module/mtk_wdt/parameters/keep_in_sleep
+if [ "$WDT_SLEEP" = on ]; then
+	[ "$SAFETY" = on ] || { echo "WDT_SLEEP=on needs SAFETY=on" >&2; exit 1; }
+	[ -w "$KIS" ] || { echo "no $KIS (kernel without mtk_wdt.keep_in_sleep)" >&2; exit 1; }
+	[ "$A" -gt 25 ] && A=25
+fi
+L=/var/log/t2-s2idle/$(date +%Y%m%d-%H%M%S); mkdir -p "$L"
+# every step also goes to the kernel log, so console-ramoops shows how far a hung run got
+log() { echo "$(date +%T) $*" >>"$L/run.log"; echo "t2-s2idle: $*" >/dev/kmsg 2>/dev/null; sync; }
+# hardware watchdog fed from the background; closed with 'V' (stops it) by wdog_stop
+wdog_start() {
+	[ "$SAFETY" = on ] || return 0
+	W=$(ls /dev/watchdog0 /dev/watchdog 2>/dev/null | head -1)
+	[ -n "$W" ] || return 0
+	[ -e /run/t2-wdog.pid ] && kill -0 "$(cat /run/t2-wdog.pid)" 2>/dev/null && return 0
+	rm -f /run/t2-wdog.stop
+	# the core leaves the hardware timeout at its maximum (31 s on MT6878)
+	( exec 3>"$W" || exit 1
+	  while [ ! -e /run/t2-wdog.stop ]; do printf . >&3; sleep 2; done
+	  printf V >&3; exec 3>&-; rm -f /run/t2-wdog.pid ) </dev/null >/dev/null 2>&1 &
+	echo $! >/run/t2-wdog.pid
+	log "watchdog $W fed by pid $!"
+}
+wdog_stop() {
+	[ -e /run/t2-wdog.pid ] || return 0
+	touch /run/t2-wdog.stop
+	for i in $(seq 1 10); do [ -e /run/t2-wdog.pid ] || break; sleep 1; done
+	rm -f /run/t2-wdog.stop
+	[ -e /run/t2-wdog.pid ] && log "watchdog feeder did not stop" || log "watchdog closed"
+}
+set_sys() { [ -w "/proc/sys/kernel/$1" ] || return 0
+	echo "$1 $(cat "/proc/sys/kernel/$1")" >>"$L/sysctl.saved"
+	echo "$2" >"/proc/sys/kernel/$1" && echo "kernel.$1=$2"; }
+# undo SAFETY once the phone is reachable again: old sysctl values back, watchdog closed
+safety_off() {
+	[ "$SAFETY" = on ] || return 0
+	wdog_stop
+	[ -r "$L/sysctl.saved" ] && while read -r k v; do echo "$v" >"/proc/sys/kernel/$k"; done <"$L/sysctl.saved"
+	log "safety settings restored ($(tr '\n' ' ' <"$L/sysctl.saved" 2>/dev/null))"
+}
+MMSYS_DBG=/sys/kernel/debug/14000000.syscon/boot-path
+GENPD_DBG=/sys/kernel/debug/pm_genpd/pm_genpd_summary
+LPM=/sys/devices/platform/soc@0/1c001000.syscon/1c001000.syscon:low-power-manager/lpm
+G=$(ls -d /sys/kernel/config/usb_gadget/* | head -1)
+UDC=$(cat "$G/UDC")
+P=$(iw dev wlan0 info 2>/dev/null | awk '/wiphy/{print $2}')
+log "start alarm=$A s, udc=$UDC, wiphy=$P"
+if [ "$SAFETY" = on ]; then
+	{ set_sys panic 10; set_sys panic_on_oops 1; set_sys softlockup_panic 1
+	  set_sys hardlockup_panic 1; set_sys hung_task_panic 1; set_sys hung_task_timeout_secs 60
+	  set_sys sysrq 1; } >>"$L/run.log" 2>&1
+	wdog_start
+fi
+[ -r "$MMSYS_DBG" ] && cat "$MMSYS_DBG" >"$L/before.boot-path" 2>&1
+[ -r "$GENPD_DBG" ] && cat "$GENPD_DBG" >"$L/before.genpd" 2>&1
+rc-service t2-powerd status >/dev/null 2>&1 && { rc-service t2-powerd stop >>"$L/run.log" 2>&1; log "t2-powerd stopped (it arms the RTC too)"; }
+[ -n "$P" ] && iw phy "phy$P" wowlan enable any && iw phy "phy$P" wowlan show >>"$L/run.log" 2>&1
+iw dev wlan0 link >"$L/before.wlan" 2>&1
+cat "$LPM/constraints" >"$L/before.constraints" 2>&1
+for f in suspend_stat idle_stat; do cat "$LPM/$f" >"$L/before.$f" 2>&1; done
+# which CPU idle state s2idle took on each CPU, and who interrupted the sleep
+cpuidle_snap() { for d in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state*; do
+	c=${d%/cpuidle/*}; c=${c##*/}; st=${d##*/}
+	echo "$c $st $(cat "$d/name") usage $(cat "$d/usage") rejected $(cat "$d/rejected" 2>/dev/null) s2idle $(cat "$d/s2idle/usage" 2>/dev/null) $(cat "$d/s2idle/time" 2>/dev/null)"
+	done; }
+cpuidle_snap >"$L/before.cpuidle"
+# the battery: charge counter / current / voltage around the sleep (the only real energy measure)
+psy_snap() { for u in /sys/class/power_supply/*/uevent; do echo "== $u"; cat "$u"; done 2>/dev/null; date +%s; }
+psy_snap >"$L/before.power_supply"
+cat /proc/interrupts >"$L/before.interrupts"
+CCCI=$(ls -d /sys/kernel/debug/mddriver@* 2>/dev/null | head -1)
+[ -n "$CCCI" ] && cat "$CCCI/fsm" >"$L/before.ccci" 2>&1
+grep -H . /sys/class/wakeup/wakeup*/name 2>/dev/null | while IFS=: read -r f n; do
+	echo "$n $(cat "${f%/name}/event_count")"; done >"$L/before.wakeup"
+for m in phy_mtk_tphy/parameters/restore_state mtu3/parameters/reinit_on_resume \
+	 mtu3/parameters/uwk_device_role mtk_mmsys/parameters/keep_boot_path \
+	 mtk_lpm/parameters/suspend_rc mtk_ccci/parameters/rx_wake_ms; do
+	echo "$m=$(cat /sys/module/$m 2>/dev/null)"; done >>"$L/run.log"
+[ "$MODEM" = off ] && { mmcli -m any --set-power-state-low >>"$L/run.log" 2>&1; log "modem low power"; sleep 3; }
+[ "$WIFI" = off ] && { nmcli radio wifi off; log "wifi off"; sleep 3; }
+echo "" >"$G/UDC"; log "gadget detached"
+sleep 2
+# the watchdog must not run while the system sleeps longer than its 31 s
+if [ "$WDT_SLEEP" = on ]; then
+	echo 1 >"$KIS"; log "watchdog kept running for the sleep (alarm $A s)"
+else
+	wdog_stop
+fi
+# markers of earlier runs stay in the kernel log: wait for a new one
+NB=$(dmesg | grep -c "t2-pmtest: back")
+/usr/local/bin/t2-pmtest -l "$LEVEL" -s "$A" -f >>"$L/run.log" 2>&1
+# t2-pmtest returns after the resume (it runs detached, so wait for its marker)
+for i in $(seq 1 $((A + 120))); do [ "$(dmesg | grep -c "t2-pmtest: back")" -gt "$NB" ] && break; sleep 1; done
+log "back from suspend (waited $i s)"
+[ "$WDT_SLEEP" = on ] && echo 0 >"$KIS"
+wdog_start
+cat "$LPM/last_wake" >"$L/last_wake" 2>&1
+cat "$LPM/last_entry" >"$L/last_entry" 2>&1
+cat "$LPM/constraints" >"$L/after.constraints" 2>&1
+for f in suspend_stat idle_stat; do cat "$LPM/$f" >"$L/after.$f" 2>&1; done
+cpuidle_snap >"$L/after.cpuidle"
+psy_snap >"$L/after.power_supply"
+cat /proc/interrupts >"$L/after.interrupts"
+# per CPU and state: usage / rejected / s2idle usage deltas (only the ones that moved)
+awk 'NR==FNR { u[$1" "$2]=$5; r[$1" "$2]=$7; s[$1" "$2]=$9; next }
+     { k=$1" "$2; du=$5-u[k]; dr=$7-r[k]; ds=$9-s[k]
+       if (du || dr || ds) printf "cpuidle %s %s %s: usage +%d rejected +%d s2idle +%d\n", $1, $2, $3, du, dr, ds }' \
+	"$L/before.cpuidle" "$L/after.cpuidle" >"$L/cpuidle.delta" 2>&1
+# interrupts that fired during the run (sum over CPUs), largest first
+awk 'NR==1 && FNR==1 { next } NR==FNR { n=0; for (i=2; i<=NF && $i ~ /^[0-9]+$/; i++) n+=$i; b[$1]=n; next }
+     FNR==1 { next } { n=0; for (i=2; i<=NF && $i ~ /^[0-9]+$/; i++) n+=$i
+       d=n-b[$1]; if (d > 0) { $1=$1; printf "%d %s\n", d, $0 } }' \
+	"$L/before.interrupts" "$L/after.interrupts" | sort -rn | head -25 >"$L/interrupts.delta" 2>&1
+{ echo "--- cpuidle deltas"; cat "$L/cpuidle.delta"; echo "--- interrupt deltas (count, line)"; cut -c1-160 "$L/interrupts.delta"; } >>"$L/run.log"
+[ -n "$CCCI" ] && cat "$CCCI/fsm" >"$L/after.ccci" 2>&1
+grep -H . /sys/class/wakeup/wakeup*/name 2>/dev/null | while IFS=: read -r f n; do
+	echo "$n $(cat "${f%/name}/event_count")"; done >"$L/after.wakeup"
+dmesg | grep -E "suspend entry|suspend wake up|woken by|IPPC changed|u2 port|device IP|pullup|wakeup glue|boot path|lost the boot|lost its modules|stuck frame|still busy|wrote back" | tail -30 >>"$L/run.log"
+[ -r "$GENPD_DBG" ] && cat "$GENPD_DBG" >"$L/after.genpd" 2>&1
+[ -r "$MMSYS_DBG" ] && cat "$MMSYS_DBG" >"$L/after.boot-path" 2>&1
+[ "$WIFI" = off ] && { nmcli radio wifi on; log "wifi on"; }
+[ "$MODEM" = off ] && { mmcli -m any --set-power-state-on >>"$L/run.log" 2>&1; log "modem on"; }
+dmesg | tail -300 >"$L/dmesg.after"
+iw dev wlan0 link >"$L/after.wlan" 2>&1
+ip -br a >"$L/after.ip" 2>&1
+ping -c2 -W3 "$GW" >"$L/after.ping" 2>&1 && log "ping gw ok" || log "ping gw FAIL"
+echo "$UDC" >"$G/UDC" 2>>"$L/run.log" && log "gadget reattached" || log "gadget reattach FAILED"
+sleep 5
+ip -br a >>"$L/after.ip" 2>&1
+grep -q "ping gw FAIL" "$L/run.log" && { nmcli dev connect wlan0 >>"$L/run.log" 2>&1; sleep 8; ping -c2 -W3 "$GW" >>"$L/after.ping" 2>&1 && log "ping gw ok after reconnect" || log "ping gw still FAIL"; }
+dmesg | tail -60 >>"$L/dmesg.after"
+dmesg | grep -i "mtu3\|pullup\|UDC" | tail -4 >>"$L/run.log"
+log "done"
+sync
+if [ "$REBOOT_AFTER" -gt 0 ]; then
+	# no way in from outside: keep the console for the next boot and come back
+	for i in $(seq 1 "$REBOOT_AFTER"); do
+		sleep 1
+		ping -c1 -W1 "$GW" >/dev/null 2>&1 && { log "link up after $i s"; safety_off; exit 0; }
+		ping -c1 -W1 172.16.42.2 >/dev/null 2>&1 && { log "link up after $i s"; safety_off; exit 0; }
+		[ $((i % 30)) -eq 0 ] && log "no link yet ($i s)"
+	done
+	log "no link for $REBOOT_AFTER s after the resume: $REBOOT_MODE for pstore"
+	sync
+	if [ "$REBOOT_MODE" = panic ] && [ -w /proc/sysrq-trigger ]; then
+		# the blocked tasks into the log, then a panic: dmesg-ramoops holds the whole log
+		set_sys panic 10 >/dev/null
+		echo w >/proc/sysrq-trigger; sleep 2; sync
+		echo c >/proc/sysrq-trigger
+	fi
+	reboot
+fi
+safety_off

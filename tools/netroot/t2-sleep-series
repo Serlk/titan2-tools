@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Unattended sleep series to find what holds the 26 MHz clock in s2idle: with the SPM
+# clock-gate/power-status/busy masks off
+# (mtk_lpm.sleep_req_mask=7) one t2-s2idle-test per mtk_lpm.sleep_src_unmask value,
+# fixed schedule, no PC needed. Results in /root/sleep-series-<ts>/ (one .dmesg, .t2.out
+# and last_entry/last_wake copy per run, SUMMARY). Start detached and leave the phone alone:
+#   nohup setsid t2-sleep-series >/dev/null 2>&1 &
+#   SLEEP=25 GAP=15 RUNS="1 2 3" REQ=7 WDT_SLEEP=on t2-sleep-series   (the defaults, ~4 min)
+# The hardware watchdog stays armed through each sleep (t2-s2idle-test WDT_SLEEP=on,
+# mtk_wdt.keep_in_sleep; sleeps 25 s): a hang resets the phone after 31 s, and what was
+# done so far is on disk. Never add 7 (mcupm/mcu ignored) without WDT_SLEEP=on: it has hung
+# the phone in a test.
+set -u
+SLEEP=${SLEEP:-25}
+GAP=${GAP:-15}
+RUNS=${RUNS:-1 2 3}
+REQ=${REQ:-7}
+WDT_SLEEP=${WDT_SLEEP:-on}
+P=/sys/module/mtk_lpm/parameters
+OUT=/root/sleep-series-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$OUT"
+G='mtk-lpm.*(suspend entry|suspend wake up|honours|SPM ignores|SPM request masks|power domains|cg_check|SRCLKEN|constraints entered)|mtk-conninfra.*(suspend|resume):|mt7921-soc.*(asleep in|resumed in|wake filter|ADDBA|left set)|Triggering wakeup'
+
+say() { echo "$(date +%T) $*" >>"$OUT/SUMMARY"; echo "t2-sleep-series: $*" >/dev/kmsg 2>/dev/null; sync; }
+
+case " $RUNS " in *" 7 "*) [ "$WDT_SLEEP" = on ] || { say "refusing run 7 without WDT_SLEEP=on"; exit 1; };; esac
+say "start: sleep $SLEEP s, gap $GAP s, sleep_req_mask $REQ, sleep_src_unmask runs: $RUNS"
+for v in $RUNS; do
+	name=src$v
+	echo "$REQ" >"$P/sleep_req_mask"
+	echo "$v" >"$P/sleep_src_unmask"
+	say "$name: begin"
+	WDT_SLEEP=$WDT_SLEEP REBOOT_AFTER=120 t2-s2idle-test "$SLEEP" >"$OUT/$name.t2.out" 2>&1
+	echo 0 >"$P/sleep_src_unmask"
+	echo 0 >"$P/sleep_req_mask"
+	dmesg | sed -n "/t2-sleep-series: $name: begin/,\$p" | grep -E "$G" >"$OUT/$name.dmesg"
+	d=$(ls -td /var/log/t2-s2idle/*/ 2>/dev/null | head -1)
+	[ -n "$d" ] && { echo "$d" >"$OUT/$name.dir"; cp "$d/last_entry" "$OUT/$name.last_entry" 2>/dev/null
+			 cp "$d/last_wake" "$OUT/$name.last_wake" 2>/dev/null; cp "$d/run.log" "$OUT/$name.run.log" 2>/dev/null; }
+	say "$name: $(grep -m1 -o 'wake up by [^,]*, slept [0-9.]* s, 26M off [0-9]*%, vcore off [0-9]*%, deepest [a-z]*' "$OUT/$name.dmesg")"
+	say "$name: $(grep -m1 -o 'SPM ignores.*' "$OUT/$name.dmesg")"
+	say "$name: ping gw: $(grep -c 'ping gw ok' "$OUT/$name.run.log" 2>/dev/null)"
+	sleep "$GAP"
+done
+say "done"

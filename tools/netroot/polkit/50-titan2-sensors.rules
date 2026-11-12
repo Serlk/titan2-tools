@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+// Titan 2: the niri session is not a logind "active" session, so iio-sensor-proxy's default
+// (allow_active) refuses ClaimProximity/ClaimAccelerometer/ClaimLight to the session's programs.
+// The session user is in group input: allow the sensor claims there.
+polkit.addRule(function(action, subject) {
+	if (action.id == "net.hadess.SensorProxy.claim-sensor" && subject.isInGroup("input"))
+		return polkit.Result.YES;
+});

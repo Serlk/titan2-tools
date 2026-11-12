@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# ffrumble [/dev/input/eventN] [ms] [strong 0-65535]: upload one FF_RUMBLE effect and play it
+# (a haptic test; Alpine has no fftest)
+import sys, os, struct, fcntl, time
+dev = sys.argv[1] if len(sys.argv) > 1 else "/dev/input/event2"
+ms = int(sys.argv[2]) if len(sys.argv) > 2 else 800
+strong = int(sys.argv[3]) if len(sys.argv) > 3 else 0xffff
+FF_RUMBLE, EV_FF = 0x50, 0x15
+# struct ff_effect (aarch64, 48 bytes): type id direction trigger(2x u16) replay(2x u16) pad2 | union 32
+eff = struct.pack("<HhHHHHHxx", FF_RUMBLE, -1, 0, 0, 0, ms, 0) + struct.pack("<HH", strong, strong // 2) + bytes(28)
+assert len(eff) == 48
+EVIOCSFF = (1 << 30) | (len(eff) << 16) | (ord('E') << 8) | 0x80
+fd = os.open(dev, os.O_RDWR)
+buf = bytearray(eff)
+fcntl.ioctl(fd, EVIOCSFF, buf, True)
+eid = struct.unpack_from("<h", buf, 2)[0]
+print("effect id", eid)
+os.write(fd, struct.pack("<qqHHi", 0, 0, EV_FF, eid, 1))
+time.sleep(ms / 1000 + 0.2)
+os.write(fd, struct.pack("<qqHHi", 0, 0, EV_FF, eid, 0))
+EVIOCRMFF = (1 << 30) | (4 << 16) | (ord('E') << 8) | 0x81
+fcntl.ioctl(fd, EVIOCRMFF, eid)
+print("done")

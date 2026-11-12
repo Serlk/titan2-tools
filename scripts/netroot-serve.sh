@@ -21,17 +21,41 @@
 #   EXTRA_PKGS="..."      additional packages in the rootfs
 #   GFX=1                 add graphics packages to check DRM/fbcon (GFX_PKGS below)
 #   LOCAL_REPO=<dir>      own apk repository (inside the project, with aarch64/APKINDEX.tar.gz),
-#                         e.g. a Mesa build: added for the duration of the build, its packages
-#                         are newer than the Alpine ones of the same name and apk picks them;
-#                         LOCAL_PKGS (default: the Mesa packages, see below) are installed or
-#                         upgraded (apk add --upgrade). The key LOCAL_KEY (default
-#                         out/atl/build-keys/titan2-atl.rsa.pub) also goes into /etc/apk/keys.
-#                         apk checks these packages with that key; verify-cache (Alpine key)
-#                         skips them, the list is in out/netroot/stage/packages-local.txt
+#                         e.g. out/t2-repo (scripts/t2-repo.sh build): added for the duration of
+#                         the build, its packages are newer than the Alpine ones of the same name
+#                         and apk picks them; LOCAL_PKGS (default: the Mesa packages, see below)
+#                         are installed or upgraded (apk add --upgrade). The key LOCAL_KEY (default
+#                         out/t2-repo/t2-repo.rsa.pub, written by scripts/t2-repo.sh build) also
+#                         goes into /etc/apk/keys. apk checks these packages with that key;
+#                         verify-cache (Alpine key) skips them, the list is in
+#                         out/netroot/stage/packages-local.txt
+#   CAMERA=1, FP=1, GNSS=1  optional subsystems from their own repositories:
+#                         CAMERA_DIR (default external/titan2-camera):
+#                           git clone https://github.com/Serlk/titan2-camera external/titan2-camera
+#                         FP_DIR (default external/titan2-fingerprint):
+#                           git clone https://github.com/Serlk/titan2-fingerprint external/titan2-fingerprint
+#                         GNSS_DIR (default external/titan2-gnss):
+#                           git clone https://github.com/Serlk/titan2-gnss external/titan2-gnss
+#                         (a relative path is relative to this repository; any path works). Each
+#                         enabled repository is mounted read-only at /extra/<camera|fingerprint|gnss>
+#                         in the build container. Its netroot/packages (package names separated by
+#                         white space, "#" starts a comment) is added to the packages, its
+#                         netroot/local-packages (same format, optional) to LOCAL_PKGS (packages
+#                         of LOCAL_REPO that must be upgraded over Alpine's), and its
+#                         netroot/install.d/*.sh are sourced after ours, with X=/extra/<name>
+#                         (that repository's root) and R=<image root>. All three need LOCAL_REPO
+#                         (their packages are built with scripts/t2-repo.sh aport); FP and GNSS
+#                         also get titan2-vendor-runtime (tools/aports/titan2-vendor-runtime) and
+#                         bionic_translation
 #   MODULES=<O>           build: also put the kernel modules from <O>/modules (like "modules")
 #   AUTHORIZED_KEYS=file  SSH keys for root (otherwise tools/initramfs/authorized_keys, otherwise
-#                         ~/.ssh/id_ed25519.pub; without keys root has an EMPTY password,
-#                         dropbear -B); the keys are not changed when adding to an image
+#                         ~/.ssh/id_ed25519.pub of the user who builds; the key file is copied at
+#                         build time, nothing is embedded in this repository). The keys are not
+#                         changed when adding to an image.
+#                         Fallback without any key: root has an EMPTY password and dropbear runs
+#                         with -B (password logins allowed). The phone is reachable only over the
+#                         USB network (172.16.42.1) then, but anything on that link can log in:
+#                         set a password (passwd) or add a key at the first login.
 #   LISTEN=172.16.42.2 PORT=10809 EXPORT=t2root   for serve (LISTEN: the USB network address only)
 #   IMG=out/netroot/rootfs.img
 #
@@ -74,26 +98,67 @@ ALPINE_IMG=alpine:${REL#v}
 # chrony: NTP time through the PC (t2-defroute). linux-firmware-arm: the Mali CSF firmware
 # (arm/mali/arch11.8/mali_csffw.bin) for panthor. e2fsprogs-extra: resize2fs for t2-growroot
 # (a root on the linux partition is grown to the whole partition).
-PKGS="alpine-base openrc busybox-extras dropbear dropbear-openrc dropbear-scp kbd evtest i2c-tools
+# NetworkManager: Wi-Fi (the USB route stays below it, t2-defroute; no connection profiles are put
+# into the image).
+PKGS="alpine-base openrc busybox-extras dropbear dropbear-openrc dropbear-scp kbd evtest i2c-tools v4l-utils iw
 iproute2 e2fsprogs e2fsprogs-extra eudev udev-init-scripts udev-init-scripts-openrc kmod seatd seatd-openrc
-chrony chrony-openrc linux-firmware-arm"
+chrony chrony-openrc linux-firmware-arm
+networkmanager networkmanager-openrc networkmanager-wifi networkmanager-cli wpa_supplicant dbus dbus-openrc"
 # Graphics (GFX=1): check DRM (simpledrm) and fbcon from a full system.
 #   cage + foot: wlroots kiosk compositor and terminal (cage -- foot);
 #   weston: an alternative (weston --backend=drm); kmscube and libdrm-tests (modetest): quick checks.
 GFX_PKGS="cage foot font-dejavu mesa-dri-gallium mesa-egl weston weston-backend-drm
 weston-shell-desktop weston-terminal kmscube libdrm-tests"
+#   niri: a Wayland compositor for a session of your own (service t2-niri); alacritty: terminal,
+#   rofi: launcher, xwayland-satellite: X11 applications. The niri package pulls the GNOME/GTK4 portals.
+GFX_PKGS="$GFX_PKGS niri xwayland-satellite alacritty rofi-wayland adwaita-icon-theme"
+#   Sensors (SCP sensor hub -> mtk-hf-iio -> IIO): iio-sensor-proxy (D-Bus net.hadess.SensorProxy,
+#   monitor-sensor), rules in tools/sensors, tools/netroot/install.d/titan2-sensors.sh
+GFX_PKGS="$GFX_PKGS iio-sensor-proxy iio-sensor-proxy-openrc"
+#   Bluetooth: BlueZ (bluetoothd, bluetoothctl/btmgmt; rc-update add bluetooth default) and the
+#   PipeWire module for headsets; the btmtkbgf driver needs the -all DT (bt@18800000)
+GFX_PKGS="$GFX_PKGS bluez bluez-openrc pipewire-spa-bluez"
 [ -z "${GFX:-}" ] || PKGS="$PKGS $GFX_PKGS"
+
+# Optional subsystems from their own repositories (see CAMERA=1, FP=1, GNSS=1 above).
+# EXTRA_REPOS: "name:host-dir" pairs, mounted at /extra/<name> in the build container.
+EXTRA_REPOS= EXTRA_MOUNTS=() XLPKGS=
+pkglist() { # <file>: package names without comments
+	[ -f "$1" ] || return 0
+	sed 's/#.*//' "$1" | tr -s ' \t\n' ' '
+}
+extra_repo() { # <flag> <name> <dir> <default> <repository name>
+	local flag=$1 name=$2 dir=$3
+	[ -n "$flag" ] || return 0
+	[ -n "${LOCAL_REPO:-}" ] || { echo "$name: needs LOCAL_REPO=out/t2-repo (scripts/t2-repo.sh aport + build)" >&2; exit 1; }
+	dir=${dir:-$ROOT/external/$5}
+	case "$dir" in /*) ;; *) dir=$ROOT/$dir ;; esac
+	dir=$(realpath -m "$dir")
+	[ -d "$dir/netroot" ] || {
+		echo "$name: no $dir/netroot (git clone https://github.com/Serlk/$5 $ROOT/external/$5)" >&2
+		exit 1
+	}
+	EXTRA_REPOS="$EXTRA_REPOS $name"
+	EXTRA_MOUNTS+=(-v "$dir:/extra/$name:ro")
+	PKGS="$PKGS $(pkglist "$dir/netroot/packages")"
+	XLPKGS="$XLPKGS $(pkglist "$dir/netroot/local-packages")"
+}
+extra_repo "${CAMERA:-}" camera "${CAMERA_DIR:-}" "" titan2-camera
+extra_repo "${FP:-}" fingerprint "${FP_DIR:-}" "" titan2-fingerprint
+extra_repo "${GNSS:-}" gnss "${GNSS_DIR:-}" "" titan2-gnss
+# the shared vendor runtime of FP and GNSS (tools/titan2-vendor-runtime of this repository)
+[ -z "${FP:-}${GNSS:-}" ] || PKGS="$PKGS titan2-vendor-runtime bionic_translation"
 PKGS="$PKGS ${EXTRA_PKGS:-}"
 # own repository (LOCAL_REPO) -> paths inside /work
 LREPO= LKEY= LPKGS=
 if [ -n "${LOCAL_REPO:-}" ]; then
 	LREPO=$(realpath -m "$ROOT/$LOCAL_REPO")
-	LKEY=$(realpath -m "$ROOT/${LOCAL_KEY:-out/atl/build-keys/titan2-atl.rsa.pub}")
+	LKEY=$(realpath -m "$ROOT/${LOCAL_KEY:-out/t2-repo/t2-repo.rsa.pub}")
 	case "$LREPO$LKEY" in "$ROOT"/*"$ROOT"/*) ;; *) echo "LOCAL_REPO/LOCAL_KEY: inside $ROOT" >&2; exit 1 ;; esac
 	[ -f "$LREPO/aarch64/APKINDEX.tar.gz" ] && [ -f "$LKEY" ] ||
 		{ echo "no $LREPO/aarch64/APKINDEX.tar.gz or $LKEY" >&2; exit 1; }
 	LREPO=/work${LREPO#"$ROOT"} LKEY=/work${LKEY#"$ROOT"}
-	LPKGS=${LOCAL_PKGS:-mesa mesa-dri-gallium mesa-egl mesa-gles mesa-gbm mesa-gl mesa-vulkan-panfrost}
+	LPKGS="${LOCAL_PKGS:-mesa mesa-dri-gallium mesa-egl mesa-gles mesa-gbm mesa-gl mesa-vulkan-panfrost} $XLPKGS"
 fi
 
 mkdir -p "$D/apk-cache" "$D/apk-cache-host"
@@ -160,6 +225,11 @@ if [ -z "${ONLY_MODULES:-}" ]; then
 	apk add --root $R --arch aarch64 $INITDB --no-scripts --no-interactive --keys-dir /tmp/keys \
 		--repositories-file /tmp/repositories --cache-dir /out/apk-cache $PKGS
 	if [ -n "${LREPO:-}" ]; then
+		# an exact pin in /etc/apk/world (e.g. mesa-dev=<version> from a manual install) silently
+		# keeps the whole set at that version despite --upgrade: our packages are never pinned
+		for p in $LPKGS; do
+			sed -i "s/^$p=.*\$/$p/" $R/etc/apk/world 2>/dev/null || :
+		done
 		apk add --root $R --arch aarch64 --upgrade --no-scripts --no-interactive --keys-dir /tmp/keys \
 			--repositories-file /tmp/repositories --cache-dir /out/apk-cache $LPKGS
 	fi
@@ -243,6 +313,12 @@ MOTD
 	[ -e $R/etc/conf.d/t2-defroute ] || install -m 644 /work/tools/netroot/t2-defroute.conf $R/etc/conf.d/t2-defroute
 	# other files of ours: tools/netroot/install.d/*.sh (one per service, sourced right here)
 	for f in /work/tools/netroot/install.d/*.sh; do if [ -e "$f" ]; then . "$f"; fi; done
+	# the same for the optional repositories (CAMERA=1, FP=1, GNSS=1): X = their root here
+	for x in $EXTRA_REPOS; do
+		X=/extra/$x
+		for f in $X/netroot/install.d/*.sh; do if [ -e "$f" ]; then . "$f"; fi; done
+	done
+	unset X
 	# udev (together with devfs; mdev stays off), seatd, route/DNS, chrony
 	for s in udev udev-trigger; do rl sysinit $s; done
 	for s in seatd t2-defroute chronyd; do rl default $s; done
@@ -283,6 +359,7 @@ cmd_build() {
 	echo "container: $(docker image inspect "$ALPINE_IMG" --format '{{index .RepoDigests 0}}')"
 	# the rootfs is built inside the container (not on the host disk as root), only the image comes out
 	dk -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
+		-e EXTRA_REPOS="$EXTRA_REPOS" "${EXTRA_MOUNTS[@]}" \
 		-e SIZE="${SIZE:-4G}" -e IMGREL="$IMGREL" -e MODE=new -e MODSRC="$modsrc" \
 		-e T2_DEBUG="${T2_DEBUG:-}" -e CONFIGURE="$CONFIGURE" "$ALPINE_IMG" sh -euc '
 trap "chown -R $UIDGID /out" EXIT
@@ -318,6 +395,7 @@ img_update() { # <modsrc> ; ONLY_MODULES=1: no packages
 	rm -f "$IMG.part"
 	cp --reflink=auto --sparse=always "$IMG" "$IMG.part"
 	dk --privileged -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
+		-e EXTRA_REPOS="$EXTRA_REPOS" "${EXTRA_MOUNTS[@]}" \
 		-e IMGREL="$IMGREL" -e MODE=update -e MODSRC="$modsrc" -e ONLY_MODULES="${ONLY_MODULES:-}" \
 		-e T2_DEBUG="${T2_DEBUG:-}" -e CONFIGURE="$CONFIGURE" "$ALPINE_IMG" sh -euc '
 LOOP=

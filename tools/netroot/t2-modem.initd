@@ -1,0 +1,134 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: the modem on mainline (mtk_ccci). Starts the NVRAM file server (t2-ccci-fsd, as t2fsd,
+# in a sandbox) and the RPC server (t2-ccci-rpcd: DRDI from modem_a, read-only), then starts the
+# modem (debugfs fsm "start") and waits for READY. stop: the modem is stopped ("stop"), then the
+# servers. Installed by scripts/netroot-serve.sh build (tools/netroot/install.d/t2-modem.sh), NOT
+# added to a runlevel: rc-update add t2-modem default. Needs mtk_ccci.power_ctrl=1
+# runtime_data=1 on the kernel command line (cmdline.extra). Settings: /etc/conf.d/t2-modem.
+description="Titan 2 modem: NVRAM file server, RPC server, modem start"
+
+: ${T2_MODEM_ROOT:=/var/lib/titan2-modem}
+: ${T2_MODEM_USER:=t2fsd}
+: ${T2_MODEM_IMAGE:=/dev/disk/by-partlabel/modem_a}
+: ${T2_MODEM_FSM:=/sys/kernel/debug/d180000.mddriver/fsm}
+: ${T2_MODEM_WAIT:=60}
+: ${T2_MODEM_LOG:=/var/log/t2-modem}
+: ${T2_MODEM_AT:=/dev/wwan0at0}
+
+fsd_pid=/run/t2-ccci-fsd.pid
+rpcd_pid=/run/t2-ccci-rpcd.pid
+
+depend() {
+	need localmount
+	after udev-trigger syslog
+}
+
+fsm_state() {
+	head -n 1 "$T2_MODEM_FSM" 2>/dev/null | sed 's/^state: //'
+}
+
+start_pre() {
+	grep -qs " /sys/kernel/debug " /proc/mounts ||
+		mount -t debugfs debugfs /sys/kernel/debug || return 1
+	if [ ! -e "$T2_MODEM_FSM" ]; then
+		eerror "no $T2_MODEM_FSM (mtk_ccci not probed?)"
+		return 1
+	fi
+	if [ "$(cat /sys/module/mtk_ccci/parameters/power_ctrl 2>/dev/null)" != Y ]; then
+		eerror "mtk_ccci.power_ctrl=1 is not set"
+		return 1
+	fi
+	# the NVRAM sandbox: a copy of the partitions from your backup, never part of the image
+	if [ ! -d "$T2_MODEM_ROOT/ro" ]; then
+		eerror "no NVRAM sandbox $T2_MODEM_ROOT/ro"
+		return 1
+	fi
+	if ! id "$T2_MODEM_USER" >/dev/null 2>&1; then
+		eerror "no user $T2_MODEM_USER"
+		return 1
+	fi
+	if [ ! -r "$T2_MODEM_IMAGE" ]; then
+		eerror "no modem image $T2_MODEM_IMAGE"
+		return 1
+	fi
+	checkpath -d -m 0755 "$T2_MODEM_LOG"
+	# t2-ccci-fsd runs as $T2_MODEM_USER and could not create its log itself
+	checkpath -f -m 0644 -o "$T2_MODEM_USER" "$T2_MODEM_LOG/fsd.log"
+	chown "$T2_MODEM_USER" /dev/ccci_fs
+}
+
+start() {
+	local i st
+
+	# servers left over from a failed start hold the ports: one opener each
+	stop_servers
+	ebegin "Starting the modem file and RPC servers"
+	start-stop-daemon -S -b -m -p "$fsd_pid" -u "$T2_MODEM_USER" \
+		-1 "$T2_MODEM_LOG/fsd.log" -2 "$T2_MODEM_LOG/fsd.log" \
+		-x /usr/local/bin/t2-ccci-fsd -- ${T2_FSD_ARGS:--v} \
+		-r "$T2_MODEM_ROOT" -d /dev/ccci_fs &&
+	start-stop-daemon -S -b -m -p "$rpcd_pid" \
+		-1 "$T2_MODEM_LOG/rpcd.log" -2 "$T2_MODEM_LOG/rpcd.log" \
+		-x /usr/local/bin/t2-ccci-rpcd -- ${T2_RPCD_ARGS:--v} \
+		-m "$T2_MODEM_IMAGE" -d /dev/ccci_rpc
+	eend $? || return 1
+
+	st=$(fsm_state)
+	case "$st" in
+	ready) return 0 ;;
+	esac
+	ebegin "Starting the modem"
+	if ! echo start > "$T2_MODEM_FSM" 2>/dev/null; then
+		# refused: the driver lists what is missing
+		grep "^\[MISS\]" "$T2_MODEM_FSM" | while read -r l; do ewarn "$l"; done
+		eend 1 "modem start refused (state $(fsm_state))"
+		return 1
+	fi
+	i=0
+	while [ $i -lt "$T2_MODEM_WAIT" ]; do
+		st=$(fsm_state)
+		case "$st" in
+		ready|failed|off|stopped|*exception*) break ;;
+		esac
+		sleep 1
+		i=$((i + 1))
+	done
+	[ "$st" = ready ]
+	eend $? "modem state: $st (dmesg | grep mtk-ccci)" || return 1
+	radio_on
+}
+
+# T2_MODEM_RADIO: SIM mask for AT+EFUN (1 SIM1, 2 SIM2, 3 both); empty: radio stays off
+radio_on() {
+	local i resp
+
+	[ -n "$T2_MODEM_RADIO" ] || return 0
+	i=0
+	while [ ! -e "$T2_MODEM_AT" ] && [ $i -lt 10 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	ebegin "Turning the modem radio on (SIM mask $T2_MODEM_RADIO)"
+	resp=$(timeout 15 sh -c 'exec 3<>"$1"; printf "AT+EFUN=%s\r" "$2" >&3
+		while IFS= read -r l <&3; do
+			case "$l" in OK*|ERROR*|+CME*) echo "$l"; exit ;; esac
+		done' radio "$T2_MODEM_AT" "$T2_MODEM_RADIO" | tr -d '\r')
+	[ "$resp" = OK ]
+	eend $? "AT+EFUN=$T2_MODEM_RADIO: ${resp:-no answer}"
+}
+
+stop_servers() {
+	start-stop-daemon -K -q -p "$rpcd_pid" -x /usr/local/bin/t2-ccci-rpcd 2>/dev/null
+	start-stop-daemon -K -q -p "$fsd_pid" -x /usr/local/bin/t2-ccci-fsd 2>/dev/null
+	rm -f "$rpcd_pid" "$fsd_pid"
+}
+
+stop() {
+	ebegin "Stopping the modem"
+	echo stop > "$T2_MODEM_FSM" 2>/dev/null
+	stop_servers
+	eend 0
+}

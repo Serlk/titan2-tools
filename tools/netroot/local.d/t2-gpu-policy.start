@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2 GPU runtime policy, the sysfs part; the governor
+# thresholds are module options in /etc/modprobe.d/titan2-panthor.conf.
+#   autosuspend_delay_ms  how long the GPU stays powered after its last job before the MFG
+#                         domain is switched off through the GPUEB (panthor default 50 ms; the
+#                         downstream kbase platform uses 100 ms: fewer on/off IPI cycles per second of
+#                         UI, same idle power).
+#   polling_interval      simple_ondemand sampling period (default 50 ms); longer = calmer.
+# Leave a line out (or set T2_GPU_POLICY=0 in /etc/conf.d/local) to keep the kernel defaults.
+[ "${T2_GPU_POLICY:-1}" = 1 ] || exit 0
+G=/sys/class/devfreq/13000000.gpu
+P=/sys/devices/platform/soc@0/13000000.gpu/power
+[ -w "$P/autosuspend_delay_ms" ] && echo 100 > "$P/autosuspend_delay_ms"
+#[ -w "$G/polling_interval" ] && echo 100 > "$G/polling_interval"
+exit 0

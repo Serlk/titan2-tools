@@ -1,0 +1,83 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: one line per sample of what heats the phone:
+# CPU frequencies per policy, cpuidle time per state (ms spent in the sample), the hottest
+# thermal zones, GPU devfreq frequency / runtime status, load average. No perf, no root
+# (the GPU runtime_status and thermal zones are world-readable).
+#   t2-perfstat [interval_s] [count]      default 2 s, forever; Ctrl-C to stop
+#   T2_PERFSTAT_TOP=1 t2-perfstat 5       also the 5 busiest processes per sample
+interval=${1:-2}
+count=${2:-0}
+gpu=/sys/class/devfreq/13000000.gpu
+gpupm=/sys/devices/platform/soc@0/13000000.gpu/power
+
+idle_snapshot() {
+	# per CPU: usage and time of every state, as "cpuN:stateM:usage:time" lines
+	for c in /sys/devices/system/cpu/cpu[0-9]*; do
+		for s in "$c"/cpuidle/state*; do
+			[ -d "$s" ] || continue
+			printf '%s:%s:%s:%s:%s\n' "${c##*/cpu}" "${s##*/state}" \
+				"$(cat "$s/usage")" "$(cat "$s/time")" "$(cat "$s/rejected" 2>/dev/null || echo 0)"
+		done
+	done
+}
+
+prev=$(idle_snapshot)
+start=$(cut -d' ' -f1 /proc/uptime)
+n=0
+while :; do
+	sleep "$interval"
+	now=$(cut -d' ' -f1 /proc/uptime)
+	cur=$(idle_snapshot)
+	# idle time per state summed over the CPUs of each cluster (ms), plus rejected entries
+	idle=$(printf '%s\n--\n%s\n' "$prev" "$cur" | awk -F: -v dt="$interval" '
+		$0 == "--" { second = 1; next }
+		!second { t[$1":"$2]=$4; r[$1":"$2]=$5; names[$2]=1; next }
+		{ cl = ($1 < 4) ? "L" : "B"; d[cl":"$2] += ($4 - t[$1":"$2]) / 1000; rj[cl":"$2] += $5 - r[$1":"$2] }
+		END {
+			for (cl in d) ;
+			out = "";
+			for (c = 0; c < 2; c++) {
+				cl = (c == 0) ? "L" : "B";
+				s = cl "[";
+				for (st = 0; st < 8; st++) if ((cl":"st) in d) {
+					s = s sprintf("%s%d", (st ? " " : ""), d[cl":"st]);
+					if (rj[cl":"st]) s = s sprintf("r%d", rj[cl":"st]);
+				}
+				out = out s "] ";
+			}
+			print out
+		}')
+	prev=$cur
+	freq=""
+	for p in /sys/devices/system/cpu/cpufreq/policy*; do
+		[ -r "$p/scaling_cur_freq" ] || continue
+		f=$(cat "$p/scaling_cur_freq")
+		freq="$freq ${p##*policy}:$((f / 1000))"
+	done
+	temps=""
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ -r "$z/temp" ] || continue
+		t=$(cat "$z/temp" 2>/dev/null) || continue
+		temps="$temps $(cat "$z/type" | sed 's/-thermal$//'):$((t / 1000))"
+	done
+	# the three hottest zones, then the gpu zone if present
+	hot=$(printf '%s\n' $temps | sort -t: -k2 -n -r | head -3 | tr '\n' ' ')
+	gz=$(printf '%s\n' $temps | grep '^gpu:' | head -1)
+	g=""
+	if [ -d "$gpu" ]; then
+		g="gpu $(($(cat "$gpu/cur_freq") / 1000000))MHz $(cat "$gpupm/runtime_status" 2>/dev/null)"
+		[ -r "$gpu/load" ] && g="$g load $(cat "$gpu/load")"
+	fi
+	printf '%s up %s load %s | MHz%s | idle ms %s| %s%s | %s\n' "$(date +%H:%M:%S)" "$now" \
+		"$(cut -d' ' -f1 /proc/loadavg)" "$freq" "$idle" "$hot" "${gz:+ $gz}" "$g"
+	if [ "${T2_PERFSTAT_TOP:-0}" = 1 ]; then
+		# busiest processes since the previous sample (busybox top -b, one iteration, by %CPU)
+		top -b -n 1 2>/dev/null | awk 'NR>4 && NF>6 {print "   "$0}' | head -5
+	fi
+	n=$((n + 1))
+	[ "$count" -gt 0 ] && [ "$n" -ge "$count" ] && break
+done
+exit 0

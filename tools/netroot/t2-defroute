@@ -9,11 +9,13 @@
 #   T2_GW=172.16.42.2      gateway (the PC's address)
 #   T2_DNS="1.1.1.1"       DNS servers for /etc/resolv.conf (space separated)
 #   T2_RESOLV=yes          no: leave resolv.conf alone
+#   T2_METRIC=750          route metric: above NetworkManager's Wi-Fi (600) and mobile (700) routes,
+#                          so that a connected Wi-Fi or modem carries the traffic; USB stays the fallback
 description="Titan 2 netroot: default route and DNS via the PC"
 
 depend() {
 	after t2-usbnet networking
-	before chronyd ntpd
+	before chronyd ntpd networkmanager
 }
 
 usb_if() {
@@ -27,7 +29,8 @@ start() {
 	local gw=${T2_GW:-172.16.42.2} dev d
 	dev=$(usb_if)
 	ebegin "Default route via $gw${dev:+ dev $dev}"
-	ip route replace default via "$gw" ${dev:+dev "$dev"}
+	ip route del default via "$gw" 2>/dev/null
+	ip route add default via "$gw" ${dev:+dev "$dev"} metric "${T2_METRIC:-750}"
 	eend $? || return 1
 	if yesno "${T2_RESOLV:-yes}"; then
 		for d in ${T2_DNS:-1.1.1.1}; do echo "nameserver $d"; done >/etc/resolv.conf
@@ -36,6 +39,6 @@ start() {
 }
 
 stop() {
-	ip route del default via "${T2_GW:-172.16.42.2}" 2>/dev/null
+	ip route del default via "${T2_GW:-172.16.42.2}" metric "${T2_METRIC:-750}" 2>/dev/null
 	return 0
 }

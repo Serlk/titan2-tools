@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Titan 2: keyboard backlight level at boot (0..100) until the desktop session handles it
+L=/sys/class/leds/white:kbd_backlight/brightness
+i=0
+while [ ! -e "$L" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done
+[ -e "$L" ] && echo 100 > "$L"

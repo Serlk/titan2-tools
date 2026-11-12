@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: the Wi-Fi firmware (SOC7_0) sends its power statistics to the host log every 30 s
+# ("PWR TINFO/SINFO/RATIO", ~1.5 KB, mt7921/mcu.c mt7921_mcu_debug_msg_event); with
+# console=ttyS0,921600 + ignore_loglevel every line is spun out over the UART with interrupts
+# off. mt7921_run_firmware() turns the log on; turn it off (debugfs fw_debug, 0 = off).
+for d in /sys/kernel/debug/ieee80211/phy*/mt76/fw_debug; do
+	[ -w "$d" ] && echo 0 > "$d"
+done
+exit 0

@@ -33,7 +33,7 @@ PACKAGES = {
     "dropbear-dbclient": {"usr/bin/dbclient": None},
     "dropbear-scp": {"usr/bin/scp": None},
     "musl": {"lib/ld-musl-aarch64.so.1": None, "lib/libc.musl-aarch64.so.1": None},
-    "zlib": {"usr/lib/libz.so.1": None, "usr/lib/libz.so.1.3.2": None},
+    "zlib": {"usr/lib/libz.so.1": None, "usr/lib/libz.so.1.4": None},
     "utmps-libs": {"usr/lib/libutmps.so.0.1": None, "usr/lib/libutmps.so.0.1.3.3": None},
     "skalibs-libs": {"usr/lib/libskarnet.so.2.15": None, "usr/lib/libskarnet.so.2.15.0.0": None},
     # hardware checks (community): I2C buses and input events

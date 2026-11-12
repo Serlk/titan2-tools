@@ -1,0 +1,88 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: the niri session as /etc/init.d/t2-niri starts it, inside dbus-run-session (no logind,
+# no systemd user manager). Gives the session what desktop apps expect:
+#   - a D-Bus session bus (xdg-desktop-portal and its backends are D-Bus activated);
+#   - XDG_CURRENT_DESKTOP=niri, so the portal picks /usr/share/xdg-desktop-portal/niri-portals.conf
+#     (gnome, gtk; Access = gtk: the camera permission dialog);
+#   - PipeWire, WirePlumber, pipewire-pulse (audio and cameras: libcamera SPA), unless something
+#     else in the session already started them.
+# niri --session itself exports WAYLAND_DISPLAY/NIRI_SOCKET into the D-Bus activation environment.
+export XDG_CURRENT_DESKTOP=niri XDG_SESSION_DESKTOP=niri XDG_SESSION_TYPE=wayland
+# GTK 4 on Wayland prefers its Vulkan renderer when a Vulkan device initialises, and
+# PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 makes panvk ("not well-tested" on Mali-G615 v11) such a
+# device. GTK picks its renderer itself (Vulkan via panvk); this is not overridden by default.
+# T2_GSK_RENDERER=gl in /etc/conf.d/t2-niri forces the panfrost GL path (control measurement / fallback).
+[ -n "${T2_GSK_RENDERER:-}" ] && export GSK_RENDERER="$T2_GSK_RENDERER"
+# XDG user directories (Pictures, Videos, ...): GLib returns nothing for them without
+# ~/.config/user-dirs.dirs, and GNOME Snapshot then refuses to take a picture
+# ("Could not find XDG_PICTURES_DIR"). xdg-user-dirs-update creates the file and the directories.
+if command -v xdg-user-dirs-update >/dev/null 2>&1; then
+	xdg-user-dirs-update 2>/dev/null || :
+elif [ ! -f "$HOME/.config/user-dirs.dirs" ]; then
+	mkdir -p "$HOME/.config" "$HOME/Pictures" "$HOME/Videos" "$HOME/Downloads" "$HOME/Documents"
+	for d in DESKTOP:Desktop DOWNLOAD:Downloads DOCUMENTS:Documents PICTURES:Pictures VIDEOS:Videos MUSIC:Music; do
+		printf 'XDG_%s_DIR="$HOME/%s"\n' "${d%%:*}" "${d#*:}"
+	done >"$HOME/.config/user-dirs.dirs"
+fi
+if command -v dbus-update-activation-environment >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+	dbus-update-activation-environment XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+		XDG_RUNTIME_DIR HOME USER PAN_I_WANT_A_BROKEN_VULKAN_DRIVER GSK_RENDERER 2>/dev/null || :
+fi
+
+uid=$(id -u)
+
+# Processes of this user that were D-Bus-activated under a previous session bus (portals,
+# gnome-keyring, ...) survive `rc-service t2-niri restart` and shadow the new ones: kill every
+# process of the user whose DBUS_SESSION_BUS_ADDRESS differs from ours (not our own ancestors).
+kill_stale_session() {
+	me=$$; mine=
+	while [ -n "$me" ] && [ "$me" != 0 ] && [ "$me" != 1 ]; do
+		mine="$mine $me"
+		me=$(awk '/^PPid:/{print $2}' "/proc/$me/status" 2>/dev/null)
+	done
+	for d in /proc/[0-9]*; do
+		pid=${d#/proc/}
+		case " $mine " in *" $pid "*) continue ;; esac
+		[ "$(stat -c %u "$d" 2>/dev/null)" = "$uid" ] || continue
+		addr=$(tr '\0' '\n' <"$d/environ" 2>/dev/null | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
+		[ -n "$addr" ] && [ "$addr" != "${DBUS_SESSION_BUS_ADDRESS:-}" ] || continue
+		kill "$pid" 2>/dev/null || :
+	done
+}
+kill_stale_session
+
+start_once() {
+	command -v "$1" >/dev/null 2>&1 || return 0
+	pgrep -u "$uid" -x "$1" >/dev/null 2>&1 && return 0
+	"$@" &
+}
+if [ "${T2_SESSION_PIPEWIRE:-1}" = 1 ]; then
+	# Leftovers of a previous session (rc-service t2-niri restart) belong to the old session bus
+	# and keep the PipeWire socket: stop them, this session starts its own
+	for p in pipewire-pulse wireplumber pipewire; do
+		pkill -u "$uid" -x "$p" 2>/dev/null || :
+	done
+	i=0
+	while pgrep -u "$uid" -x pipewire >/dev/null 2>&1 && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+	pkill -KILL -u "$uid" -x pipewire 2>/dev/null || :
+	rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" \
+		"$XDG_RUNTIME_DIR/pipewire-0-manager" "$XDG_RUNTIME_DIR/pipewire-0-manager.lock" 2>/dev/null || :
+	start_once pipewire
+	# WirePlumber connects to the PipeWire socket: give pipewire a moment to create it
+	i=0
+	while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+	start_once wireplumber
+	start_once pipewire-pulse
+fi
+
+# GeoClue authorization agent: without one GeoClue refuses non-system clients (apps that talk to
+# GeoClue directly; the xdg-desktop-portal Location portal is a system client and needs none).
+# The demo agent of the geoclue package is whitelisted in geoclue.conf as geoclue-demo-agent.
+if [ -x /usr/libexec/geoclue-2.0/demos/agent ] && ! pgrep -u "$uid" -f geoclue-2.0/demos/agent >/dev/null 2>&1; then
+	/usr/libexec/geoclue-2.0/demos/agent >/dev/null 2>&1 &
+fi
+
+exec niri --session

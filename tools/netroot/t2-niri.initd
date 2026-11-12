@@ -1,0 +1,78 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: niri (Wayland) on the phone's screen as an ordinary user, through seatd: no display
+# manager, no login. Installed by scripts/netroot-serve.sh build (tools/netroot/install.d/t2-niri.sh),
+# NOT added to a runlevel: rc-update add t2-niri default. The user is set in /etc/conf.d/t2-niri
+# (T2_NIRI_USER, default "user"; the account must exist).
+description="Titan 2: niri session on the screen"
+
+: ${T2_NIRI_USER:=user}
+: ${T2_NIRI_LOG:=/var/log/t2-niri.log}
+# 1: session bus + PipeWire/WirePlumber + portals environment (/usr/local/bin/t2-niri-session in
+# dbus-run-session); 0: bare niri as before
+: ${T2_NIRI_SESSION:=1}
+
+pidfile=/run/t2-niri.pid
+
+depend() {
+	need seatd localmount
+	after udev-trigger dbus
+}
+
+start_pre() {
+	if ! id "$T2_NIRI_USER" >/dev/null 2>&1; then
+		eerror "no user $T2_NIRI_USER"
+		return 1
+	fi
+	uid=$(id -u "$T2_NIRI_USER")
+	home=$(getent passwd "$T2_NIRI_USER" | cut -d: -f6)
+	# no logind: nobody else makes the runtime directories
+	checkpath -d -m 0755 /run/user
+	checkpath -d -m 0700 -o "$T2_NIRI_USER" "/run/user/$uid"
+	checkpath -f -m 0644 -o "$T2_NIRI_USER" "$T2_NIRI_LOG"
+}
+
+# PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1: panvk shows the Mali-G615 (Valhall v11, "not well-tested"
+# in Mesa) only with it; inherited by everything niri spawns
+start() {
+	ebegin "Starting niri for $T2_NIRI_USER"
+	if [ "$T2_NIRI_SESSION" = 1 ] && [ -x /usr/bin/dbus-run-session ] && [ -x /usr/local/bin/t2-niri-session ]; then
+		set -- /usr/bin/dbus-run-session -- /usr/local/bin/t2-niri-session
+	else
+		set -- /usr/bin/niri -- --session
+	fi
+	start-stop-daemon -S -b -m -p "$pidfile" -u "$T2_NIRI_USER" -d "$home" \
+		-e XDG_RUNTIME_DIR="/run/user/$uid" -e HOME="$home" -e USER="$T2_NIRI_USER" \
+		-e XDG_SESSION_TYPE=wayland -e PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 \
+		-e T2_GSK_RENDERER="${T2_GSK_RENDERER:-}" -1 "$T2_NIRI_LOG" -2 "$T2_NIRI_LOG" \
+		-x "$@"
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping niri"
+	# The pidfile holds dbus-run-session (or niri); start-stop-daemon -b made it a session
+	# leader, so niri, everything niri spawned (session daemons, apps), the portals and
+	# PipeWire share its session id. End the whole session and wait for it: otherwise a restart
+	# can start the new session while the old daemons are still alive, because only the
+	# leader is signalled and nobody waits for the rest.
+	sid=$(cat "$pidfile" 2>/dev/null)
+	start-stop-daemon -K -R TERM/5/KILL/2 -p "$pidfile"
+	if [ -n "$sid" ]; then
+		pkill -TERM -s "$sid" 2>/dev/null || :
+		i=0
+		while pgrep -s "$sid" >/dev/null 2>&1 && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+		pkill -KILL -s "$sid" 2>/dev/null || :
+	fi
+	pkill -u "$T2_NIRI_USER" -x niri 2>/dev/null || :
+	# the session's media services (started by t2-niri-session) and the D-Bus activated
+	# services of its bus (portals, document/permission store) go with it; the user has no
+	# other session bus on the phone, so its dbus-daemon goes too
+	for p in pipewire-pulse wireplumber pipewire xdg-desktop-portal xdg-desktop-portal-gtk \
+		xdg-desktop-portal-gnome xdg-document-portal xdg-permission-store dbus-daemon; do
+		pkill -u "$T2_NIRI_USER" -x "$p" 2>/dev/null || :
+	done
+	eend 0
+}

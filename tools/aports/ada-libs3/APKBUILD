@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Maintainer: serlk <22211586+Serlk@users.noreply.github.com>
+# libada.so.3 (ada 3.3.0, Alpine 3.23 main ada-libs-3.3.0-r0, unchanged binary) next to ada 4:
+# Alpine 3.24 community telegram-desktop 6.8.5 still links libada.so.3.
+pkgname=ada-libs3
+pkgver=3.3.0
+pkgrel=0
+pkgdesc="ada 3.3.0 URL parser library (libada.so.3) for telegram-desktop 6.8.5"
+url="https://github.com/ada-url/ada"
+arch="aarch64"
+license="( Apache-2.0 OR MIT ) AND MPL-2.0"
+depends=""
+options="!check !strip !tracedeps"
+provides="so:libada.so.3=3.3.0"
+source="ada-libs-3.3.0-r0.apk::https://dl-cdn.alpinelinux.org/alpine/v3.23/main/aarch64/ada-libs-3.3.0-r0.apk"
+noextract="ada-libs-3.3.0-r0.apk"
+
+package() {
+	mkdir -p "$srcdir/x"
+	tar -xzf "$srcdir/ada-libs-3.3.0-r0.apk" -C "$srcdir/x" usr/lib 2>/dev/null || :
+	mkdir -p "$pkgdir/usr/lib"
+	cp -a "$srcdir/x/usr/lib/libada.so.3" "$srcdir/x/usr/lib/libada.so.3.3.0" "$pkgdir/usr/lib/"
+}

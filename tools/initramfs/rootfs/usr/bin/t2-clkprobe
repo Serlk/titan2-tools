@@ -1,0 +1,81 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Find the clock whose register read hangs the bus (clk_summary -> watchdog reboot).
+#   ssh root@172.16.42.1 t2-clkprobe            # .is_enabled of every clock, like clk_summary
+#   ssh root@172.16.42.1 t2-clkprobe --all      # also .is_prepared, .recalc_rate, .get_parent
+#   ssh root@172.16.42.1 t2-clkprobe --from im_c_s_i3c5_w1s   # continue from a clock
+# Before every read it writes "t2-clkprobe: <clock>/<file>" to /dev/kmsg and syncs.
+# If the phone hangs, the last such line in /sys/fs/pstore/console-ramoops-0 after the reboot
+# (t2-report shows pstore) names the culprit.
+#
+# Needs the clk_hw_* files (CONFIG_COMMON_CLK_DEBUGFS_HW_STATE, kernel patch "clk: Add debugfs
+# files that read the clock hardware state"). The other files in /sys/kernel/debug/clk/<clock>/
+# do NOT touch the hardware: clk_rate is cached (recalculated only with CLK_GET_RATE_NOCACHE,
+# which no MT6878 clock has), clk_parent/clk_phase/clk_accuracy/*_count are cached, clk_duty_cycle
+# is cached (MediaTek has no .get_duty_cycle). Without clk_hw_* the walk is useless.
+#
+#   --all          all clk_hw_* files (default: clk_hw_enabled only)
+#   --file F       only this file (clk_hw_enabled|clk_hw_prepared|clk_hw_rate|clk_hw_parent),
+#                  may be given several times
+#   --from NAME    start at clock NAME (alphabetical order), skip the ones before
+#   --skip NAME    skip a clock (may be given several times)
+#   --delay SEC    pause after the kmsg write, e.g. 0.05 (default 0)
+FILES=
+FROM=
+SKIP=' '
+DELAY=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--all) FILES='clk_hw_enabled clk_hw_prepared clk_hw_rate clk_hw_parent' ;;
+	--file) FILES="$FILES $2"; shift ;;
+	--from) FROM=$2; shift ;;
+	--skip) SKIP="$SKIP$2 "; shift ;;
+	--delay) DELAY=$2; shift ;;
+	*) echo "usage: t2-clkprobe [--all] [--file F]... [--from NAME] [--skip NAME]... [--delay SEC]" >&2
+	   exit 2 ;;
+	esac
+	shift
+done
+[ -n "$FILES" ] || FILES=clk_hw_enabled
+
+D=/sys/kernel/debug
+mountpoint -q $D 2>/dev/null || mount -t debugfs debugfs $D 2>/dev/null
+C=$D/clk
+[ -d $C ] || { echo "t2-clkprobe: no $C (debugfs/COMMON_CLK)" >&2; exit 1; }
+if ! ls $C/*/clk_hw_* >/dev/null 2>&1; then
+	echo "t2-clkprobe: the kernel has no clk_hw_* files (CONFIG_COMMON_CLK_DEBUGFS_HW_STATE)" >&2
+	exit 1
+fi
+
+# without this /dev/kmsg rate-limits user lines (10 per 5 s) and the trail is lost
+echo on >/proc/sys/kernel/printk_devkmsg 2>/dev/null
+
+log() {
+	echo "<4>t2-clkprobe: $*" >/dev/kmsg
+	sync
+	[ "$DELAY" = 0 ] || sleep "$DELAY"
+}
+
+log "start: $FILES${FROM:+ from $FROM}"
+started=
+[ -n "$FROM" ] || started=1
+n=0
+for dir in $C/*/; do
+	name=${dir%/}
+	name=${name##*/}
+	[ -n "$started" ] || { [ "$name" = "$FROM" ] && started=1 || continue; }
+	case "$SKIP" in *" $name "*) continue ;; esac
+	line=$name
+	for f in $FILES; do
+		[ -e "$dir$f" ] || continue
+		log "$name/$f"
+		v=$(cat "$dir$f" 2>&1)
+		line="$line ${f#clk_hw_}=$v"
+	done
+	[ "$line" = "$name" ] && continue
+	echo "$line"
+	n=$((n + 1))
+done
+log "done: $n clocks"
