@@ -93,13 +93,18 @@ cp --reflink=auto --sparse=always "$BASE" "$O/linux.raw"
 REL_A=${ALPINE_RELEASE:-v3.24}
 docker run --rm --privileged -v "$O:/o" -e UIDGID="$(id -u):$(id -g)" "alpine:${REL_A#v}" sh -euc '
 	mkdir -p /mnt/r
-	mount -o loop /o/linux.raw /mnt/r
-	trap "umount /mnt/r" EXIT
+	# loop device: the container /dev is a snapshot, the node of a new loopN may be missing
+	LOOP=$(losetup -f)
+	[ -b $LOOP ] || mknod $LOOP b 7 ${LOOP#/dev/loop}
+	losetup $LOOP /o/linux.raw
+	trap "umount /mnt/r 2>/dev/null || :; losetup -d $LOOP || :" EXIT
+	mount -t ext4 $LOOP /mnt/r
 	rm -rf /mnt/r/boot/extlinux /mnt/r/boot/dtbs
 	mkdir -p /mnt/r/boot
 	cp -r /o/boot/. /mnt/r/boot/
 	chown -R 0:0 /mnt/r/boot
 	umount /mnt/r
+	losetup -d $LOOP
 	trap - EXIT
 	chown "$UIDGID" /o/linux.raw
 '
