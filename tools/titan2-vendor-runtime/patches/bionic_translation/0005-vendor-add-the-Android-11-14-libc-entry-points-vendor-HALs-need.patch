@@ -1,0 +1,288 @@
+From ec465556a3e6f0d1dc06c3d45871804d25c892b3 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 16:00:34 +0300
+Subject: [PATCH] vendor: add the Android 11..14 libc entry points vendor HALs
+ need
+
+A library with an unresolved symbol is refused by the linker, so a vendor
+HAL referencing any bionic entry point that libc_bio.so lacks cannot be
+loaded at all unless LINKER_DIE_AT_RUNTIME masks the gap. The FocalTech
+fingerprint and TrustKernel gatekeeper HALs of a MediaTek Android 14
+device reference sixteen of them.
+
+Add vendor/libc_compat.c to libvendor_bio.so with fdsan (no ownership
+tracking), __cfi_slowpath (no-op), android_get_exported_namespace
+(no namespaces), __register_atfork (pthread_atfork),
+__cxa_thread_atexit_impl (per-thread destructor list on a pthread key),
+__openat_2, __pread_chk, __pwrite_chk, __readlink_chk, __strlcpy_chk,
+__strlcat_chk and __system_property_wait (properties come from a file
+and never change: return at once). Add pthread_cond_clockwait and
+pthread_gettid_np to libpthread_bio.so, which has the bionic types.
+---
+ README.md                    |   5 +
+ meson.build                  |   1 +
+ pthread_wrapper/libpthread.c |  33 +++++++
+ vendor/libc_compat.c         | 175 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 214 insertions(+)
+ create mode 100644 vendor/libc_compat.c
+
+diff --git a/README.md b/README.md
+index 47e2808..50e4d9d 100644
+--- a/README.md
++++ b/README.md
+@@ -54,6 +54,11 @@ With `BIONIC_VENDOR_ROOT` set, `libdl_bio.so` also loads `libvendor_bio.so.0` in
+ holds `bionic_`-prefixed replacements for the parts of Android system libraries that only make sense
+ with Android daemons around (liblog's `__android_log_*`, which would otherwise try to reach logd) or
+ with Android-only kernel drivers (libcutils' `ashmem_*`, mapped onto memfd_create(2)).
++It also fills in bionic entry points of Android 11..14 that `libc_bio.so` lacks and that vendor HALs
++reference (fdsan, `__cfi_slowpath`, `__register_atfork`, `__cxa_thread_atexit_impl`,
++`__system_property_wait`, a few `_chk` variants); `libpthread_bio.so` gains `pthread_cond_clockwait`
++and `pthread_gettid_np` for the same reason. An unresolved symbol makes the linker refuse the whole
++library, so these matter even when they are never called.
+ A program that does not use the environment variable can link `libvendor_bio.so` itself; nothing
+ in it depends on the vendor root.
+ 
+diff --git a/meson.build b/meson.build
+index 139d386..76ca29f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -160,6 +160,7 @@ vendor_bio = shared_library('vendor_bio',
+ 	sources: [
+ 		'vendor/liblog.c',
+ 		'vendor/ashmem.c',
++		'vendor/libc_compat.c',
+ 	],
+ 	soversion: 0,
+ 	install: true,
+diff --git a/pthread_wrapper/libpthread.c b/pthread_wrapper/libpthread.c
+index 56693ae..94f7ef5 100644
+--- a/pthread_wrapper/libpthread.c
++++ b/pthread_wrapper/libpthread.c
+@@ -6,6 +6,8 @@
+ #include <semaphore.h>
+ #include <assert.h>
+ #include <sys/mman.h>
++#include <sys/syscall.h>
++#include <time.h>
+ #include <setjmp.h>
+ 
+ // when __GLIBC__ (or some glibc specific symbol) is not defined, we're assuming musl; can't check to be sure because 🤡
+@@ -632,3 +634,34 @@ int bionic_pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*ch
+ {
+ 	return pthread_atfork(prepare, parent, child);
+ }
++
++/* Android 11+: wait with an explicit clock (CLOCK_REALTIME or CLOCK_MONOTONIC) */
++int bionic_pthread_cond_clockwait(bionic_cond_t *cond, bionic_mutex_t *mutex, clockid_t clock, const struct timespec *abstime)
++{
++	assert(cond && mutex && abstime);
++	if (clock == CLOCK_MONOTONIC) {
++		/* abstime is absolute on CLOCK_MONOTONIC; the host wait takes CLOCK_REALTIME */
++		struct timespec now, rt;
++		clock_gettime(CLOCK_MONOTONIC, &now);
++		clock_gettime(CLOCK_REALTIME, &rt);
++		rt.tv_sec += abstime->tv_sec - now.tv_sec;
++		rt.tv_nsec += abstime->tv_nsec - now.tv_nsec;
++		if (rt.tv_nsec >= 1000000000) {
++			++rt.tv_sec;
++			rt.tv_nsec -= 1000000000;
++		} else if (rt.tv_nsec < 0) {
++			--rt.tv_sec;
++			rt.tv_nsec += 1000000000;
++		}
++		return bionic_pthread_cond_timedwait(cond, mutex, &rt);
++	}
++	return bionic_pthread_cond_timedwait(cond, mutex, abstime);
++}
++
++/* kernel thread id of a thread: only known for the calling thread here */
++pid_t bionic_pthread_gettid_np(bionic_pthread_t thread)
++{
++	if (pthread_equal((pthread_t)thread, pthread_self()))
++		return syscall(SYS_gettid);
++	return -1;
++}
+diff --git a/vendor/libc_compat.c b/vendor/libc_compat.c
+new file mode 100644
+index 0000000..fd4a5dd
+--- /dev/null
++++ b/vendor/libc_compat.c
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ * Bionic entry points of Android 11..14 that vendor HALs reference and that
++ * libc_bio.so does not provide. Without them a library cannot even be loaded
++ * (the linker refuses unresolved symbols unless LINKER_DIE_AT_RUNTIME is set),
++ * so they are implemented here, bionic_-prefixed like everything else
++ * (linker/linker.c, apkenv_reloc_library), with the semantics a non-Android
++ * host can offer.
++ */
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++/* ---- fdsan (bionic/fdsan.h): no ownership tracking, tags are ignored ---- */
++
++uint64_t bionic_android_fdsan_create_owner_tag(int type, uint64_t tag)
++{
++	return 0;
++}
++
++void bionic_android_fdsan_exchange_owner_tag(int fd, uint64_t expected_tag, uint64_t new_tag)
++{
++}
++
++uint64_t bionic_android_fdsan_get_owner_tag(int fd)
++{
++	return 0;
++}
++
++int bionic_android_fdsan_close_with_tag(int fd, uint64_t tag)
++{
++	return close(fd);
++}
++
++int bionic_android_fdsan_get_error_level(void)
++{
++	return 0;	/* ANDROID_FDSAN_ERROR_LEVEL_DISABLED */
++}
++
++int bionic_android_fdsan_set_error_level(int new_level)
++{
++	return 0;
++}
++
++/* ---- CFI: the compiler-inserted check for cross-DSO indirect calls ---- */
++
++void bionic___cfi_slowpath(uint64_t call_sig_id, void *ptr)
++{
++}
++
++void bionic___cfi_slowpath_diag(uint64_t call_sig_id, void *ptr, void *diag_data)
++{
++}
++
++/* ---- linker namespaces: there are none ---- */
++
++void *bionic_android_get_exported_namespace(const char *name)
++{
++	return NULL;
++}
++
++/* ---- fork handlers: bionic's pthread_atfork() is a thin wrapper around this ---- */
++
++int bionic___register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void),
++			     void *dso_handle)
++{
++	return pthread_atfork(prepare, parent, child);
++}
++
++/* ---- thread_local destructors (libc++ emits __cxa_thread_atexit_impl calls) ---- */
++
++struct thread_dtor {
++	void (*func)(void *);
++	void *obj;
++	struct thread_dtor *next;
++};
++
++static pthread_key_t thread_dtor_key;
++static pthread_once_t thread_dtor_once = PTHREAD_ONCE_INIT;
++
++static void run_thread_dtors(void *list)
++{
++	struct thread_dtor *d = list;
++
++	while (d) {
++		struct thread_dtor *next = d->next;
++
++		d->func(d->obj);
++		free(d);
++		d = next;
++	}
++}
++
++static void thread_dtor_init(void)
++{
++	pthread_key_create(&thread_dtor_key, run_thread_dtors);
++}
++
++int bionic___cxa_thread_atexit_impl(void (*func)(void *), void *obj, void *dso_symbol)
++{
++	struct thread_dtor *d;
++
++	pthread_once(&thread_dtor_once, thread_dtor_init);
++	d = malloc(sizeof(*d));
++	if (!d)
++		return -1;
++	d->func = func;
++	d->obj = obj;
++	d->next = pthread_getspecific(thread_dtor_key);
++	pthread_setspecific(thread_dtor_key, d);
++	return 0;
++}
++
++/* ---- _FORTIFY_SOURCE run-time variants not in libc-chk.c ---- */
++
++int bionic___openat_2(int fd, const char *pathname, int flags)
++{
++	return openat(fd, pathname, flags, 0);
++}
++
++ssize_t bionic___pread_chk(int fd, void *buf, size_t count, off_t offset, size_t buf_size)
++{
++	return pread(fd, buf, count, offset);
++}
++
++ssize_t bionic___pwrite_chk(int fd, const void *buf, size_t count, off_t offset, size_t buf_size)
++{
++	return pwrite(fd, buf, count, offset);
++}
++
++ssize_t bionic___readlink_chk(const char *path, char *buf, size_t size, size_t buf_size)
++{
++	return readlink(path, buf, size);
++}
++
++size_t bionic___strlcpy_chk(char *dst, const char *src, size_t size, size_t dst_size)
++{
++	size_t len = strlen(src);
++
++	if (size) {
++		size_t n = len < size - 1 ? len : size - 1;
++
++		memcpy(dst, src, n);
++		dst[n] = 0;
++	}
++	return len;
++}
++
++size_t bionic___strlcat_chk(char *dst, const char *src, size_t size, size_t dst_size)
++{
++	size_t dlen = strnlen(dst, size);
++
++	if (dlen == size)
++		return size + strlen(src);
++	return dlen + bionic___strlcpy_chk(dst + dlen, src, size - dlen, 0);
++}
++
++/*
++ * ---- __system_property_wait: properties come from a file (libc-properties.c)
++ * and never change at run time, so a waiter is told at once that the serial
++ * moved on; blocking here would stall HAL threads that poll for a property.
++ */
++bool bionic___system_property_wait(const void *pi, uint32_t old_serial, uint32_t *new_serial_ptr,
++				   const struct timespec *relative_timeout)
++{
++	if (new_serial_ptr)
++		*new_serial_ptr = old_serial + 1;
++	return true;
++}
+-- 
+2.56.0
+

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# /etc/conf.d/t2-vendor: the vendor container (t2-vendor-container)
+#T2_VENDOR_ROOT=/var/lib/titan2-vendor
+# SELinux policy loaded permissive at start (default: the factory precompiled_sepolicy of the
+# vendor root; "none" to skip — then the service managers cannot register anything)
+#T2_SEPOLICY=none
+# start hwservicemanager too (not needed: the factory VINTF manifests declare no HIDL HAL)
+#T2_HWSERVICEMANAGER=1

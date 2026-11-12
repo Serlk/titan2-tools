@@ -1,0 +1,96 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Assemble the vendor root (/var/lib/titan2-vendor) from the phone's own factory
+# firmware. Closed daemons run there natively in a bionic chroot; closed HAL modules
+# are loaded from there in-process through bionic_translation. Nothing is downloaded
+# and nothing vendor-made is shipped: the lists only name files, which are copied
+# from the user's own partitions when this script runs.
+#
+#   t2-vendor-setup SRC [DEST] [LIST...]
+#     SRC   directory with the factory partitions, mounted or extracted:
+#           SRC/system_a (or SRC/system), SRC/system_ext_a (or SRC/system_ext),
+#           SRC/vendor_a (or SRC/vendor), SRC/product_a (or SRC/product)
+#     DEST  vendor root (default /var/lib/titan2-vendor)
+#     LIST  file lists; default: every *.txt in the drop-in directory
+#           $T2_VENDOR_FILES_D (default /usr/share/titan2-vendor-runtime/files.d)
+#
+# Drop-in interface (installed by the packages that need the vendor root):
+#   files.d/<name>.txt   "<source path below SRC> <path below DEST>" lines;
+#                        "#" starts a comment line; a leading "?" marks an optional
+#                        file; a destination ending in "/" copies a directory;
+#                        "@dir <path>" creates a runtime directory below DEST.
+#   props.d/<name>.props "name=value" lines merged into DEST/t2-props (the property
+#                        file of bionic_translation and of t2-propd); a property already
+#                        present in DEST/t2-props is never overwritten.
+# titan2-vendor-runtime itself installs files.d/vendor-container.txt (binder service
+# managers for t2-vendor-container) and props.d/00-base.props.
+set -eu
+SRC=${1:?usage: t2-vendor-setup SRC [DEST] [LIST...]}
+DEST=${2:-/var/lib/titan2-vendor}
+shift; [ $# -eq 0 ] || shift
+SHARE=${T2_VENDOR_SHARE:-/usr/share/titan2-vendor-runtime}
+FILES_D=${T2_VENDOR_FILES_D:-$SHARE/files.d}
+PROPS_D=${T2_VENDOR_PROPS_D:-$SHARE/props.d}
+if [ $# -gt 0 ]; then LISTS="$*"
+else LISTS=$(ls "$FILES_D"/*.txt 2>/dev/null || true); fi
+[ -n "$LISTS" ] || { echo "t2-vendor-setup: no file lists in $FILES_D" >&2; exit 1; }
+for l in $LISTS; do [ -f "$l" ] || { echo "t2-vendor-setup: no $l" >&2; exit 1; }; done
+
+# accept both SRC/system_a/system/lib64 (extracted system_a) and SRC/system/lib64
+src_of() {
+	case "$1" in
+	system/*)
+		if [ -e "$SRC/system_a/system/${1#system/}" ]; then echo "$SRC/system_a/system/${1#system/}"
+		elif [ -e "$SRC/system/system/${1#system/}" ]; then echo "$SRC/system/system/${1#system/}"
+		else echo "$SRC/$1"; fi ;;
+	system_ext/*)
+		if [ -e "$SRC/system_ext_a/${1#system_ext/}" ]; then echo "$SRC/system_ext_a/${1#system_ext/}"
+		elif [ -e "$SRC/system_a/system/system_ext/${1#system_ext/}" ]; then echo "$SRC/system_a/system/system_ext/${1#system_ext/}"
+		else echo "$SRC/$1"; fi ;;
+	vendor/*)
+		if [ -e "$SRC/vendor_a/${1#vendor/}" ]; then echo "$SRC/vendor_a/${1#vendor/}"
+		else echo "$SRC/$1"; fi ;;
+	product/*)
+		if [ -e "$SRC/product_a/${1#product/}" ]; then echo "$SRC/product_a/${1#product/}"
+		elif [ -e "$SRC/system_a/system/product/${1#product/}" ]; then echo "$SRC/system_a/system/product/${1#product/}"
+		else echo "$SRC/$1"; fi ;;
+	*) echo "$SRC/$1" ;;
+	esac
+}
+
+mkdir -p "$DEST"
+cat $LISTS | while read -r src dst; do
+	case "$src" in ''|'#'*) continue ;; esac
+	# a trailing "# comment" is not part of the destination
+	dst=${dst%%#*}
+	dst=$(echo "$dst" | sed 's/[[:space:]]*$//')
+	if [ "$src" = @dir ]; then mkdir -p "$DEST/$dst"; continue; fi
+	opt=
+	case "$src" in '?'*) opt=1; src=${src#?} ;; esac
+	s=$(src_of "$src")
+	if [ ! -e "$s" ]; then
+		if [ -n "$opt" ]; then echo "  (optional, absent) $src"; continue; fi
+		echo "  MISSING $src" >&2; continue
+	fi
+	case "$dst" in
+	*/)	mkdir -p "$DEST/$dst"; cp -a "$s/." "$DEST/$dst" ;;
+	*)	mkdir -p "$DEST/$(dirname "$dst")"; cp -f "$s" "$DEST/$dst"; chmod 644 "$DEST/$dst" ;;
+	esac
+done
+# (the loop runs in a subshell: a MISSING line above is the error report)
+chmod 755 "$DEST"/system/bin/* "$DEST"/system/bin/bootstrap/* "$DEST"/vendor/bin/* "$DEST"/vendor/bin/hw/* 2>/dev/null || true
+for d in dev proc sys data/vendor data/misc; do mkdir -p "$DEST/$d"; done
+
+# properties: merge the drop-ins, never overwrite a value already in t2-props
+touch "$DEST/t2-props"
+for p in "$PROPS_D"/*.props; do
+	[ -f "$p" ] || continue
+	while IFS= read -r line; do
+		case "$line" in ''|'#'*) continue ;; esac
+		name=${line%%=*}
+		grep -q "^$name=" "$DEST/t2-props" || echo "$line" >>"$DEST/t2-props"
+	done <"$p"
+done
+echo "t2-vendor-setup: $DEST ready ($(du -sh "$DEST" | cut -f1))"

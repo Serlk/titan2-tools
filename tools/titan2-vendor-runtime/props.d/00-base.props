@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Base Android properties of the Titan 2 vendor root (merged into t2-props by
+# t2-vendor-setup); read by bionic_translation (patch 0002) and t2-propd.
+ro.build.version.sdk=34
+ro.build.version.release=14
+ro.board.platform=mt6878
+ro.product.brand=Unihertz
+ro.product.model=Titan 2
+ro.product.name=Titan2
+ro.arch=arm64
+ro.hardware=mt6878
+ro.debuggable=0

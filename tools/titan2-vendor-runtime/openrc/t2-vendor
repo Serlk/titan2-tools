@@ -1,0 +1,33 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Vendor container: the binder service managers of the factory firmware (and the HAL services
+# started on top of them) in the bionic chroot of /var/lib/titan2-vendor, on
+# binderfs with our property service and log collector. Everything is driven
+# by t2-vendor-container; t2-teed starts the property service by itself.
+description="Android vendor container (binder managers, properties, logd) in a bionic chroot"
+
+: "${T2_VENDOR_ROOT:=/var/lib/titan2-vendor}"
+export T2_VENDOR_ROOT T2_SEPOLICY T2_HWSERVICEMANAGER
+
+depend() {
+	need localmount
+	after modules
+}
+
+start() {
+	ebegin "Starting the vendor container in $T2_VENDOR_ROOT"
+	t2-vendor-container start
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping the vendor container"
+	t2-vendor-container stop
+	eend $?
+}
+
+status() {
+	t2-vendor-container status
+}

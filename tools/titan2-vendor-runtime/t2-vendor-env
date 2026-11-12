@@ -1,0 +1,92 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# What every factory-firmware daemon run natively in the vendor chroot needs, in one place
+# (the same steps t2-teed does for teed): the chroot sees the real /dev, /proc,
+# /sys (plain binds — no namespaces, no binderfs needed for mnld), our Android
+# property service t2-propd (/dev/__properties__ + /dev/socket/property_service,
+# initial values from <root>/t2-props) and our log collector t2-logd
+# (/dev/socket/logdw -> /var/log/t2-vendor/logcat.log). The pid files are shared
+# with t2-teed and t2-vendor-container: whoever starts first owns them.
+#
+#   t2-vendor-env up                 mounts + propd + logd (idempotent)
+#   t2-vendor-env prop NAME VALUE    set a property (t2-props line + live setprop)
+#   t2-vendor-env status
+#   T2_VENDOR_ROOT (default /var/lib/titan2-vendor), T2_CONTAINER_LOG (/var/log/t2-vendor)
+set -eu
+ROOT=${T2_VENDOR_ROOT:-/var/lib/titan2-vendor}
+LOG=${T2_CONTAINER_LOG:-/var/log/t2-vendor}
+ENV="LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/vendor/lib64/hw ANDROID_DATA=/data ANDROID_ROOT=/system"
+
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+tool() {
+	local c
+	for c in "$(command -v "$1" 2>/dev/null)" "/usr/bin/$1" "$(dirname "$0")/$1"; do
+		[ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+	done
+	echo "t2-vendor-env: no $1 (install titan2-vendor-runtime)" >&2
+	return 1
+}
+
+up() {
+	[ -x "$ROOT/system/bin/linker64" ] || { echo "t2-vendor-env: $ROOT has no system/bin/linker64 (t2-vendor-setup)" >&2; return 1; }
+	local d
+	for d in dev proc sys data/vendor data/misc; do mkdir -p "$ROOT/$d"; done
+	mountpoint -q "$ROOT/dev" || mount --bind /dev "$ROOT/dev"
+	mountpoint -q "$ROOT/proc" || mount -t proc proc "$ROOT/proc"
+	mountpoint -q "$ROOT/sys" || mount --bind /sys "$ROOT/sys"
+	mkdir -p /dev/socket "$LOG"
+	if ! alive /run/t2-vendor-propd.pid; then
+		local propd
+		propd=$(tool t2-propd) || return 1
+		start-stop-daemon --start --background --make-pidfile --pidfile /run/t2-vendor-propd.pid \
+			--stdout "$LOG/propd.log" --stderr "$LOG/propd.log" --exec "$propd" -- -D -f "$ROOT/t2-props"
+		sleep 0.3
+	fi
+	if ! alive /run/t2-vendor-logd.pid; then
+		local logd
+		logd=$(tool t2-logd) || return 1
+		start-stop-daemon --start --background --make-pidfile --pidfile /run/t2-vendor-logd.pid \
+			--exec "$logd" -- -s /dev/socket/logdw -o "$LOG/logcat.log"
+	fi
+	return 0
+}
+
+# a property: persisted in <root>/t2-props (loaded at the next propd start) and set live
+prop() {
+	local name=$1 value=$2
+	touch "$ROOT/t2-props"
+	if grep -q "^$name=" "$ROOT/t2-props"; then
+		sed -i "s|^$name=.*|$name=$value|" "$ROOT/t2-props"
+	else
+		echo "$name=$value" >>"$ROOT/t2-props"
+	fi
+	if alive /run/t2-vendor-propd.pid && [ -x "$ROOT/system/bin/setprop" ]; then
+		env $ENV timeout 3 chroot "$ROOT" /system/bin/setprop "$name" "$value" 2>/dev/null || true
+	fi
+}
+
+status() {
+	echo "root: $ROOT"
+	local d
+	for d in dev proc sys; do
+		mountpoint -q "$ROOT/$d" && echo "  $d: mounted" || echo "  $d: NOT mounted"
+	done
+	alive /run/t2-vendor-propd.pid && echo "  t2-propd: running" || echo "  t2-propd: not running"
+	alive /run/t2-vendor-logd.pid && echo "  t2-logd: running" || echo "  t2-logd: not running"
+	if [ -x "$ROOT/system/bin/getprop" ]; then
+		local p
+		for p in persist.vendor.connsys.chipid vendor.connsys.gps.adie.chipid vendor.connsys.driver.ready vendor.service.nvram_init hwservicemanager.disabled; do
+			echo "  $p=$(env $ENV timeout 3 chroot "$ROOT" /system/bin/getprop "$p" 2>/dev/null)"
+		done
+	fi
+}
+
+case "${1:-}" in
+up) up ;;
+prop) shift; prop "$1" "$2" ;;
+status) status ;;
+*) sed -n '13,17p' "$0"; exit 2 ;;
+esac

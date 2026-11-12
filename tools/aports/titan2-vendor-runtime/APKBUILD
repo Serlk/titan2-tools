@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Maintainer: serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2 vendor runtime: the shared base of titan2-fingerprint and titan2-gnss. Builds the
+# vendor root from the phone's own factory partitions (t2-vendor-setup, drop-in file lists),
+# runs factory daemons natively in a bionic chroot (t2-vendor-env, t2-propd, t2-logd,
+# t2-vendor-container) and sets up the bionic_translation vendor profile. Contains no
+# vendor files. Source: tools/titan2-vendor-runtime (`make -C tools/titan2-vendor-runtime dist`,
+# then `abuild checksum`).
+pkgname=titan2-vendor-runtime
+pkgver=0.1
+pkgrel=0
+pkgdesc="Unihertz Titan 2: vendor root builder and bionic chroot helpers for factory HALs and daemons"
+url="https://github.com/Serlk/titan2-tools"
+arch="aarch64"
+license="GPL-2.0-or-later AND Apache-2.0"
+# bionic_translation with the patches in tools/titan2-vendor-runtime/patches/bionic_translation
+depends="bionic_translation openrc"
+subpackages="$pkgname-dev"
+options="!check"
+source="titan2-vendor-runtime.tar.gz"
+builddir="$srcdir/titan2-vendor-runtime"
+
+build() {
+	make
+}
+
+package() {
+	make DESTDIR="$pkgdir" PREFIX=/usr install
+}
+
+dev() {
+	pkgdesc="$pkgdesc (t2-hal and bionic_exe sources and headers for dependent packages)"
+	depends="$pkgname=$pkgver-r$pkgrel"
+	amove usr/share/titan2-vendor-runtime/src
+}
+
+sha512sums="
+"

@@ -1,0 +1,230 @@
+From 9353f3cf458afecd8d575286c9d1edbaea760b65 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:16:51 +0300
+Subject: [PATCH 1/4] linker: add a vendor profile with BIONIC_VENDOR_ROOT
+ library directories
+
+Allow loading bionic-linked libraries out of a directory tree laid out
+like the Android partitions. When BIONIC_VENDOR_ROOT is set, the linker
+adds <root>/vendor/lib64, <root>/vendor/lib64/hw,
+<root>/apex/<vndk>/lib64 (BIONIC_VNDK_APEX, default
+com.android.vndk.v34) and <root>/system/lib64 to the fixed library
+search directories, in that order, so that libraries from vendor/ see
+the VNDK copies of the framework libraries before system/lib64.
+
+Absolute Android paths (/vendor/lib64/hw/foo.so, /system/lib64/bar.so)
+passed to dlopen or found in DT_NEEDED are resolved below the root
+first. Absolute paths that point into one of the fixed library
+directories are now also accepted as bionic-linked libraries, like
+paths matching BIONIC_LD_LIBRARY_PATH already were.
+
+libm.so is mapped to libc_bio.so.0 in this profile, since libm is part
+of libc on musl and glibc and a foreign libm must never be loaded.
+override_map_append() is exported from the config helper for this.
+
+SOPATH_MAX grows to 16 to make room for the extra directories.
+---
+ README.md              | 18 ++++++++++
+ linker/dlfcn.c         | 12 +++++++
+ linker/linker.c        | 78 +++++++++++++++++++++++++++++++++++++++++-
+ linker/linker.h        |  2 ++
+ shared/config/config.c |  2 +-
+ shared/config/config.h |  1 +
+ 6 files changed, 111 insertions(+), 2 deletions(-)
+
+diff --git a/README.md b/README.md
+index 38b6c25..f6a3e29 100644
+--- a/README.md
++++ b/README.md
+@@ -29,6 +29,24 @@ LINKER_PRINT_MISSING_SYMBOLS_AND_DIE= - When a non-function symbol is not found
+ LINKER_IGNORE_UNKNOWN_RELOCS= - Don't set this. It's used when we run tests, because we know the missing relocs are only needed by a few tests which will correctly be marked as failing with this set.
+ ```
+ 
++### vendor profile
++
++The linker can also load bionic-linked libraries out of a directory tree laid out like the
++Android partitions (`vendor/`, `system/`, `apex/`), for example an extracted or bind-mounted
++copy of them. This is opt-in:
++
++```
++BIONIC_VENDOR_ROOT=<dir> - Adds <dir>/vendor/lib64, <dir>/vendor/lib64/hw, <dir>/apex/<vndk>/lib64 and
++                           <dir>/system/lib64 (in this order) to the directories searched for bionic-linked
++                           libraries, and resolves absolute paths such as /vendor/lib64/hw/foo.so below <dir>
++                           first. libm.so is mapped to libc_bio.so.0, because libm is part of libc here.
++BIONIC_VNDK_APEX=<name>  - Name of the VNDK apex directory below <dir>/apex (default: com.android.vndk.v34).
++```
++
++Only 64-bit library directories are added; the vendor profile is not meant for 32-bit libraries.
++Note that the libraries found this way are linked by this linker with all the usual caveats, and that
++anything they need beyond libc/libdl/libm (e.g. libc++.so) has to be present in those directories too.
++
+ ### dependencies
+ 
+ the -dev(el) packages for: `egl libelf libbsd libunwind`
+diff --git a/linker/dlfcn.c b/linker/dlfcn.c
+index 5389531..eae3f7d 100644
+--- a/linker/dlfcn.c
++++ b/linker/dlfcn.c
+@@ -386,4 +386,16 @@ __attribute__((constructor)) void construct(void)
+ 	if (bionic_ld_library_path) {
+ 		dl_parse_library_path(bionic_ld_library_path, ":");
+ 	} // it might make sense to not specify the env, for example translation layer code calls dl_parse_library_path directly with the app's lib dir
++
++	// vendor profile: a directory with Android-style partition trees whose
++	// 64-bit library directories hold bionic-linked libraries
++	const char *vendor_root = getenv("BIONIC_VENDOR_ROOT");
++	if (vendor_root) {
++		if (apkenv_set_vendor_root(vendor_root) < 0) {
++			fprintf(stderr, "BIONIC_VENDOR_ROOT: failed to set up library directories below '%s'\n", vendor_root);
++		} else {
++			// libm is part of libc on musl/glibc; never load a foreign libm.so from the root
++			override_map_append(&lib_override_map, "libm.so", "libc_bio.so.0");
++		}
++	}
+ }
+diff --git a/linker/linker.c b/linker/linker.c
+index f77a87d..f1937dc 100644
+--- a/linker/linker.c
++++ b/linker/linker.c
+@@ -744,7 +744,7 @@ static void dump(soinfo *si)
+ }
+ #endif
+ 
+-#define SOPATH_MAX 8
++#define SOPATH_MAX 16
+ 
+ static const char *apkenv_sopaths[SOPATH_MAX + 1] = {
+ 	"/vendor/lib",
+@@ -772,6 +772,58 @@ int apkenv_add_sopath(const char *path)
+ 	return -1;
+ }
+ 
++/* Vendor profile: a directory holding Android-style partition trees (vendor/,
++ * system/, apex/). Libraries found below it are linked by this linker. */
++static const char *apkenv_vendor_root;
++
++const char *apkenv_get_vendor_root(void)
++{
++	return apkenv_vendor_root;
++}
++
++int apkenv_set_vendor_root(const char *root)
++{
++	if (!root || !*root)
++		return -1;
++
++	char *copy = strdup(root);
++	if (!copy)
++		return -1;
++	size_t len = strlen(copy);
++	while (len > 1 && copy[len - 1] == '/')
++		copy[--len] = '\0';
++	apkenv_vendor_root = copy;
++
++	const char *vndk_apex = getenv("BIONIC_VNDK_APEX") ?: "com.android.vndk.v34";
++
++	/* order matters: vendor libraries must see the VNDK copies of the shared
++	 * framework libraries before anything in system/lib64 */
++	const char *subdirs[] = {
++		"vendor/lib64",
++		"vendor/lib64/hw",
++		NULL, /* apex/<vndk>/lib64, filled in below */
++		"system/lib64",
++	};
++
++	for (size_t i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
++		char *dir;
++		int n;
++		if (subdirs[i])
++			n = asprintf(&dir, "%s/%s", copy, subdirs[i]);
++		else
++			n = asprintf(&dir, "%s/apex/%s/lib64", copy, vndk_apex);
++		if (n < 0)
++			return -1;
++		if (apkenv_add_sopath(dir) < 0) {
++			free(dir);
++			return -1;
++		}
++		INFO("[ %5d vendor profile: added library directory %s ]\n", apkenv_pid, dir);
++	}
++
++	return 0;
++}
++
+ static int apkenv__open_lib(const char *name)
+ {
+ 	int fd;
+@@ -806,6 +858,15 @@ static int apkenv_open_library(const char *name, char *fullpath)
+ 
+ 	strcpy(fullpath, name);
+ 
++	/* vendor profile: an absolute Android path is looked up below the vendor root first */
++	if (apkenv_vendor_root && name[0] == '/') {
++		n = format_buffer(buf, sizeof(buf), "%s%s", apkenv_vendor_root, name);
++		if (n > 0 && n < (int)sizeof(buf) && (fd = apkenv__open_lib(buf)) >= 0) {
++			strcpy(fullpath, buf);
++			return fd;
++		}
++	}
++
+ 	tmp_name = strdup(name);
+ 	path_normalized_name = realpath(dirname(tmp_name), NULL);
+ 	free(tmp_name);
+@@ -855,6 +916,21 @@ static int apkenv_open_library(const char *name, char *fullpath)
+ 		}
+ 	}
+ 
++	/* an absolute path inside one of the fixed library directories is ours as well */
++	if (path_normalized_name && name[0] == '/') {
++		for (path = apkenv_sopaths; *path; path++) {
++			char *sopath_normalized = realpath(*path, NULL);
++			if (!sopath_normalized)
++				continue;
++			int same = !strcmp(sopath_normalized, path_normalized_name);
++			free(sopath_normalized);
++			if (same && (fd = apkenv__open_lib(name)) >= 0) {
++				free(path_normalized_name);
++				return fd;
++			}
++		}
++	}
++
+ 	free(path_normalized_name);
+ 
+ 	for (path = apkenv_sopaths; *path; path++) {
+diff --git a/linker/linker.h b/linker/linker.h
+index 268f8f3..48c9bec 100644
+--- a/linker/linker.h
++++ b/linker/linker.h
+@@ -286,6 +286,8 @@ int apkenv_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), voi
+ 
+ void apkenv_notify_gdb_of_libraries(void);
+ int apkenv_add_sopath(const char *path);
++int apkenv_set_vendor_root(const char *root);
++const char *apkenv_get_vendor_root(void);
+ 
+ bool do_we_have_this_handle(void *handle);
+ 
+diff --git a/shared/config/config.c b/shared/config/config.c
+index 4fcb3fd..a170d19 100644
+--- a/shared/config/config.c
++++ b/shared/config/config.c
+@@ -8,7 +8,7 @@
+ 
+ #define OVERRIDE_MAP_DEFAULT_SIZE 8
+ 
+-static void override_map_append(struct override_map *map, char *from, char *to)
++void override_map_append(struct override_map *map, char *from, char *to)
+ {
+ 	if(!map->overrides) {
+ 		size_t map_size = OVERRIDE_MAP_DEFAULT_SIZE;
+diff --git a/shared/config/config.h b/shared/config/config.h
+index a077727..13a12b7 100644
+--- a/shared/config/config.h
++++ b/shared/config/config.h
+@@ -15,4 +15,5 @@ struct override_map {
+ };
+ 
+ void read_cfg_dir(struct override_map *map, char *cfg_dir_path);
++void override_map_append(struct override_map *map, char *from, char *to);
+ #endif

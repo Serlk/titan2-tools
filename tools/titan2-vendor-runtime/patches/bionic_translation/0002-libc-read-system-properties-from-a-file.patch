@@ -1,0 +1,446 @@
+From 8fab837aef6a8f12d8590df5fbde5fed39de156d Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:17:46 +0300
+Subject: [PATCH 2/4] libc: read system properties from a file
+
+Replace the __system_property_get/find/read stubs with a small
+in-memory property table loaded from a text file, one name=value per
+line, named by BIONIC_PROPS_FILE or <BIONIC_VENDOR_ROOT>/t2-props.
+Libraries that configure themselves from properties (ro.hardware.*,
+ro.vendor.*, debug.*, persist.*) can then be given exactly the values
+they expect.
+
+Added on top of the old API: __system_property_read_callback,
+__system_property_foreach, __system_property_set (in-memory only),
+__system_property_serial and __system_property_area_serial.
+
+When no file is configured the old behaviour is kept, so existing
+users see no change: ro.build.version.sdk reads as 21 and every other
+property is empty. __system_property_find no longer leaks one
+allocation per call; prop_info pointers point into a table that only
+grows, as callers expect them to stay valid.
+---
+ README.md              |   5 +
+ libc/libc-misc.c       |  35 +----
+ libc/libc-properties.c | 311 +++++++++++++++++++++++++++++++++++++++++
+ libc/libc.c            |  14 +-
+ meson.build            |   1 +
+ 5 files changed, 319 insertions(+), 47 deletions(-)
+ create mode 100644 libc/libc-properties.c
+
+diff --git a/README.md b/README.md
+index f6a3e29..2666b0d 100644
+--- a/README.md
++++ b/README.md
+@@ -41,6 +41,11 @@ BIONIC_VENDOR_ROOT=<dir> - Adds <dir>/vendor/lib64, <dir>/vendor/lib64/hw, <dir>
+                            libraries, and resolves absolute paths such as /vendor/lib64/hw/foo.so below <dir>
+                            first. libm.so is mapped to libc_bio.so.0, because libm is part of libc here.
+ BIONIC_VNDK_APEX=<name>  - Name of the VNDK apex directory below <dir>/apex (default: com.android.vndk.v34).
++BIONIC_PROPS_FILE=<file> - System properties (__system_property_get and friends) are read from this file,
++                           one `name=value` per line, `#` starts a comment. Defaults to <dir>/t2-props when
++                           BIONIC_VENDOR_ROOT is set. Without a file, ro.build.version.sdk reads as 21 and
++                           every other property is empty, as before. __system_property_set only changes
++                           the in-memory copy.
+ ```
+ 
+ Only 64-bit library directories are added; the vendor profile is not meant for 32-bit libraries.
+diff --git a/libc/libc-misc.c b/libc/libc-misc.c
+index c46c010..e2669b5 100644
+--- a/libc/libc-misc.c
++++ b/libc/libc-misc.c
+@@ -5,40 +5,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-// this seems to not be a stable ABI, so hopefully nobody treats it as such
+-// FIXME: move this out into it's own file whenever we get to implementing it more properly
+-struct prop_info {
+-	const char *name;
+-};
+-
+-#define PROP_NAME_MAX  32
+-#define PROP_VALUE_MAX 92
+-
+-const struct prop_info *bionic___system_property_find(const char *name)
+-{
+-	struct prop_info *ret = malloc(sizeof(struct prop_info));
+-	ret->name = name;
+-
+-	return ret;
+-}
+-
+-int bionic___system_property_read(const struct prop_info *prop_info, char *name, char *value)
+-{
+-	if (name)
+-		strncpy(name, prop_info->name, PROP_NAME_MAX);
+-
+-	if (!value)
+-		return 0;
+-
+-	if (!strcmp(prop_info->name, "ro.build.fingerprint")) {
+-		strncpy(value, "", PROP_VALUE_MAX); // there is no good reason that apps should need this, so just return an empty string
+-	} else {
+-		printf("__system_property_find: >%s< not handled yet\n", prop_info->name);
+-		strncpy(value, "", PROP_VALUE_MAX);
+-	}
+-
+-	return strlen(value);
+-}
++// __system_property_find/read live in libc-properties.c
+ 
+ // actually misc stuff
+ 
+diff --git a/libc/libc-properties.c b/libc/libc-properties.c
+new file mode 100644
+index 0000000..91833d9
+--- /dev/null
++++ b/libc/libc-properties.c
+@@ -0,0 +1,311 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ * System properties backed by a plain text file.
++ *
++ * On Android the property area is shared memory maintained by init; apps and
++ * libraries read it through __system_property_get/find/read and friends,
++ * which live in libc. Here the properties come from a file with one
++ * "name=value" per line ('#' starts a comment), named by BIONIC_PROPS_FILE,
++ * or <BIONIC_VENDOR_ROOT>/t2-props when only the vendor root is set.
++ *
++ * If no file is configured, the historic behaviour of this library is kept:
++ * ro.build.version.sdk reads as 21, everything else is empty.
++ *
++ * __system_property_set only updates the in-memory table; nothing is written
++ * back to the file.
++ */
++#include <errno.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../wrapper/verbose.h"
++
++#define PROP_NAME_MAX  32 /* legacy limit of the old API, reads truncate to it */
++#define PROP_VALUE_MAX 92
++
++#define BIONIC_PROP_NAME_MAX 128
++
++struct prop_info {
++	char name[BIONIC_PROP_NAME_MAX];
++	char value[PROP_VALUE_MAX];
++	uint32_t serial;
++};
++
++typedef void (*prop_read_callback)(void *cookie, const char *name, const char *value, uint32_t serial);
++
++static struct prop_info *props;
++static size_t props_count;
++static size_t props_capacity;
++static bool props_from_file;
++static uint32_t area_serial;
++static pthread_mutex_t props_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_once_t props_once = PTHREAD_ONCE_INIT;
++
++/* called with props_lock held */
++static struct prop_info *prop_lookup(const char *name)
++{
++	for (size_t i = 0; i < props_count; i++) {
++		if (!strcmp(props[i].name, name))
++			return &props[i];
++	}
++	return NULL;
++}
++
++/* called with props_lock held; returns NULL when the table cannot grow */
++static struct prop_info *prop_add(const char *name, const char *value)
++{
++	if (props_count == props_capacity) {
++		size_t new_capacity = props_capacity ? props_capacity * 2 : 64;
++		struct prop_info *grown = realloc(props, new_capacity * sizeof(*props));
++		if (!grown)
++			return NULL;
++		props = grown;
++		props_capacity = new_capacity;
++	}
++
++	struct prop_info *pi = &props[props_count++];
++	snprintf(pi->name, sizeof(pi->name), "%s", name);
++	snprintf(pi->value, sizeof(pi->value), "%s", value);
++	pi->serial = 1;
++	return pi;
++}
++
++static char *trim(char *s)
++{
++	while (*s == ' ' || *s == '\t')
++		s++;
++	size_t len = strlen(s);
++	while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n'))
++		s[--len] = '\0';
++	return s;
++}
++
++static void props_load(void)
++{
++	const char *path = getenv("BIONIC_PROPS_FILE");
++	char *allocated_path = NULL;
++
++	if (!path) {
++		const char *root = getenv("BIONIC_VENDOR_ROOT");
++		if (!root)
++			return;
++		if (asprintf(&allocated_path, "%s/t2-props", root) < 0)
++			return;
++		path = allocated_path;
++	}
++
++	FILE *f = fopen(path, "r");
++	if (!f) {
++		if (getenv("BIONIC_PROPS_FILE")) /* an explicitly named file should exist */
++			fprintf(stderr, "system properties: cannot open %s (%s)\n", path, strerror(errno));
++		free(allocated_path);
++		return;
++	}
++
++	char *line = NULL;
++	size_t line_cap = 0;
++	ssize_t n;
++	while ((n = getline(&line, &line_cap, f)) > 0) {
++		char *s = trim(line);
++		if (*s == '\0' || *s == '#')
++			continue;
++		char *eq = strchr(s, '=');
++		if (!eq) {
++			fprintf(stderr, "system properties: ignoring malformed line in %s: %s\n", path, s);
++			continue;
++		}
++		*eq = '\0';
++		char *name = trim(s);
++		char *value = trim(eq + 1);
++		if (strlen(name) >= BIONIC_PROP_NAME_MAX || strlen(value) >= PROP_VALUE_MAX)
++			fprintf(stderr, "system properties: truncating overlong entry %s\n", name);
++		struct prop_info *pi = prop_lookup(name);
++		if (pi)
++			snprintf(pi->value, sizeof(pi->value), "%s", value);
++		else
++			prop_add(name, value);
++	}
++	free(line);
++	fclose(f);
++
++	props_from_file = true;
++	area_serial = 1;
++	verbose("loaded %zu properties from %s", props_count, path);
++	free(allocated_path);
++}
++
++static void props_init(void)
++{
++	pthread_mutex_lock(&props_lock);
++	props_load();
++	pthread_mutex_unlock(&props_lock);
++}
++
++/* historic defaults, used when no file is configured */
++static int legacy_property_get(const char *name, char *value)
++{
++	if (!strcmp(name, "ro.build.version.sdk"))
++		return snprintf(value, PROP_VALUE_MAX, "%d", 21);
++
++	*value = '\0';
++	return 0;
++}
++
++int __system_property_get(const char *name, char *value)
++{
++	verbose("%s", name);
++
++	if (!name || !value)
++		return 0;
++
++	pthread_once(&props_once, props_init);
++
++	if (!props_from_file)
++		return legacy_property_get(name, value);
++
++	int len = 0;
++	pthread_mutex_lock(&props_lock);
++	struct prop_info *pi = prop_lookup(name);
++	if (pi)
++		len = snprintf(value, PROP_VALUE_MAX, "%s", pi->value);
++	else
++		*value = '\0';
++	pthread_mutex_unlock(&props_lock);
++
++	return len;
++}
++
++const struct prop_info *bionic___system_property_find(const char *name)
++{
++	if (!name)
++		return NULL;
++
++	pthread_once(&props_once, props_init);
++
++	pthread_mutex_lock(&props_lock);
++	struct prop_info *pi = prop_lookup(name);
++	if (!pi && !props_from_file) {
++		/* keep the old behaviour of always returning something for the few
++		 * well-known names; the table only ever grows, so the pointer stays valid */
++		char value[PROP_VALUE_MAX];
++		legacy_property_get(name, value);
++		pi = prop_add(name, value);
++	}
++	pthread_mutex_unlock(&props_lock);
++
++	if (!pi)
++		verbose("property %s not found", name);
++
++	return pi;
++}
++
++int bionic___system_property_read(const struct prop_info *pi, char *name, char *value)
++{
++	if (!pi)
++		return 0;
++
++	pthread_mutex_lock(&props_lock);
++	if (name) {
++		/* the old API only has room for PROP_NAME_MAX, longer names are cut */
++		size_t n = strlen(pi->name);
++		if (n >= PROP_NAME_MAX)
++			n = PROP_NAME_MAX - 1;
++		memcpy(name, pi->name, n);
++		name[n] = '\0';
++	}
++	int len = 0;
++	if (value)
++		len = snprintf(value, PROP_VALUE_MAX, "%s", pi->value);
++	pthread_mutex_unlock(&props_lock);
++
++	return len;
++}
++
++void bionic___system_property_read_callback(const struct prop_info *pi, prop_read_callback callback, void *cookie)
++{
++	if (!pi || !callback)
++		return;
++
++	char name[BIONIC_PROP_NAME_MAX];
++	char value[PROP_VALUE_MAX];
++	uint32_t serial;
++
++	pthread_mutex_lock(&props_lock);
++	snprintf(name, sizeof(name), "%s", pi->name);
++	snprintf(value, sizeof(value), "%s", pi->value);
++	serial = pi->serial;
++	pthread_mutex_unlock(&props_lock);
++
++	callback(cookie, name, value, serial);
++}
++
++int bionic___system_property_foreach(void (*propfn)(const struct prop_info *pi, void *cookie), void *cookie)
++{
++	if (!propfn)
++		return 0;
++
++	pthread_once(&props_once, props_init);
++
++	/* the table only grows and entries never move once the callback runs
++	 * without the lock, so take a snapshot of the count */
++	pthread_mutex_lock(&props_lock);
++	size_t count = props_count;
++	struct prop_info *table = props;
++	pthread_mutex_unlock(&props_lock);
++
++	for (size_t i = 0; i < count; i++)
++		propfn(&table[i], cookie);
++
++	return 0;
++}
++
++int bionic___system_property_set(const char *name, const char *value)
++{
++	if (!name || !value)
++		return -1;
++	if (strlen(name) >= BIONIC_PROP_NAME_MAX || strlen(value) >= PROP_VALUE_MAX)
++		return -1;
++
++	pthread_once(&props_once, props_init);
++
++	int ret = 0;
++	pthread_mutex_lock(&props_lock);
++	struct prop_info *pi = prop_lookup(name);
++	if (pi) {
++		snprintf(pi->value, sizeof(pi->value), "%s", value);
++		pi->serial++;
++	} else if (!prop_add(name, value)) {
++		ret = -1;
++	}
++	if (!ret)
++		area_serial++;
++	pthread_mutex_unlock(&props_lock);
++
++	verbose("%s=%s (in-memory only)", name, value);
++	return ret;
++}
++
++uint32_t bionic___system_property_serial(const struct prop_info *pi)
++{
++	if (!pi)
++		return 0;
++
++	pthread_mutex_lock(&props_lock);
++	uint32_t serial = pi->serial;
++	pthread_mutex_unlock(&props_lock);
++	return serial;
++}
++
++uint32_t bionic___system_property_area_serial(void)
++{
++	pthread_once(&props_once, props_init);
++
++	pthread_mutex_lock(&props_lock);
++	uint32_t serial = area_serial;
++	pthread_mutex_unlock(&props_lock);
++	return serial;
++}
+diff --git a/libc/libc.c b/libc/libc.c
+index 0f57724..70a9fcf 100644
+--- a/libc/libc.c
++++ b/libc/libc.c
+@@ -58,19 +58,7 @@ struct bionic_sigaction {
+ 
+ // Stuff that doesn't exist in glibc
+ 
+-#define PROP_NAME_MAX  32
+-#define PROP_VALUE_MAX 92
+-
+-int __system_property_get(const char *name, char *value)
+-{
+-	verbose("%s", name);
+-
+-	if (!strcmp(name, "ro.build.version.sdk"))
+-		return snprintf(value, PROP_VALUE_MAX, "%d", 21);
+-
+-	*value = 0;
+-	return 0;
+-}
++// __system_property_get and friends live in libc-properties.c
+ 
+ pid_t gettid(void)
+ {
+diff --git a/meson.build b/meson.build
+index 09f8c8e..0f037b5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -112,6 +112,7 @@ c_bio = shared_library('c_bio',
+ 		'libc/libc-stdio.c',
+ 		'libc/libc-sha1.c',
+ 		'libc/libc-open-overrides.c',
++		'libc/libc-properties.c',
+ 	],
+ 	soversion: 0, # we're shimming a stable ABI; this should never need to change
+ 	install: true,

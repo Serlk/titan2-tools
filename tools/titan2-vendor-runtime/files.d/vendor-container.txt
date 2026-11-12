@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Files of the Titan 2 factory firmware (V01.00.14, Android 14) for the vendor container:
+# the binder service managers in a bionic chroot (t2-vendor-container). Names only: the
+# files are copied by t2-vendor-setup from the user's own partitions (files.d format).
+#   <source below system_a / system_ext_a / vendor_a>   <path below the vendor root>
+# bionic runtime (bootstrap copies: the apex ones are symlinks)
+system/bin/bootstrap/linker64			system/bin/linker64
+# servicemanager and hwservicemanager are bootstrap binaries: PT_INTERP /system/bin/bootstrap/linker64
+system/bin/bootstrap/linker64			system/bin/bootstrap/linker64
+# binder managers: servicemanager (AIDL /dev/binder), vndservicemanager (/dev/vndbinder),
+# hwservicemanager (HIDL /dev/hwbinder; lives in system_ext in the factory firmware)
+system/bin/servicemanager			system/bin/servicemanager
+vendor/bin/vndservicemanager			vendor/bin/vndservicemanager
+system_ext/bin/hwservicemanager			system/bin/hwservicemanager
+# shell client for a smoke test: `service list`, `service check <name>`
+system/bin/service				system/bin/service
+# SELinux context files: servicemanager/vndservicemanager CHECK the service_contexts handle
+# (libselinux initialize_backend) even when no policy is loaded
+system/etc/selinux/				system/etc/selinux/
+vendor/etc/selinux/				vendor/etc/selinux/
+?system_ext/etc/selinux/			system/system_ext/etc/selinux/
+?product/etc/selinux/				system/product/etc/selinux/
+# getprop/setprop (toolbox applets) for property checks
+system/bin/toolbox				system/bin/toolbox
+system/bin/getprop				system/bin/getprop
+system/bin/setprop				system/bin/setprop
+# VINTF manifests/matrices: servicemanager and hwservicemanager check declared interfaces
+system/etc/vintf/				system/etc/vintf/
+vendor/etc/vintf/				vendor/etc/vintf/
+# DT_NEEDED closure of the three managers (needed-closure.py)
+system/lib64/android.hidl.token@1.0.so	system/lib64/android.hidl.token@1.0.so
+system/lib64/ld-android.so	system/lib64/ld-android.so
+system/lib64/libapexsupport.so	system/lib64/libapexsupport.so
+system/lib64/libbase.so	system/lib64/libbase.so
+system/lib64/libbinder.so	system/lib64/libbinder.so
+system/lib64/libc++.so	system/lib64/libc++.so
+system/lib64/bootstrap/libc.so	system/lib64/libc.so
+system/lib64/libcrypto.so	system/lib64/libcrypto.so
+system/lib64/libcutils.so	system/lib64/libcutils.so
+system/lib64/bootstrap/libdl.so	system/lib64/libdl.so
+system/lib64/bootstrap/libdl_android.so	system/lib64/libdl_android.so
+system/lib64/libhidl-gen-utils.so	system/lib64/libhidl-gen-utils.so
+system/lib64/libhidlbase.so	system/lib64/libhidlbase.so
+system/lib64/liblog.so	system/lib64/liblog.so
+system/lib64/bootstrap/libm.so	system/lib64/libm.so
+system/lib64/libpackagelistparser.so	system/lib64/libpackagelistparser.so
+system/lib64/libpcre2.so	system/lib64/libpcre2.so
+system/lib64/libselinux.so	system/lib64/libselinux.so
+system/lib64/libtinyxml2.so	system/lib64/libtinyxml2.so
+system/lib64/libutils.so	system/lib64/libutils.so
+system/lib64/libvintf.so	system/lib64/libvintf.so
+system/lib64/libvndksupport.so	system/lib64/libvndksupport.so
+system/lib64/libz.so	system/lib64/libz.so

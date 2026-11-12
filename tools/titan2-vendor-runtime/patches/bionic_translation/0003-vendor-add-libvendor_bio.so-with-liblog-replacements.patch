@@ -1,0 +1,378 @@
+From a432c5c0da181b53b76b2994369a1c38887f8cdd Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:18:46 +0300
+Subject: [PATCH 3/4] vendor: add libvendor_bio.so with liblog replacements
+
+Bionic-linked libraries log through liblog.so, whose real implementation
+sends everything to the logd daemon. Add a new library, libvendor_bio.so,
+with bionic_-prefixed replacements for the common liblog entry points:
+__android_log_print, __android_log_vprint, __android_log_write,
+__android_log_buf_write, __android_log_buf_print,
+__android_log_write_log_message, __android_log_is_loggable,
+__android_log_is_loggable_len, __android_log_set_minimum_priority,
+__android_log_get_minimum_priority and __android_log_assert. Messages go
+to stderr as "<buffer> <P>/<tag>: text" with the Android priority letter,
+or to syslog(3) when BIONIC_LOG_SYSLOG is set; BIONIC_LOG_LEVEL drops
+messages below a priority.
+
+The bionic_ prefix makes the linker prefer these over whatever liblog.so
+is loaded, so the rest of a real liblog.so keeps working. Because that
+lookup goes through the global symbol scope, the library is not linked
+into libc_bio.so: libdl_bio.so dlopens it with RTLD_GLOBAL when
+BIONIC_VENDOR_ROOT is set, and programs that do not use the vendor root
+can link it explicitly. Existing users see no change.
+---
+ README.md       |   8 ++
+ linker/dlfcn.c  |   5 +
+ meson.build     |  14 +++
+ vendor/liblog.c | 279 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 306 insertions(+)
+ create mode 100644 vendor/liblog.c
+
+diff --git a/README.md b/README.md
+index 2666b0d..0edd0ec 100644
+--- a/README.md
++++ b/README.md
+@@ -46,8 +46,16 @@ BIONIC_PROPS_FILE=<file> - System properties (__system_property_get and friends)
+                            BIONIC_VENDOR_ROOT is set. Without a file, ro.build.version.sdk reads as 21 and
+                            every other property is empty, as before. __system_property_set only changes
+                            the in-memory copy.
++BIONIC_LOG_LEVEL=<V|D|I|W|E|F|S> - Drop log messages (__android_log_print and friends) below this priority.
++BIONIC_LOG_SYSLOG=1      - Send log messages to syslog(3) instead of stderr.
+ ```
+ 
++With `BIONIC_VENDOR_ROOT` set, `libdl_bio.so` also loads `libvendor_bio.so.0` into the global scope. It
++holds `bionic_`-prefixed replacements for the parts of Android system libraries that only make sense
++with Android daemons around (liblog's `__android_log_*`, which would otherwise try to reach logd).
++A program that does not use the environment variable can link `libvendor_bio.so` itself; nothing
++in it depends on the vendor root.
++
+ Only 64-bit library directories are added; the vendor profile is not meant for 32-bit libraries.
+ Note that the libraries found this way are linked by this linker with all the usual caveats, and that
+ anything they need beyond libc/libdl/libm (e.g. libc++.so) has to be present in those directories too.
+diff --git a/linker/dlfcn.c b/linker/dlfcn.c
+index eae3f7d..bc90702 100644
+--- a/linker/dlfcn.c
++++ b/linker/dlfcn.c
+@@ -396,6 +396,11 @@ __attribute__((constructor)) void construct(void)
+ 		} else {
+ 			// libm is part of libc on musl/glibc; never load a foreign libm.so from the root
+ 			override_map_append(&lib_override_map, "libm.so", "libc_bio.so.0");
++
++			// the bionic_-prefixed replacements for liblog & co. need to be in the
++			// global scope for symbol resolution to pick them up
++			if (!dlopen("libvendor_bio.so.0", RTLD_NOW | RTLD_GLOBAL))
++				fprintf(stderr, "BIONIC_VENDOR_ROOT: failed to load libvendor_bio.so.0 (%s)\n", dlerror());
+ 		}
+ 	}
+ }
+diff --git a/meson.build b/meson.build
+index 0f037b5..a700e35 100644
+--- a/meson.build
++++ b/meson.build
+@@ -153,6 +153,20 @@ stdcpp_bio = shared_library('stdc++_bio',
+ 	]
+ )
+ 
++# libvendor_bio.so - replacements for Android system libraries (liblog, ...) that
++# bionic-linked libraries from a vendor tree expect; loaded by libdl_bio.so when
++# BIONIC_VENDOR_ROOT is set, or linked in by the host program explicitly
++vendor_bio = shared_library('vendor_bio',
++	sources: [
++		'vendor/liblog.c',
++	],
++	soversion: 0,
++	install: true,
++	c_args: [
++		c_args_common,
++	],
++)
++
+ install_data(
+ 	sources: [
+ 		'cfg.d/bionic_translation.cfg'
+diff --git a/vendor/liblog.c b/vendor/liblog.c
+new file mode 100644
+index 0000000..ab66aac
+--- /dev/null
++++ b/vendor/liblog.c
+@@ -0,0 +1,279 @@
++// SPDX-License-Identifier: Apache-2.0
++/*
++ * liblog replacements for the vendor profile.
++ *
++ * Bionic-linked libraries log through liblog.so (__android_log_print and
++ * friends), which on Android talks to the logd daemon over a socket. There is
++ * no logd here, so the messages go to stderr, prefixed with the Android
++ * priority letter and the tag, or to syslog(3) when BIONIC_LOG_SYSLOG is set.
++ *
++ * These are bionic_-prefixed, so the linker prefers them over whatever
++ * liblog.so happens to be loaded (see linker/linker.c, apkenv_reloc_library).
++ * Entry points that are not replaced here still resolve to that liblog.so.
++ */
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <syslog.h>
++#include <unistd.h>
++
++enum {
++	ANDROID_LOG_UNKNOWN = 0,
++	ANDROID_LOG_DEFAULT,
++	ANDROID_LOG_VERBOSE,
++	ANDROID_LOG_DEBUG,
++	ANDROID_LOG_INFO,
++	ANDROID_LOG_WARN,
++	ANDROID_LOG_ERROR,
++	ANDROID_LOG_FATAL,
++	ANDROID_LOG_SILENT,
++};
++
++/* log_id_t */
++enum {
++	LOG_ID_MAIN = 0,
++	LOG_ID_RADIO,
++	LOG_ID_EVENTS,
++	LOG_ID_SYSTEM,
++	LOG_ID_CRASH,
++	LOG_ID_STATS,
++	LOG_ID_SECURITY,
++	LOG_ID_KERNEL,
++};
++
++struct __android_log_message {
++	size_t struct_size;
++	int32_t buffer_id;
++	int32_t priority;
++	const char *tag;
++	const char *file;
++	uint32_t line;
++	const char *message;
++};
++
++#define LOG_LINE_MAX 4096
++
++static int minimum_priority = ANDROID_LOG_DEFAULT;
++
++static char priority_letter(int prio)
++{
++	switch (prio) {
++	case ANDROID_LOG_VERBOSE: return 'V';
++	case ANDROID_LOG_DEBUG:   return 'D';
++	case ANDROID_LOG_INFO:    return 'I';
++	case ANDROID_LOG_WARN:    return 'W';
++	case ANDROID_LOG_ERROR:   return 'E';
++	case ANDROID_LOG_FATAL:   return 'F';
++	case ANDROID_LOG_SILENT:  return 'S';
++	default:                  return '?';
++	}
++}
++
++static int syslog_priority(int prio)
++{
++	switch (prio) {
++	case ANDROID_LOG_VERBOSE:
++	case ANDROID_LOG_DEBUG:   return LOG_DEBUG;
++	case ANDROID_LOG_INFO:    return LOG_INFO;
++	case ANDROID_LOG_WARN:    return LOG_WARNING;
++	case ANDROID_LOG_ERROR:   return LOG_ERR;
++	case ANDROID_LOG_FATAL:   return LOG_CRIT;
++	default:                  return LOG_NOTICE;
++	}
++}
++
++static const char *buffer_name(int bufID)
++{
++	switch (bufID) {
++	case LOG_ID_MAIN:     return "";
++	case LOG_ID_RADIO:    return "radio ";
++	case LOG_ID_EVENTS:   return "events ";
++	case LOG_ID_SYSTEM:   return "system ";
++	case LOG_ID_CRASH:    return "crash ";
++	case LOG_ID_STATS:    return "stats ";
++	case LOG_ID_SECURITY: return "security ";
++	case LOG_ID_KERNEL:   return "kernel ";
++	default:              return "";
++	}
++}
++
++/* BIONIC_LOG_LEVEL: a priority letter (V D I W E F S) or number; messages
++ * below it are dropped. Unset: everything the library sends is shown. */
++static int configured_threshold(void)
++{
++	static int threshold = -1;
++
++	if (threshold >= 0)
++		return threshold;
++
++	const char *env = getenv("BIONIC_LOG_LEVEL");
++	int t = ANDROID_LOG_VERBOSE;
++	if (env && *env) {
++		switch (*env) {
++		case 'V': case 'v': t = ANDROID_LOG_VERBOSE; break;
++		case 'D': case 'd': t = ANDROID_LOG_DEBUG; break;
++		case 'I': case 'i': t = ANDROID_LOG_INFO; break;
++		case 'W': case 'w': t = ANDROID_LOG_WARN; break;
++		case 'E': case 'e': t = ANDROID_LOG_ERROR; break;
++		case 'F': case 'f': t = ANDROID_LOG_FATAL; break;
++		case 'S': case 's': t = ANDROID_LOG_SILENT; break;
++		default:
++			if (*env >= '0' && *env <= '9')
++				t = atoi(env);
++			break;
++		}
++	}
++	threshold = t;
++	return threshold;
++}
++
++static bool use_syslog(void)
++{
++	static int enabled = -1;
++
++	if (enabled < 0) {
++		const char *env = getenv("BIONIC_LOG_SYSLOG");
++		enabled = (env && *env && strcmp(env, "0")) ? 1 : 0;
++		if (enabled)
++			openlog(NULL, LOG_PID, LOG_USER);
++	}
++	return enabled;
++}
++
++static bool is_loggable(int prio, int default_prio)
++{
++	if (prio < configured_threshold())
++		return false;
++	if (minimum_priority != ANDROID_LOG_DEFAULT && prio < minimum_priority)
++		return false;
++	(void)default_prio; /* no per-tag overrides (log.tag.<tag>) here */
++	return true;
++}
++
++static int log_write(int bufID, int prio, const char *tag, const char *text)
++{
++	if (!is_loggable(prio, ANDROID_LOG_VERBOSE))
++		return 0; /* dropped, but not an error */
++
++	if (!tag)
++		tag = "";
++	if (!text)
++		text = "";
++
++	if (use_syslog()) {
++		syslog(syslog_priority(prio), "%s%c/%s: %s", buffer_name(bufID), priority_letter(prio), tag, text);
++	} else {
++		/* one write per line keeps lines from different threads apart */
++		char line[LOG_LINE_MAX];
++		int n = snprintf(line, sizeof(line), "%s%c/%s: %s\n", buffer_name(bufID), priority_letter(prio), tag, text);
++		if (n < 0)
++			return -1;
++		if (n >= (int)sizeof(line)) {
++			n = sizeof(line) - 1;
++			line[n - 1] = '\n';
++		}
++		(void)!write(STDERR_FILENO, line, n);
++	}
++
++	return 1;
++}
++
++int bionic___android_log_write(int prio, const char *tag, const char *text)
++{
++	return log_write(LOG_ID_MAIN, prio, tag, text);
++}
++
++int bionic___android_log_buf_write(int bufID, int prio, const char *tag, const char *text)
++{
++	return log_write(bufID, prio, tag, text);
++}
++
++int bionic___android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap)
++{
++	char buf[LOG_LINE_MAX];
++	vsnprintf(buf, sizeof(buf), fmt ?: "", ap);
++	return log_write(LOG_ID_MAIN, prio, tag, buf);
++}
++
++int bionic___android_log_print(int prio, const char *tag, const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	int ret = bionic___android_log_vprint(prio, tag, fmt, ap);
++	va_end(ap);
++	return ret;
++}
++
++int bionic___android_log_buf_print(int bufID, int prio, const char *tag, const char *fmt, ...)
++{
++	char buf[LOG_LINE_MAX];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt ?: "", ap);
++	va_end(ap);
++	return log_write(bufID, prio, tag, buf);
++}
++
++void bionic___android_log_write_log_message(struct __android_log_message *msg)
++{
++	if (!msg || msg->struct_size < sizeof(*msg))
++		return;
++
++	if (msg->file) {
++		char buf[LOG_LINE_MAX];
++		snprintf(buf, sizeof(buf), "%s:%u] %s", msg->file, msg->line, msg->message ?: "");
++		log_write(msg->buffer_id, msg->priority, msg->tag, buf);
++	} else {
++		log_write(msg->buffer_id, msg->priority, msg->tag, msg->message);
++	}
++}
++
++int bionic___android_log_is_loggable(int prio, const char *tag, int default_prio)
++{
++	(void)tag;
++	return is_loggable(prio, default_prio);
++}
++
++int bionic___android_log_is_loggable_len(int prio, const char *tag, size_t len, int default_prio)
++{
++	(void)tag;
++	(void)len;
++	return is_loggable(prio, default_prio);
++}
++
++int32_t bionic___android_log_set_minimum_priority(int32_t priority)
++{
++	int32_t old = minimum_priority;
++	minimum_priority = priority;
++	return old;
++}
++
++int32_t bionic___android_log_get_minimum_priority(void)
++{
++	return minimum_priority;
++}
++
++__attribute__((noreturn))
++void bionic___android_log_assert(const char *cond, const char *tag, const char *fmt, ...)
++{
++	char buf[LOG_LINE_MAX];
++
++	if (fmt) {
++		va_list ap;
++		va_start(ap, fmt);
++		vsnprintf(buf, sizeof(buf), fmt, ap);
++		va_end(ap);
++	} else if (cond) {
++		snprintf(buf, sizeof(buf), "Assertion failed: %s", cond);
++	} else {
++		snprintf(buf, sizeof(buf), "Unspecified assertion failed");
++	}
++
++	/* never filtered */
++	minimum_priority = ANDROID_LOG_DEFAULT;
++	log_write(LOG_ID_MAIN, ANDROID_LOG_FATAL, tag, buf);
++	abort();
++}

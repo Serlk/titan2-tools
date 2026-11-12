@@ -1,0 +1,142 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Vendor container: the binder service managers of the factory firmware,
+# and later the closed HAL services (GNSS, sensors, camera), as bionic
+# processes in a chroot of the vendor root built by t2-vendor-setup, on our kernel
+# with binderfs. No Android init: processes are started one by one here, their
+# properties come from nowhere (bionic's property_get returns the default), SELinux
+# is present without a policy so every access check passes.
+#
+#   t2-vendor-container start        binderfs + the three managers
+#   t2-vendor-container stop
+#   t2-vendor-container status       devices, processes, `service list`
+#   t2-vendor-container run CMD..    run a factory-firmware binary in the chroot (foreground)
+#   T2_VENDOR_ROOT (default /var/lib/titan2-vendor)
+set -eu
+ROOT=${T2_VENDOR_ROOT:-/var/lib/titan2-vendor}
+LOG=${T2_CONTAINER_LOG:-/var/log/t2-vendor}
+ENV="LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/vendor/lib64/hw ANDROID_DATA=/data ANDROID_ROOT=/system"
+
+mounts() {
+	for d in dev proc sys data/vendor data/misc; do mkdir -p "$ROOT/$d"; done
+	# binderfs first: one instance per ipc namespace; the device names come from the kernel
+	# (CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder")
+	mkdir -p /dev/binderfs
+	mountpoint -q /dev/binderfs || mount -t binder binder /dev/binderfs
+	for b in binder hwbinder vndbinder; do
+		[ -e /dev/$b ] || ln -s binderfs/$b /dev/$b
+	done
+	# SELinux: the managers' access checks (libselinux avc, class service_manager) fail
+	# without a loaded policy ("Unknown class service_manager" -> "Could not self register").
+	# Load the factory precompiled policy permissive: every check then passes and is only
+	# logged (avc: denied ... permissive=1 in dmesg). T2_SEPOLICY=none skips this.
+	[ -d /sys/fs/selinux ] && ! mountpoint -q /sys/fs/selinux && mount -t selinuxfs selinuxfs /sys/fs/selinux 2>/dev/null || true
+	if [ "${T2_SEPOLICY:-}" != none ] && [ -w /sys/fs/selinux/load ]; then
+		if [ ! -e /sys/fs/selinux/policy ] || ! cat /sys/fs/selinux/policy >/dev/null 2>&1; then
+			pol=${T2_SEPOLICY:-$ROOT/vendor/etc/selinux/precompiled_sepolicy}
+			if [ -f "$pol" ]; then
+				echo 0 >/sys/fs/selinux/enforce 2>/dev/null || true
+				# selinuxfs wants the whole policy in ONE write (cat's chunks give EINVAL)
+				if dd if="$pol" of=/sys/fs/selinux/load bs=8M count=1 2>/dev/null; then echo "  sepolicy: $pol loaded, permissive"
+				else echo "  sepolicy: loading $pol failed (dmesg | grep -i selinux)"; fi
+			fi
+		fi
+		echo 0 >/sys/fs/selinux/enforce 2>/dev/null || true
+	fi
+	# --rbind: the chroot must see the binderfs (and pts, shm) submounts of /dev
+	mountpoint -q "$ROOT/dev" || mount --rbind /dev "$ROOT/dev"
+	# an older plain bind (or a root on a share that cannot be unmounted) hides the submount
+	[ -c "$ROOT/dev/binderfs/binder" ] || { mkdir -p "$ROOT/dev/binderfs"; mount -t binder binder "$ROOT/dev/binderfs"; }
+	mountpoint -q "$ROOT/proc" || mount -t proc proc "$ROOT/proc"
+	mountpoint -q "$ROOT/sys" || mount --rbind /sys "$ROOT/sys"
+	mkdir -p /dev/socket
+	mkdir -p "$LOG"
+}
+
+umounts() {
+	for d in sys proc dev; do
+		mountpoint -q "$ROOT/$d" || continue
+		umount -R "$ROOT/$d" 2>/dev/null || umount -l "$ROOT/$d" || true
+	done
+	# never remove a root while anything is mounted below it (rm -rf would walk into /dev, /sys)
+	mountpoint -q "$ROOT/dev" && echo "t2-vendor-container: $ROOT/dev is still mounted" >&2 || true
+}
+
+tool() {	# find one of our helpers (installed, or next to the sources)
+	local c
+	for c in "$(command -v "$1" 2>/dev/null)" "/usr/bin/$1" "/usr/local/bin/$1" "$(dirname "$0")/../$1"; do
+		[ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+	done
+	echo "t2-vendor-container: no $1 (install titan2-vendor-runtime)" >&2
+	return 1
+}
+
+daemon() {	# name path args..
+	local name=$1; shift
+	[ -x "$ROOT$1" ] || { echo "t2-vendor-container: no $ROOT$1 (t2-vendor-setup)" >&2; return 1; }
+	setsid env $ENV chroot "$ROOT" "$@" >"$LOG/$name.log" 2>&1 </dev/null &
+	echo $! >"/run/t2-vendor-$name.pid"
+	echo "  $name: pid $! ($*)"
+}
+
+start() {
+	mounts
+	echo "t2-vendor-container: $ROOT"
+	# property service: /dev/__properties__ + /dev/socket/property_service (t2-propd);
+	# initial values from the vendor root's t2-props (t2-vendor-setup)
+	if ! [ -f /run/t2-vendor-propd.pid ] || ! kill -0 "$(cat /run/t2-vendor-propd.pid)" 2>/dev/null; then
+		PROPD=$(tool t2-propd) || return 1
+		"$PROPD" -D -f "$ROOT/t2-props" >"$LOG/propd.log" 2>&1 </dev/null &
+		echo $! >/run/t2-vendor-propd.pid
+		echo "  t2-propd: pid $! -> $LOG/propd.log"
+		sleep 0.3
+	fi
+	# liblog of every bionic process writes to /dev/socket/logdw: collect it
+	if ! [ -f /run/t2-vendor-logd.pid ] || ! kill -0 "$(cat /run/t2-vendor-logd.pid)" 2>/dev/null; then
+		LOGD=$(tool t2-logd) || return 1
+		"$LOGD" -s /dev/socket/logdw -o "$LOG/logcat.log" &
+		echo $! >/run/t2-vendor-logd.pid
+		echo "  t2-logd: pid $! -> $LOG/logcat.log"
+	fi
+	daemon servicemanager /system/bin/servicemanager
+	daemon vndservicemanager /vendor/bin/vndservicemanager /dev/vndbinder
+	# hwservicemanager only on request: the factory VINTF manifests declare no HIDL interface
+	# ("HIDL is not supported on this device so hwservicemanager is not needed"), and without a
+	# property service its exit path (set hwservicemanager.disabled) aborts anyway
+	[ -z "${T2_HWSERVICEMANAGER:-}" ] || daemon hwservicemanager /system/bin/hwservicemanager
+	sleep 1
+	status
+}
+
+stop() {
+	for n in hwservicemanager vndservicemanager servicemanager logd propd; do
+		[ -f "/run/t2-vendor-$n.pid" ] && { kill "$(cat "/run/t2-vendor-$n.pid")" 2>/dev/null || true; rm -f "/run/t2-vendor-$n.pid"; }
+	done
+	umounts
+}
+
+status() {
+	ls -la /dev/binder /dev/hwbinder /dev/vndbinder 2>&1 | sed 's/^/  /'
+	for n in servicemanager vndservicemanager hwservicemanager; do
+		[ "$n" = hwservicemanager ] && [ ! -f "/run/t2-vendor-$n.pid" ] && continue
+		if [ -f "/run/t2-vendor-$n.pid" ] && kill -0 "$(cat "/run/t2-vendor-$n.pid")" 2>/dev/null; then
+			echo "  $n: running"
+		else
+			echo "  $n: not running"; [ -f "$LOG/$n.log" ] && tail -5 "$LOG/$n.log" | sed 's/^/    /'
+		fi
+	done
+	echo "  properties: servicemanager.ready=$(env $ENV chroot "$ROOT" /system/bin/getprop servicemanager.ready 2>/dev/null) ro.product.model=$(env $ENV chroot "$ROOT" /system/bin/getprop ro.product.model 2>/dev/null)"
+	echo "  logcat (tail):"; tail -12 "$LOG/logcat.log" 2>/dev/null | sed 's/^/    /'
+	echo "  service list:"
+	env $ENV timeout 5 chroot "$ROOT" /system/bin/service list 2>&1 | head -20 | sed 's/^/    /'
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+status) status ;;
+run) shift; mounts; exec env $ENV chroot "$ROOT" "$@" ;;
+*) sed -n '5,17p' "$0"; exit 2 ;;
+esac
