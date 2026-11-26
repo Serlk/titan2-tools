@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<!-- @PKG@, @VC@ and @MANIFEST_ATTRS@ are filled in per variant by ../build.sh. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@PKG@"
+    android:versionCode="@VC@"@MANIFEST_ATTRS@
+    android:versionName="@VC@.0">
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="org.titan2.atltest.permission.SAME_SIGNER" />
+    <permission android:name="org.titan2.atltest.permission.SAME_SIGNER" android:protectionLevel="signature" />
+    <application android:label="ATL app test">
+        <activity android:name="org.titan2.atltest.app.MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="atltest" />
+            </intent-filter>
+        </activity>
+        <!-- a second launcher entry, off by default: the test switches between the two -->
+        <activity-alias android:name="org.titan2.atltest.app.AltLauncher" android:targetActivity="org.titan2.atltest.app.MainActivity"
+            android:label="ATL app test (alt)" android:enabled="false" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity android:name="org.titan2.atltest.app.PrivateActivity" android:exported="false" />
+        <service android:name="org.titan2.atltest.app.EchoService" android:exported="true">
+            <intent-filter>
+                <action android:name="org.titan2.atltest.ECHO" />
+            </intent-filter>
+        </service>
+        <service android:name="org.titan2.atltest.app.PrivateService" android:exported="false" />
+        <provider android:name="org.titan2.atltest.app.NotesProvider" android:authorities="@PKG@.notes"
+            android:exported="true" />
+        <provider android:name="org.titan2.atltest.app.PrivateProvider" android:authorities="@PKG@.private"
+            android:exported="false" />
+    </application>
+</manifest>
