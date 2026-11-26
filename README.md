@@ -1,19 +1,28 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# titan2-tools: mainline Linux on the Unihertz Titan 2 (alpha1)
+# titan2-tools: mainline Linux on the Unihertz Titan 2
 
 [Русская версия](README.ru.md)
 
-This repository has the tools that build and check boot images for the first mainline Linux
-(7.2) on the **Unihertz Titan 2** (MediaTek MT6878 / Dimensity 7300). The images are loaded by the
-**stock bootloader (LK), which is not modified**. The kernel itself is in
-[titan2-linux](https://github.com/Serlk/titan2-linux) (branch `titan2`). The documentation (LK requirements, boot
-attempts, hardware notes) is in [titan2-docs](https://github.com/Serlk/titan2-docs). The alpha1 images are attached to
-the GitHub release `alpha1` of this repository.
+This repository has the tools that build and check the images for mainline Linux (7.2) on the
+**Unihertz Titan 2** (MediaTek MT6878 / Dimensity 7300): the kernel build, the boot menu image
+for `boot_a`, the initramfs, the Alpine root file system for the `linux` partition, our apk
+packages, and the services and user space tools that run on the phone. The images are loaded by
+the **stock bootloader (LK), which is not modified**. The kernel itself is in
+[titan2-linux](https://github.com/Serlk/titan2-linux) (branch `titan2`).
 
-> **This is an alpha for developers.** It boots to a root shell over USB. There is no
-> graphical system, no phone functions, no Wi-Fi and no battery management that has been
-> verified. Use it only if you can restore your phone through fastboot. You do everything at
-> your own risk.
+**Start here:** the build guide is [BUILD-LINUX.md](https://github.com/Serlk/titan2-docs/blob/main/docs/BUILD-LINUX.md)
+in [titan2-docs](https://github.com/Serlk/titan2-docs), the installation
+[INSTALL-LINUX.md](https://github.com/Serlk/titan2-docs/blob/main/docs/INSTALL-LINUX.md), what works
+[STATUS.md](https://github.com/Serlk/titan2-docs/blob/main/docs/STATUS.md). The section
+"[Since alpha1](#since-alpha1-the-alpine-system-and-its-services)" below lists what this
+repository has today.
+
+The sections about **alpha1** (the tag `alpha1`, October 2026: the first boot images, a root
+shell over USB) are kept as history; they do not describe the current state. No images are
+attached to this repository: you build them with the guide above.
+
+> Everything here is for developers. Use it only if you can restore your phone through fastboot.
+> You do everything at your own risk.
 
 ## What works in alpha1 (4th boot on hardware)
 
@@ -46,9 +55,9 @@ the GitHub release `alpha1` of this repository.
   (`dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a.img`, and so on).
 - A Linux PC with `fastboot` and `ssh`; for building: Docker, git, and clang 21 (the official LLVM 21.1.8 release from GitHub, or AOSP clang r574158).
 
-## Installing the alpha1 images
+## Installing the alpha1 images (history)
 
-The release has two variants with the same kernel and initramfs:
+alpha1 had two variants with the same kernel and initramfs:
 
 - `usb-minimal`: devicetree without SPMI/PMIC and without the keyboard, touchscreen and touchpad
   (screen, UFS, USB, volume keys). Use it first.

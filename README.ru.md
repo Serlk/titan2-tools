@@ -1,18 +1,26 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# titan2-tools: mainline Linux на Unihertz Titan 2 (alpha1)
+# titan2-tools: mainline Linux на Unihertz Titan 2
 
 [English version](README.md)
 
-Здесь лежат инструменты, которые собирают и проверяют загрузочные образы для первого
-mainline-ядра Linux (7.2) на **Unihertz Titan 2** (MediaTek MT6878 / Dimensity 7300). Образы
-загружает **стоковый загрузчик LK, его мы не меняем**. Само ядро находится в
-[titan2-linux](https://github.com/Serlk/titan2-linux) (ветка `titan2`). Документация (требования LK, попытки загрузки,
-описание железа) — в [titan2-docs](https://github.com/Serlk/titan2-docs). Образы alpha1 приложены к GitHub-релизу
-`alpha1` этого репозитория.
+Здесь лежат инструменты, которые собирают и проверяют образы mainline Linux (7.2) для
+**Unihertz Titan 2** (MediaTek MT6878 / Dimensity 7300): сборка ядра, образ загрузочного меню для
+`boot_a`, initramfs, корневая система Alpine для раздела `linux`, наши apk-пакеты, а также службы
+и программы, которые работают на телефоне. Образы загружает **стоковый загрузчик LK, его мы не
+меняем**. Само ядро находится в [titan2-linux](https://github.com/Serlk/titan2-linux) (ветка `titan2`).
 
-> **Это альфа для разработчиков.** Система загружается до root-консоли по USB. Графики, телефонии
-> и Wi-Fi нет, управление батареей не проверено. Ставьте, только если умеете восстановить телефон
-> через fastboot. Всё делаете на свой риск.
+**С чего начать:** руководство по сборке — [BUILD-LINUX.ru.md](https://github.com/Serlk/titan2-docs/blob/main/docs/BUILD-LINUX.ru.md)
+в [titan2-docs](https://github.com/Serlk/titan2-docs), установка —
+[INSTALL-LINUX.ru.md](https://github.com/Serlk/titan2-docs/blob/main/docs/INSTALL-LINUX.ru.md), что работает —
+[STATUS.ru.md](https://github.com/Serlk/titan2-docs/blob/main/docs/STATUS.ru.md). Раздел «После alpha1»
+ниже описывает, что есть в репозитории сейчас.
+
+Разделы про **alpha1** (тег `alpha1`, октябрь 2026: первые загрузочные образы, root-консоль по USB)
+оставлены как история и не описывают текущее состояние. Готовых образов к репозиторию не
+приложено: их собирают по руководству выше.
+
+> Всё это — для разработчиков. Ставьте, только если умеете восстановить телефон через fastboot.
+> Всё делаете на свой риск.
 
 ## Что работает в alpha1 (4-я загрузка на железе)
 
@@ -45,9 +53,9 @@ mainline-ядра Linux (7.2) на **Unihertz Titan 2** (MediaTek MT6878 / Dimen
   (`dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a.img` и так далее).
 - ПК с Linux, `fastboot` и `ssh`. Для сборки: Docker, git, AOSP clang r574158.
 
-## Установка образов alpha1
+## Установка образов alpha1 (история)
 
-В релизе два варианта, ядро и initramfs у них одинаковые:
+У alpha1 было два варианта, ядро и initramfs у них одинаковые:
 
 - `usb-minimal`: devicetree без SPMI/PMIC, клавиатуры, тачскрина и тачпада (экран, UFS, USB,
   громкость). Начните с него.
