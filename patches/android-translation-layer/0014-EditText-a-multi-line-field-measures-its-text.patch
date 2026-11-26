@@ -1,0 +1,151 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] EditText: a multi-line field measures its text
+
+The multi-line widget reports no natural height before it was shown and
+laid out once. A field that is as high as its text (wrap_content, and
+every field inside a ScrollView, which measures its child without a
+height limit) was therefore measured and laid out with a height of zero:
+a text editor showed an empty page that could not be touched, focused or
+typed into.
+
+The field now measures the text it holds, wrapped at the width it gets:
+never less than one line, plus the widget's margins, and it asks for a new
+layout when a change adds or removes lines.
+
+---
+  src/api-impl-jni/generated_headers/android_widget_EditText.h |  8 ++++++
+  src/api-impl-jni/widgets/android_widget_EditText.c           | 36 ++++++++++++++++++++++++++
+  src/api-impl/android/widget/EditText.java                    | 43 ++++++++++++++++++++++++++++++++
+  3 files changed, 87 insertions(+)
+
+diff --git a/src/api-impl-jni/generated_headers/android_widget_EditText.h b/src/api-impl-jni/generated_headers/android_widget_EditText.h
+index 14e1f7f..d75ba43 100644
+--- a/src/api-impl-jni/generated_headers/android_widget_EditText.h
++++ b/src/api-impl-jni/generated_headers/android_widget_EditText.h
+@@ -289,6 +289,14 @@ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setHint
+ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setTextSize
+   (JNIEnv *, jobject, jlong, jfloat);
+ 
++/*
++ * Class:     android_widget_EditText
++ * Method:    native_textSize
++ * Signature: (JI)J
++ */
++JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1textSize
++  (JNIEnv *, jobject, jlong, jint);
++
+ /*
+  * Class:     android_widget_EditText
+  * Method:    native_setInputMode
+diff --git a/src/api-impl-jni/widgets/android_widget_EditText.c b/src/api-impl-jni/widgets/android_widget_EditText.c
+index 51d7192..932f6e1 100644
+--- a/src/api-impl-jni/widgets/android_widget_EditText.c
++++ b/src/api-impl-jni/widgets/android_widget_EditText.c
+@@ -327,3 +327,39 @@ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setTextSize(JNIEnv *
+ 	gtk_style_context_add_provider(style_context, GTK_STYLE_PROVIDER(css_provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+ 	g_object_set_data_full(G_OBJECT(widget), "size_style_provider", css_provider, g_object_unref);
+ }
++
++/*
++ * The size the text of a multi-line field needs, wrapped at `width` pixels (-1: not wrapped):
++ * width in the high word, height in the low word. Never less than one line, plus the margins the
++ * widget puts around its text.
++ */
++JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1textSize(JNIEnv *env, jobject this, jlong widget_ptr, jint width)
++{
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	int text_width = 0, text_height = 0;
++	int margin_x = 0, margin_y = 0;
++	char *text = NULL;
++
++	if (GTK_IS_TEXT_VIEW(widget)) {
++		GtkTextView *view = GTK_TEXT_VIEW(widget);
++		GtkTextBuffer *buffer = gtk_text_view_get_buffer(view);
++		GtkTextIter start, end;
++		gtk_text_buffer_get_bounds(buffer, &start, &end);
++		text = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
++		margin_x = gtk_text_view_get_left_margin(view) + gtk_text_view_get_right_margin(view);
++		margin_y = gtk_text_view_get_top_margin(view) + gtk_text_view_get_bottom_margin(view);
++	}
++	/* an empty text, or one ending in a line break, still shows the line the cursor is on */
++	char *shown = g_strconcat(text ? text : "", "\u200b", NULL);
++	PangoLayout *layout = gtk_widget_create_pango_layout(widget, shown);
++	if (width > margin_x) {
++		pango_layout_set_width(layout, (width - margin_x) * PANGO_SCALE);
++		pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
++	}
++	pango_layout_get_pixel_size(layout, &text_width, &text_height);
++	g_object_unref(layout);
++	g_free(shown);
++	g_free(text);
++	/* room for the cursor after the last character */
++	return ((jlong)(text_width + margin_x + 2) << 32) | (uint32_t)(text_height + margin_y);
++}
+diff --git a/src/api-impl/android/widget/EditText.java b/src/api-impl/android/widget/EditText.java
+index 54e994a..76fab96 100644
+--- a/src/api-impl/android/widget/EditText.java
++++ b/src/api-impl/android/widget/EditText.java
+@@ -117,6 +117,35 @@ public class EditText extends TextView {
+ 	private native long native_getSelection(long widget);
+ 	private native void native_setHint(long widget, String s);
+ 	private native void native_setTextSize(long widget, float size);
++	private native long native_textSize(long widget, int width);
++
++	/**
++	 * The multi-line widget reports no height of its own before it has been shown and laid out,
++	 * so a field that is as high as its text (wrap_content, or any field inside a ScrollView) came
++	 * out with a height of zero. Measure the text itself: at least one line, wrapped at the
++	 * width the field gets.
++	 */
++	@Override
++	protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
++		super.onMeasure(widthMeasureSpec, heightMeasureSpec);
++		if (atl_single_line)
++			return;
++		int widthMode = MeasureSpec.getMode(widthMeasureSpec);
++		int heightMode = MeasureSpec.getMode(heightMeasureSpec);
++		if (widthMode == MeasureSpec.EXACTLY && heightMode == MeasureSpec.EXACTLY)
++			return;
++		int width = getMeasuredWidth();
++		int height = getMeasuredHeight();
++		int wrapAt = widthMode == MeasureSpec.EXACTLY ? width : widthMode == MeasureSpec.AT_MOST ? MeasureSpec.getSize(widthMeasureSpec) : -1;
++		long size = native_textSize(widget, wrapAt);
++		int textWidth = (int)(size >> 32);
++		int textHeight = (int)size;
++		if (widthMode != MeasureSpec.EXACTLY && width < textWidth)
++			width = widthMode == MeasureSpec.AT_MOST ? Math.min(textWidth, MeasureSpec.getSize(widthMeasureSpec)) : textWidth;
++		if (heightMode != MeasureSpec.EXACTLY && height < textHeight)
++			height = heightMode == MeasureSpec.AT_MOST ? Math.min(textHeight, MeasureSpec.getSize(heightMeasureSpec)) : textHeight;
++		setMeasuredDimension(width, height);
++	}
+ 	private native void native_setInputMode(long widget, boolean hidden, int purpose, boolean editable);
+ 
+ 	/** one line or several is a property of the widget and is decided when it is created */
+@@ -197,6 +226,9 @@ public class EditText extends TextView {
+ 			for (TextWatcher w : atl_watcher_snapshot())
+ 				w.onTextChanged(s, start, before, count);
+ 			EditText.this.onTextChanged(s, start, before, count);
++			// more or fewer lines: a field as high as its text has to be laid out again
++			if (!atl_single_line && atl_changes_lines(s, start, count, before))
++				requestLayout();
+ 		}
+ 
+ 		@Override
+@@ -256,6 +288,17 @@ public class EditText extends TextView {
+ 		}
+ 	}
+ 
++	/** did the change add a line break, or remove text (which may have held one)? */
++	private static boolean atl_changes_lines(CharSequence s, int start, int count, int before) {
++		if (before > 0)
++			return true;
++		for (int i = start; i < start + count && i < s.length(); i++) {
++			if (s.charAt(i) == '\n')
++				return true;
++		}
++		return false;
++	}
++
+ 	private static int atl_utf16(CharSequence s, int codePoints) {
+ 		int index = 0;
+ 		int length = s.length();

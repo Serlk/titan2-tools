@@ -1,0 +1,158 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] EditText: text colour of the application's theme, text size
+
+A field whose layout names no text colour drew its text in the colour of
+the desktop theme: under a dark desktop the text of an application with a
+light theme was light on its light background, typed text seemed not to
+arrive at all. Such a field now takes editTextColor (or textColorPrimary)
+of the application's theme; a colour set by the layout or by setTextColor
+still wins.
+
+setTextSize was a no-op for EditText, so every field used the small
+default font; it sets the font size now, in the unit TextView uses for
+labels.
+
+---
+  src/api-impl-jni/generated_headers/android_widget_EditText.h |  8 +++++
+  src/api-impl-jni/widgets/android_widget_EditText.c           | 21 +++++++++++++
+  src/api-impl/android/widget/EditText.java                    | 51 +++++++++++++++++++++++++++++++-
+  3 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/src/api-impl-jni/generated_headers/android_widget_EditText.h b/src/api-impl-jni/generated_headers/android_widget_EditText.h
+index cb0fa30..14e1f7f 100644
+--- a/src/api-impl-jni/generated_headers/android_widget_EditText.h
++++ b/src/api-impl-jni/generated_headers/android_widget_EditText.h
+@@ -281,6 +281,14 @@ JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1getSelection
+ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setHint
+   (JNIEnv *, jobject, jlong, jstring);
+ 
++/*
++ * Class:     android_widget_EditText
++ * Method:    native_setTextSize
++ * Signature: (JF)V
++ */
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setTextSize
++  (JNIEnv *, jobject, jlong, jfloat);
++
+ /*
+  * Class:     android_widget_EditText
+  * Method:    native_setInputMode
+diff --git a/src/api-impl-jni/widgets/android_widget_EditText.c b/src/api-impl-jni/widgets/android_widget_EditText.c
+index f61a830..51d7192 100644
+--- a/src/api-impl-jni/widgets/android_widget_EditText.c
++++ b/src/api-impl-jni/widgets/android_widget_EditText.c
+@@ -1,5 +1,7 @@
+ #include <gtk/gtk.h>
+ 
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations" /* per-widget style providers */
++
+ #include "../defines.h"
+ #include "../util.h"
+ 
+@@ -306,3 +308,22 @@ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setInputMode(JNIEnv
+ 		gtk_editable_set_editable(GTK_EDITABLE(widget), editable);
+ 	}
+ }
++
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setTextSize(JNIEnv *env, jobject this, jlong widget_ptr, jfloat size)
++{
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	GtkStyleContext *style_context = gtk_widget_get_style_context(widget);
++	char number[G_ASCII_DTOSTR_BUF_SIZE];
++
++	GtkCssProvider *old_provider = g_object_get_data(G_OBJECT(widget), "size_style_provider");
++	if (old_provider)
++		gtk_style_context_remove_provider(style_context, GTK_STYLE_PROVIDER(old_provider));
++
++	GtkCssProvider *css_provider = gtk_css_provider_new();
++	char *css_string = g_strdup_printf("* { font-size: %spt; }", g_ascii_formatd(number, sizeof(number), "%.2f", size));
++	gtk_css_provider_load_from_string(css_provider, css_string);
++	g_free(css_string);
++
++	gtk_style_context_add_provider(style_context, GTK_STYLE_PROVIDER(css_provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
++	g_object_set_data_full(G_OBJECT(widget), "size_style_provider", css_provider, g_object_unref);
++}
+diff --git a/src/api-impl/android/widget/EditText.java b/src/api-impl/android/widget/EditText.java
+index e965be4..54e994a 100644
+--- a/src/api-impl/android/widget/EditText.java
++++ b/src/api-impl/android/widget/EditText.java
+@@ -47,6 +47,48 @@ public class EditText extends TextView {
+ 	private boolean atl_widget_selection;
+ 	private boolean atl_has_focus;
+ 	private int atl_removed_code_points;
++	private boolean atl_color_set;
++
++	@Override
++	public void setTextColor(int color) {
++		atl_color_set = true;
++		super.setTextColor(color);
++	}
++
++	@Override
++	public void setTextColor(android.content.res.ColorStateList colors) {
++		if (colors != null)
++			atl_color_set = true;
++		super.setTextColor(colors);
++	}
++
++	/**
++	 * A field whose layout and style name no text colour takes the one of the application's theme.
++	 * Left to the desktop theme, the text of a light application under a dark desktop would be
++	 * light on light.
++	 */
++	private void atl_apply_theme_color(Context context) {
++		android.util.TypedValue value = new android.util.TypedValue();
++		for (int attr : new int[] {android.R.attr.editTextColor, android.R.attr.textColorPrimary}) {
++			try {
++				if (!context.getTheme().resolveAttribute(attr, value, true))
++					continue;
++				if (value.type >= android.util.TypedValue.TYPE_FIRST_COLOR_INT && value.type <= android.util.TypedValue.TYPE_LAST_COLOR_INT) {
++					super.setTextColor(value.data);
++					return;
++				}
++				if (value.resourceId != 0) {
++					android.content.res.ColorStateList list = context.getResources().getColorStateList(value.resourceId);
++					if (list != null) {
++						super.setTextColor(list.getDefaultColor());
++						return;
++					}
++				}
++			} catch (RuntimeException e) {
++				// an attribute the theme cannot resolve: try the next
++			}
++		}
++	}
+ 
+ 	public EditText(Context context) {
+ 		this(context, null);
+@@ -64,6 +106,8 @@ public class EditText extends TextView {
+ 		super(context, attrs, defStyle, defStyleRes);
+ 		setFocusable(true);
+ 		atl_apply_input_mode();
++		if (!atl_color_set)
++			atl_apply_theme_color(context);
+ 	}
+ 
+ 	private native long native_create(boolean singleLine);
+@@ -72,6 +116,7 @@ public class EditText extends TextView {
+ 	private native void native_setSelection(long widget, int start, int end);
+ 	private native long native_getSelection(long widget);
+ 	private native void native_setHint(long widget, String s);
++	private native void native_setTextSize(long widget, float size);
+ 	private native void native_setInputMode(long widget, boolean hidden, int purpose, boolean editable);
+ 
+ 	/** one line or several is a property of the widget and is decided when it is created */
+@@ -335,8 +380,12 @@ public class EditText extends TextView {
+ 		atl_buffer().append(text, start, end);
+ 	}
+ 
++	/** the same unit the labels of TextView use, so a field and a label of one size look alike */
+ 	@Override
+-	public void setTextSize(float size) {}
++	public void setTextSize(float size) {
++		if (size > 0)
++			native_setTextSize(widget, size);
++	}
+ 
+ 	@Override
+ 	public void addTextChangedListener(TextWatcher watcher) {

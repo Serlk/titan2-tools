@@ -1,0 +1,152 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] api-impl: ActionBar: usable stub, Activity.getActionBar() returns it
+
+Apps written against the platform ActionBar (no AppCompat) call
+getActionBar().setSubtitle()/setCustomView()/... unguarded. ART resolves
+the method before it checks the receiver, so with an empty ActionBar class
+every such call dies with NoSuchMethodError even though getActionBar()
+returns null (seen with org.billthefarmer.editor 1.98).
+
+Give ActionBar the common API as no-ops (titles are kept, the custom view
+is inflated and handed back so apps can fill it) and hand out one instance
+per Activity.
+
+SPDX-License-Identifier: GPL-3.0-only
+---
+--- a/src/api-impl/android/app/ActionBar.java
++++ b/src/api-impl/android/app/ActionBar.java
+@@ -1,3 +1,117 @@
+ package android.app;
++import android.content.Context;
++import android.graphics.drawable.Drawable;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
+ 
+-public class ActionBar {}
++/* The window title lives in the GTK header bar; everything else is accepted and ignored. */
++public class ActionBar {
++	public static final int NAVIGATION_MODE_STANDARD = 0;
++	public static final int NAVIGATION_MODE_LIST = 1;
++	public static final int NAVIGATION_MODE_TABS = 2;
++	public static final int DISPLAY_USE_LOGO = 0x1;
++	public static final int DISPLAY_SHOW_HOME = 0x2;
++	public static final int DISPLAY_HOME_AS_UP = 0x4;
++	public static final int DISPLAY_SHOW_TITLE = 0x8;
++	public static final int DISPLAY_SHOW_CUSTOM = 0x10;
++
++	public interface OnMenuVisibilityListener {
++		void onMenuVisibilityChanged(boolean isVisible);
++	}
++
++	public interface OnNavigationListener {
++		boolean onNavigationItemSelected(int itemPosition, long itemId);
++	}
++
++	public static class LayoutParams extends ViewGroup.MarginLayoutParams {
++		public int gravity = -1;
++
++		public LayoutParams(int width, int height) {
++			super(width, height);
++		}
++
++		public LayoutParams(int width, int height, int gravity) {
++			super(width, height);
++			this.gravity = gravity;
++		}
++
++		public LayoutParams(ViewGroup.LayoutParams source) {
++			super(source);
++		}
++	}
++
++	private final Activity activity;
++	private CharSequence title;
++	private CharSequence subtitle;
++	private View customView;
++	private int displayOptions = DISPLAY_SHOW_HOME | DISPLAY_SHOW_TITLE;
++	private int navigationMode = NAVIGATION_MODE_STANDARD;
++	private boolean showing = true;
++
++	public ActionBar(Activity activity) {
++		this.activity = activity;
++	}
++
++	public void setTitle(CharSequence title) { this.title = title; }
++	public void setTitle(int resId) { this.title = activity.getText(resId); }
++	public CharSequence getTitle() { return title != null ? title : activity.getTitle(); }
++	public void setSubtitle(CharSequence subtitle) { this.subtitle = subtitle; }
++	public void setSubtitle(int resId) { this.subtitle = activity.getText(resId); }
++	public CharSequence getSubtitle() { return subtitle; }
++
++	public void setCustomView(View view) { customView = view; }
++	public void setCustomView(View view, LayoutParams layoutParams) { customView = view; }
++	public void setCustomView(int resId) {
++		customView = LayoutInflater.from(activity).inflate(resId, null);
++	}
++	public View getCustomView() { return customView; }
++
++	public void setDisplayOptions(int options) { displayOptions = options; }
++	public void setDisplayOptions(int options, int mask) {
++		displayOptions = (displayOptions & ~mask) | (options & mask);
++	}
++	public int getDisplayOptions() { return displayOptions; }
++	private void setOption(int flag, boolean on) { setDisplayOptions(on ? flag : 0, flag); }
++	public void setDisplayUseLogoEnabled(boolean useLogo) { setOption(DISPLAY_USE_LOGO, useLogo); }
++	public void setDisplayShowHomeEnabled(boolean showHome) { setOption(DISPLAY_SHOW_HOME, showHome); }
++	public void setDisplayHomeAsUpEnabled(boolean showHomeAsUp) { setOption(DISPLAY_HOME_AS_UP, showHomeAsUp); }
++	public void setDisplayShowTitleEnabled(boolean showTitle) { setOption(DISPLAY_SHOW_TITLE, showTitle); }
++	public void setDisplayShowCustomEnabled(boolean showCustom) { setOption(DISPLAY_SHOW_CUSTOM, showCustom); }
++	public void setHomeButtonEnabled(boolean enabled) {}
++	public void setHomeAsUpIndicator(int resId) {}
++	public void setHomeAsUpIndicator(Drawable indicator) {}
++	public void setHomeActionContentDescription(CharSequence description) {}
++	public void setHomeActionContentDescription(int resId) {}
++
++	public void setIcon(int resId) {}
++	public void setIcon(Drawable icon) {}
++	public void setLogo(int resId) {}
++	public void setLogo(Drawable logo) {}
++	public void setBackgroundDrawable(Drawable d) {}
++	public void setStackedBackgroundDrawable(Drawable d) {}
++	public void setSplitBackgroundDrawable(Drawable d) {}
++	public void setElevation(float elevation) {}
++	public float getElevation() { return 0; }
++	public void setHideOnContentScrollEnabled(boolean hideOnContentScroll) {}
++	public boolean isHideOnContentScrollEnabled() { return false; }
++	public void setHideOffset(int offset) {}
++	public int getHideOffset() { return 0; }
++
++	public void setNavigationMode(int mode) { navigationMode = mode; }
++	public int getNavigationMode() { return navigationMode; }
++	public void setListNavigationCallbacks(android.widget.SpinnerAdapter adapter, OnNavigationListener callback) {}
++	public void setSelectedNavigationItem(int position) {}
++	public int getSelectedNavigationIndex() { return -1; }
++	public int getNavigationItemCount() { return 0; }
++
++	public void addOnMenuVisibilityListener(OnMenuVisibilityListener listener) {}
++	public void removeOnMenuVisibilityListener(OnMenuVisibilityListener listener) {}
++
++	public void show() { showing = true; }
++	public void hide() { showing = false; }
++	public boolean isShowing() { return showing; }
++	public int getHeight() { return 0; }
++	public Context getThemedContext() { return activity; }
++	public void setShowHideAnimationEnabled(boolean enabled) {}
++}
+--- a/src/api-impl/android/app/Activity.java
++++ b/src/api-impl/android/app/Activity.java
+@@ -665,8 +665,12 @@
+ 		return true;
+ 	}
+ 
++	private ActionBar actionBar;
++
+ 	public ActionBar getActionBar() {
+-		return null;
++		if (actionBar == null)
++			actionBar = new ActionBar(this);
++		return actionBar;
+ 	}
+ 
+ 	@Override

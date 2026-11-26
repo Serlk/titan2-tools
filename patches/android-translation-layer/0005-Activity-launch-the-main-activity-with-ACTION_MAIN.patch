@@ -1,0 +1,22 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] Activity: launch the main activity with ACTION_MAIN/CATEGORY_LAUNCHER
+
+Android starts a launcher activity with an Intent whose action is
+ACTION_MAIN and category CATEGORY_LAUNCHER. ATL passed an empty Intent, so
+apps that switch on getIntent().getAction() (org.billthefarmer.editor) died
+with a NullPointerException in onCreate.
+
+SPDX-License-Identifier: GPL-3.0-only
+---
+--- a/src/api-impl/android/app/Activity.java
++++ b/src/api-impl/android/app/Activity.java
+@@ -99,7 +99,8 @@
+ 				System.err.println("Failed to find main Activity");
+ 			System.exit(1);
+ 		}
+-		return internalCreateActivity(className, native_window, uri != null ? new Intent("android.intent.action.VIEW", uri) : new Intent());
++		return internalCreateActivity(className, native_window, uri != null ? new Intent(Intent.ACTION_VIEW, uri)
++		                                                             : new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER));
+ 	}
+ 
+ 	public Activity() {

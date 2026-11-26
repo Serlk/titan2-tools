@@ -1,0 +1,1422 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] location and connectivity: units, permissions, unsubscribe, transport type
+
+LocationManager:
+- the portal passes the time of a fix as seconds and microseconds; the
+  microseconds were added to milliseconds unconverted. 1700000000 s +
+  500000 us is 1700000000500 ms now.
+- providers are listed (gps, network, passive; fused from API 31), the
+  last fix is kept and returned by getLastKnownLocation with its accuracy,
+  time and reception time on the clock that counts during sleep;
+  getCurrentLocation obeys maximum age, timeout and cancellation.
+- absent altitude, speed and heading are reported as absent.
+- what a listener receives follows the permission its package holds when
+  the fix is delivered: fine gets the fix, coarse a position snapped to a
+  grid of about 2 km at most every ten minutes, none nothing. An
+  application of an API level without a permission request is asked at
+  first use. A process-wide environment switch no longer decides it.
+- removeUpdates works; the portal session is closed with the last
+  listener, on revocation and when the process ends, and reopened with the
+  accuracy the remaining listeners may have.
+
+ConnectivityManager tells Wi-Fi, mobile data and cable apart by the
+interface of the default route, reports no network as none, delivers
+onLost/onAvailable/onCapabilitiesChanged on every change, and
+unregisterNetworkCallback ends the subscription. NetworkCallback is a
+static nested class, as applications are compiled against it.
+
+---
+  .../generated_headers/android_location_LocationManager.h        |  22 +-
+  .../generated_headers/android_net_ConnectivityManager.h         |  26 +-
+  src/api-impl-jni/location/android_location_LocationManager.c    |  49 +++-
+  src/api-impl-jni/net/android_net_ConnectivityManager.c          |  16 +-
+  src/api-impl/android/hardware/SensorManager.java                |  24 +-
+  src/api-impl/android/location/Location.java                     | 182 ++++++++++--
+  src/api-impl/android/location/LocationListener.java             |   8 +
+  src/api-impl/android/location/LocationManager.java              | 419 +++++++++++++++++++++++++---
+  src/api-impl/android/net/ConnectivityManager.java               | 284 +++++++++++++++++--
+  src/api-impl/android/net/NetworkInfo.java                       |  45 ++-
+  10 files changed, 940 insertions(+), 135 deletions(-)
+
+diff --git a/src/api-impl-jni/generated_headers/android_location_LocationManager.h b/src/api-impl-jni/generated_headers/android_location_LocationManager.h
+index 6dea43c..7d48b4a 100644
+--- a/src/api-impl-jni/generated_headers/android_location_LocationManager.h
++++ b/src/api-impl-jni/generated_headers/android_location_LocationManager.h
+@@ -7,13 +7,29 @@
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
++#undef android_location_LocationManager_COARSE_GRID_METERS
++#define android_location_LocationManager_COARSE_GRID_METERS 2000.0
++#undef android_location_LocationManager_COARSE_INTERVAL_MS
++#define android_location_LocationManager_COARSE_INTERVAL_MS 600000LL
++#undef android_location_LocationManager_CURRENT_MAX_AGE_MS
++#define android_location_LocationManager_CURRENT_MAX_AGE_MS 10000LL
++#undef android_location_LocationManager_CURRENT_TIMEOUT_MS
++#define android_location_LocationManager_CURRENT_TIMEOUT_MS 30000LL
+ /*
+  * Class:     android_location_LocationManager
+- * Method:    nativeGetLocation
++ * Method:    nativeStart
++ * Signature: (ZII)V
++ */
++JNIEXPORT void JNICALL Java_android_location_LocationManager_nativeStart
++  (JNIEnv *, jclass, jboolean, jint, jint);
++
++/*
++ * Class:     android_location_LocationManager
++ * Method:    nativeStop
+  * Signature: ()V
+  */
+-JNIEXPORT void JNICALL Java_android_location_LocationManager_nativeGetLocation
+-  (JNIEnv *, jobject);
++JNIEXPORT void JNICALL Java_android_location_LocationManager_nativeStop
++  (JNIEnv *, jclass);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/api-impl-jni/generated_headers/android_net_ConnectivityManager.h b/src/api-impl-jni/generated_headers/android_net_ConnectivityManager.h
+index 4890568..8dfa03e 100644
+--- a/src/api-impl-jni/generated_headers/android_net_ConnectivityManager.h
++++ b/src/api-impl-jni/generated_headers/android_net_ConnectivityManager.h
+@@ -7,28 +7,36 @@
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
++#undef android_net_ConnectivityManager_TYPE_NONE
++#define android_net_ConnectivityManager_TYPE_NONE -1L
++#undef android_net_ConnectivityManager_TYPE_MOBILE
++#define android_net_ConnectivityManager_TYPE_MOBILE 0L
++#undef android_net_ConnectivityManager_TYPE_WIFI
++#define android_net_ConnectivityManager_TYPE_WIFI 1L
++#undef android_net_ConnectivityManager_TYPE_ETHERNET
++#define android_net_ConnectivityManager_TYPE_ETHERNET 9L
+ /*
+  * Class:     android_net_ConnectivityManager
+- * Method:    registerNetworkCallback
+- * Signature: (Landroid/net/NetworkRequest;Landroid/net/ConnectivityManager/NetworkCallback;)V
++ * Method:    nativeWatch
++ * Signature: ()V
+  */
+-JNIEXPORT void JNICALL Java_android_net_ConnectivityManager_registerNetworkCallback
+-  (JNIEnv *, jobject, jobject, jobject);
++JNIEXPORT void JNICALL Java_android_net_ConnectivityManager_nativeWatch
++  (JNIEnv *, jclass);
+ 
+ /*
+  * Class:     android_net_ConnectivityManager
+- * Method:    isActiveNetworkMetered
++ * Method:    nativeGetNetworkAvailable
+  * Signature: ()Z
+  */
+-JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_isActiveNetworkMetered
+-  (JNIEnv *, jobject);
++JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_nativeGetNetworkAvailable
++  (JNIEnv *, jclass);
+ 
+ /*
+  * Class:     android_net_ConnectivityManager
+- * Method:    nativeGetNetworkAvailable
++ * Method:    isActiveNetworkMetered
+  * Signature: ()Z
+  */
+-JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_nativeGetNetworkAvailable
++JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_isActiveNetworkMetered
+   (JNIEnv *, jobject);
+ 
+ #ifdef __cplusplus
+diff --git a/src/api-impl-jni/location/android_location_LocationManager.c b/src/api-impl-jni/location/android_location_LocationManager.c
+index 608ba97..37863c1 100644
+--- a/src/api-impl-jni/location/android_location_LocationManager.c
++++ b/src/api-impl-jni/location/android_location_LocationManager.c
+@@ -4,6 +4,9 @@
+ #include "../util.h"
+ #include "../generated_headers/android_location_LocationManager.h"
+ 
++static XdpPortal *portal = NULL;
++
++/* libportal: the time of the fix is passed as seconds and microseconds */
+ static void location_updated(
+     XdpPortal *self,
+     gdouble latitude,
+@@ -14,30 +17,56 @@ static void location_updated(
+     gdouble heading,
+     gchar *description,
+     gint64 timestamp_s,
+-    gint64 timestamp_ms,
++    gint64 timestamp_us,
+     JavaVM *jvm)
+ {
+ 	JNIEnv *env;
+ 	(*jvm)->GetEnv(jvm, (void **)&env, JNI_VERSION_1_6);
+-	jlong timestamp = timestamp_s * 1000 + timestamp_ms;
+-	J__LocationManager__locationUpdated(env, latitude, longitude, altitude, accuracy, speed, heading, timestamp);
++	J__LocationManager__locationUpdated(env, latitude, longitude, altitude, accuracy, speed, heading, (jlong)timestamp_s, (jlong)timestamp_us);
++	if ((*env)->ExceptionCheck(env))
++		(*env)->ExceptionDescribe(env);
+ }
+ 
+-JNIEXPORT void JNICALL Java_android_location_LocationManager_nativeGetLocation(JNIEnv *env, jobject)
++static void monitor_started(GObject *source, GAsyncResult *result, gpointer user_data)
+ {
+-	if (!getenv("ATL_UGLY_ENABLE_LOCATION")) {
+-		// Location access is prohibited by default until sanboxing is implemented.
+-		// Set ATL_UGLY_ENABLE_LOCATION environment variable to enable it.
+-		return;
++	GError *error = NULL;
++	if (!xdp_portal_location_monitor_start_finish(XDP_PORTAL(source), result, &error)) {
++		JNIEnv *env = get_jni_env();
++		J__LocationManager__locationSessionFailed(env, _JSTRING(error ? error->message : "unknown error"));
++		if ((*env)->ExceptionCheck(env))
++			(*env)->ExceptionDescribe(env);
++		g_clear_error(&error);
+ 	}
++}
+ 
+-	static XdpPortal *portal = NULL;
++JNIEXPORT void JNICALL Java_android_location_LocationManager_nativeStart(JNIEnv *env, jclass this, jboolean exact, jint distance_threshold, jint time_threshold)
++{
+ 	if (!portal) {
+ 		portal = xdp_portal_new();
+ 		JavaVM *jvm;
+ 		(*env)->GetJavaVM(env, &jvm);
+ 		g_signal_connect(portal, "location-updated", G_CALLBACK(location_updated), jvm);
+ 	}
++	xdp_portal_location_monitor_start(portal, NULL, MAX(distance_threshold, 0), MAX(time_threshold, 0),
++	                                  exact ? XDP_LOCATION_ACCURACY_EXACT : XDP_LOCATION_ACCURACY_NEIGHBORHOOD,
++	                                  XDP_LOCATION_MONITOR_FLAG_NONE, NULL, monitor_started, NULL);
++}
+ 
+-	xdp_portal_location_monitor_start(portal, NULL, 0, 0, XDP_LOCATION_ACCURACY_EXACT, XDP_LOCATION_MONITOR_FLAG_NONE, NULL, NULL, NULL);
++/* closes the portal session: with no other user left, the location service lets the receiver rest */
++JNIEXPORT void JNICALL Java_android_location_LocationManager_nativeStop(JNIEnv *env, jclass this)
++{
++	if (portal)
++		xdp_portal_location_monitor_stop(portal);
++}
++
++/*
++ * Test hook: feed one fix as the portal would deliver it (seconds + microseconds), e.g. from a
++ * debugger or a test harness: atl_test_inject_location(55.75, 37.61, 150, 5, 1.5, 90, 1700000000, 500000)
++ */
++void atl_test_inject_location(double latitude, double longitude, double altitude, double accuracy, double speed, double heading, gint64 timestamp_s, gint64 timestamp_us)
++{
++	JNIEnv *env = get_jni_env();
++	J__LocationManager__locationUpdated(env, latitude, longitude, altitude, accuracy, speed, heading, (jlong)timestamp_s, (jlong)timestamp_us);
++	if ((*env)->ExceptionCheck(env))
++		(*env)->ExceptionDescribe(env);
+ }
+diff --git a/src/api-impl-jni/net/android_net_ConnectivityManager.c b/src/api-impl-jni/net/android_net_ConnectivityManager.c
+index 94d9bf6..9345e76 100644
+--- a/src/api-impl-jni/net/android_net_ConnectivityManager.c
++++ b/src/api-impl-jni/net/android_net_ConnectivityManager.c
+@@ -10,24 +10,22 @@ JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_isActiveNetworkM
+ 	return g_network_monitor_get_network_metered(g_network_monitor_get_default());
+ }
+ 
+-JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_nativeGetNetworkAvailable(JNIEnv *env, jobject this)
++JNIEXPORT jboolean JNICALL Java_android_net_ConnectivityManager_nativeGetNetworkAvailable(JNIEnv *env, jclass this)
+ {
+ 	return g_network_monitor_get_network_available(g_network_monitor_get_default());
+ }
+ 
+-static void on_network_changed(GNetworkMonitor *self, gboolean network_available, jobject callback)
++/* fires on any change of the routing state, also when the default route moves between interfaces */
++static void on_network_changed(GNetworkMonitor *self, gboolean network_available, gpointer user_data)
+ {
+ 	JNIEnv *env = get_jni_env();
+-	if (network_available) {
+-		J__ConnectivityManager__NetworkCallback__onAvailable(env, callback, NULL);
+-	} else {
+-		J__ConnectivityManager__NetworkCallback__onLost(env, callback, NULL);
+-	}
++	J__ConnectivityManager__networkChanged(env);
+ 	if ((*env)->ExceptionCheck(env))
+ 		(*env)->ExceptionDescribe(env);
+ }
+ 
+-JNIEXPORT void JNICALL Java_android_net_ConnectivityManager_registerNetworkCallback(JNIEnv *env, jobject this, jobject request, jobject callback)
++/* one subscription per process; the Java side keeps the list of callbacks */
++JNIEXPORT void JNICALL Java_android_net_ConnectivityManager_nativeWatch(JNIEnv *env, jclass this)
+ {
+-	g_signal_connect(g_network_monitor_get_default(), "network-changed", G_CALLBACK(on_network_changed), _REF(callback));
++	g_signal_connect(g_network_monitor_get_default(), "network-changed", G_CALLBACK(on_network_changed), NULL);
+ }
+diff --git a/src/api-impl/android/hardware/SensorManager.java b/src/api-impl/android/hardware/SensorManager.java
+index a3e92d2..e7a962b 100644
+--- a/src/api-impl/android/hardware/SensorManager.java
++++ b/src/api-impl/android/hardware/SensorManager.java
+@@ -121,12 +121,24 @@ public class SensorManager {
+ 		if (listener == null || sensor == null)
+ 			return false;
+ 		if (sensor.getType() == Sensor.TYPE_ORIENTATION) {
+-			new LocationManager().requestLocationUpdates(null, 0, 0, new LocationListener() {
+-				@Override
+-				public void onLocationChanged(Location location) {
+-					listener.onSensorChanged(new SensorEvent(new float[] {location.getBearing(), 0, 0}, sensor));
+-				}
+-			});
++			// the heading of travel stands in for the compass here; it is position data and needs the permission
++			try {
++				new LocationManager().requestLocationUpdates(null, 0, 0, new LocationListener() {
++					@Override
++					public void onLocationChanged(Location location) {
++						if (location != null && location.hasBearing())
++							listener.onSensorChanged(new SensorEvent(new float[] {location.getBearing(), 0, 0}, sensor));
++					}
++					@Override
++					public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
++					@Override
++					public void onProviderEnabled(String provider) {}
++					@Override
++					public void onProviderDisabled(String provider) {}
++				});
++			} catch (SecurityException e) {
++				return false;
++			}
+ 			return true;
+ 		}
+ 		IioSensors.Channel ch = IioSensors.find(sensor);
+diff --git a/src/api-impl/android/location/Location.java b/src/api-impl/android/location/Location.java
+index 1517471..0e98d0c 100644
+--- a/src/api-impl/android/location/Location.java
++++ b/src/api-impl/android/location/Location.java
+@@ -1,34 +1,58 @@
+ package android.location;
+ 
+-public class Location {
++import android.os.Bundle;
++import android.os.SystemClock;
+ 
++public class Location {
++	private String provider;
+ 	private double latitude;
+ 	private double longitude;
+ 	private double altitude;
+-	private double accuracy;
+-	private double speed;
+-	private double bearing;
++	private float accuracy;
++	private float speed;
++	private float bearing;
+ 	private long timestamp;
++	private long elapsedRealtimeNanos;
++	private boolean hasAltitude;
++	private boolean hasAccuracy;
++	private boolean hasSpeed;
++	private boolean hasBearing;
++	private Bundle extras;
++
++	public Location(String provider) {
++		this.provider = provider;
++	}
++
++	public Location(Location l) {
++		set(l);
++	}
++
++	public void set(Location l) {
++		provider = l.provider;
++		latitude = l.latitude;
++		longitude = l.longitude;
++		altitude = l.altitude;
++		accuracy = l.accuracy;
++		speed = l.speed;
++		bearing = l.bearing;
++		timestamp = l.timestamp;
++		elapsedRealtimeNanos = l.elapsedRealtimeNanos;
++		hasAltitude = l.hasAltitude;
++		hasAccuracy = l.hasAccuracy;
++		hasSpeed = l.hasSpeed;
++		hasBearing = l.hasBearing;
++		extras = l.extras == null ? null : new Bundle(l.extras);
++	}
+ 
+-	public Location(String provider) {}
++	public String getProvider() {
++		return provider;
++	}
+ 
+-	/* for internal use */
+-	public Location(double latitude,
+-	                double longitude,
+-	                double altitude,
+-	                double accuracy,
+-	                double speed,
+-	                double bearing,
+-	                long timestamp) {
+-		this.latitude = latitude;
+-		this.longitude = longitude;
+-		this.altitude = altitude;
+-		this.accuracy = accuracy;
+-		this.speed = speed;
+-		this.bearing = bearing;
+-		this.timestamp = timestamp;
++	public void setProvider(String provider) {
++		this.provider = provider;
+ 	}
+ 
++	/** degrees */
+ 	public double getLatitude() {
+ 		return latitude;
+ 	}
+@@ -37,6 +61,7 @@ public class Location {
+ 		this.latitude = latitude;
+ 	}
+ 
++	/** degrees */
+ 	public double getLongitude() {
+ 		return longitude;
+ 	}
+@@ -46,46 +71,145 @@ public class Location {
+ 	}
+ 
+ 	public boolean hasAltitude() {
+-		return altitude != -Double.MAX_VALUE;
++		return hasAltitude;
+ 	}
+ 
++	/** metres above the WGS 84 ellipsoid; 0 if there is none */
+ 	public double getAltitude() {
+ 		return altitude;
+ 	}
+ 
++	public void setAltitude(double altitude) {
++		this.altitude = altitude;
++		this.hasAltitude = true;
++	}
++
++	public void removeAltitude() {
++		this.altitude = 0;
++		this.hasAltitude = false;
++	}
++
+ 	public boolean hasAccuracy() {
+-		return true;
++		return hasAccuracy;
+ 	}
+ 
++	/** metres, radius of 68 % confidence */
+ 	public float getAccuracy() {
+-		return (float)accuracy;
++		return accuracy;
+ 	}
+ 
+ 	public void setAccuracy(float accuracy) {
+ 		this.accuracy = accuracy;
++		this.hasAccuracy = true;
+ 	}
+ 
+ 	public boolean hasSpeed() {
+-		return speed != -1;
++		return hasSpeed;
+ 	}
+ 
++	/** metres per second */
+ 	public float getSpeed() {
+-		return (float)speed;
++		return speed;
++	}
++
++	public void setSpeed(float speed) {
++		this.speed = speed;
++		this.hasSpeed = true;
++	}
++
++	public void removeSpeed() {
++		this.speed = 0;
++		this.hasSpeed = false;
+ 	}
+ 
+ 	public boolean hasBearing() {
+-		return bearing != -1;
++		return hasBearing;
+ 	}
+ 
++	/** degrees east of true north */
+ 	public float getBearing() {
+-		return (float)bearing;
++		return bearing;
++	}
++
++	public void setBearing(float bearing) {
++		this.bearing = bearing;
++		this.hasBearing = true;
++	}
++
++	public void removeBearing() {
++		this.bearing = 0;
++		this.hasBearing = false;
+ 	}
+ 
++	/** milliseconds since the Unix epoch, as the source of the fix reported it */
+ 	public long getTime() {
+ 		return timestamp;
+ 	}
+ 
+-	public String getProvider() {
+-		return "fused";
++	public void setTime(long time) {
++		this.timestamp = time;
++	}
++
++	/** when the fix was received, on the clock that keeps counting during sleep */
++	public long getElapsedRealtimeNanos() {
++		return elapsedRealtimeNanos;
++	}
++
++	public long getElapsedRealtimeMillis() {
++		return elapsedRealtimeNanos / 1000000L;
++	}
++
++	public void setElapsedRealtimeNanos(long time) {
++		this.elapsedRealtimeNanos = time;
++	}
++
++	public long getElapsedRealtimeAgeMillis() {
++		return SystemClock.elapsedRealtime() - getElapsedRealtimeMillis();
++	}
++
++	public Bundle getExtras() {
++		return extras;
++	}
++
++	public void setExtras(Bundle extras) {
++		this.extras = extras == null ? null : new Bundle(extras);
++	}
++
++	public boolean isFromMockProvider() {
++		return false;
++	}
++
++	public boolean isMock() {
++		return false;
++	}
++
++	public boolean isComplete() {
++		return provider != null && hasAccuracy && timestamp != 0 && elapsedRealtimeNanos != 0;
++	}
++
++	public float distanceTo(Location dest) {
++		float[] results = new float[1];
++		distanceBetween(latitude, longitude, dest.latitude, dest.longitude, results);
++		return results[0];
++	}
++
++	/** great-circle distance in metres on a sphere of the mean Earth radius */
++	public static void distanceBetween(double startLatitude, double startLongitude, double endLatitude, double endLongitude, float[] results) {
++		double phi1 = Math.toRadians(startLatitude);
++		double phi2 = Math.toRadians(endLatitude);
++		double dphi = phi2 - phi1;
++		double dlambda = Math.toRadians(endLongitude - startLongitude);
++		double a = Math.sin(dphi / 2) * Math.sin(dphi / 2) + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) * Math.sin(dlambda / 2);
++		results[0] = (float)(6371008.8 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
++		if (results.length > 1) {
++			double y = Math.sin(dlambda) * Math.cos(phi2);
++			double x = Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dlambda);
++			results[1] = (float)Math.toDegrees(Math.atan2(y, x));
++		}
++	}
++
++	@Override
++	public String toString() {
++		return "Location[" + provider + " " + latitude + "," + longitude + (hasAccuracy ? " acc=" + accuracy : "") + " t=" + timestamp + "]";
+ 	}
+ }
+diff --git a/src/api-impl/android/location/LocationListener.java b/src/api-impl/android/location/LocationListener.java
+index d023a7f..3865c14 100644
+--- a/src/api-impl/android/location/LocationListener.java
++++ b/src/api-impl/android/location/LocationListener.java
+@@ -1,6 +1,14 @@
+ package android.location;
+ 
++import android.os.Bundle;
++
+ public interface LocationListener {
+ 
+ 	public void onLocationChanged(Location location);
++
++	public void onStatusChanged(String provider, int status, Bundle extras);
++
++	public void onProviderEnabled(String provider);
++
++	public void onProviderDisabled(String provider);
+ }
+diff --git a/src/api-impl/android/location/LocationManager.java b/src/api-impl/android/location/LocationManager.java
+index b252228..7c5db9a 100644
+--- a/src/api-impl/android/location/LocationManager.java
++++ b/src/api-impl/android/location/LocationManager.java
+@@ -1,67 +1,420 @@
+ package android.location;
+ 
++import android.app.Activity;
++import android.app.PendingIntent;
++import android.atl.ATLLoadedApp;
++import android.atl.ATLPermissions;
+ import android.atl.annotation.Export;
+ import android.os.Bundle;
++import android.os.CancellationSignal;
+ import android.os.Handler;
+ import android.os.Looper;
+-import java.lang.Runnable;
+-import java.util.Collections;
+-import java.util.HashSet;
++import android.os.SystemClock;
++import android.util.Slog;
++import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+-import java.util.Set;
++import java.util.concurrent.Executor;
+ 
++/**
++ * Positions come from the session's location portal (GeoClue behind it), one portal session per
++ * process, opened while at least one listener may receive positions and closed with the last one.
++ *
++ * What a listener gets depends on what its package holds at the moment of delivery: with
++ * ACCESS_FINE_LOCATION the fix as it is; with only ACCESS_COARSE_LOCATION a position snapped to a
++ * grid of about two kilometres, an accuracy no better than that, at most one every ten minutes;
++ * with neither, nothing, and the listener is dropped.
++ */
+ public class LocationManager {
++	private static final String TAG = "LocationManager";
+ 
+-	static Set<LocationListener> listeners = new HashSet<>();
++	public static final String GPS_PROVIDER = "gps";
++	public static final String NETWORK_PROVIDER = "network";
++	public static final String PASSIVE_PROVIDER = "passive";
++	public static final String FUSED_PROVIDER = "fused";
++	public static final String KEY_LOCATION_CHANGED = "location";
++	public static final String KEY_PROVIDER_ENABLED = "providerEnabled";
++	public static final String PROVIDERS_CHANGED_ACTION = "android.location.PROVIDERS_CHANGED";
++	public static final String MODE_CHANGED_ACTION = "android.location.MODE_CHANGED";
++
++	private static final String FINE = "android.permission.ACCESS_FINE_LOCATION";
++	private static final String COARSE = "android.permission.ACCESS_COARSE_LOCATION";
++
++	private static final double COARSE_GRID_METERS = 2000;
++	private static final long COARSE_INTERVAL_MS = 10 * 60 * 1000;
++	/** how old a cached fix may be to answer getCurrentLocation() */
++	private static final long CURRENT_MAX_AGE_MS = 10 * 1000;
++	private static final long CURRENT_TIMEOUT_MS = 30 * 1000;
++
++	private static final class Request {
++		LocationListener listener;
++		String provider;
++		long minTimeMs;
++		float minDistanceM;
++		Handler handler;
++		boolean single;
++		long lastDeliveryElapsed;
++		Location lastDelivered;
++	}
++
++	private static final List<Request> requests = new ArrayList<>();
++	/** the newest fix, at full precision; what a caller sees of it is decided per call */
++	private static Location lastFix;
++	private static boolean sessionRunning;
++	private static boolean sessionExact;
++
++	private static native void nativeStart(boolean exact, int distanceThresholdM, int timeThresholdS);
++	private static native void nativeStop();
++
++	private static String packageName() {
++		return ATLLoadedApp.getPrimaryApplication().pkg.packageName;
++	}
++
++	/** 2 fine, 1 coarse, 0 none: by explicit decision of the user (or the old test switch) */
++	private static int grantedLevel() {
++		if (System.getenv("ATL_UGLY_ENABLE_LOCATION") != null)
++			return 2;
++		String pkg = packageName();
++		if (ATLPermissions.allowed(pkg, FINE))
++			return 2;
++		if (ATLPermissions.allowed(pkg, COARSE))
++			return 1;
++		return 0;
++	}
++
++	/** does the app, as far as it can tell, hold a location permission? (it may still have to be confirmed by the user) */
++	private static boolean claimsPermission() {
++		String pkg = packageName();
++		return System.getenv("ATL_UGLY_ENABLE_LOCATION") != null
++		    || ATLPermissions.check(pkg, FINE) == 0 || ATLPermissions.check(pkg, COARSE) == 0;
++	}
++
++	private static boolean undecided() {
++		String pkg = packageName();
++		return ATLPermissions.get(pkg, FINE) == ATLPermissions.UNSET && ATLPermissions.get(pkg, COARSE) == ATLPermissions.UNSET;
++	}
++
++	private static boolean knownProvider(String provider) {
++		return GPS_PROVIDER.equals(provider) || NETWORK_PROVIDER.equals(provider) || PASSIVE_PROVIDER.equals(provider) || FUSED_PROVIDER.equals(provider);
++	}
++
++	/* ---- providers ---- */
++
++	public List<String> getAllProviders() {
++		List<String> out = new ArrayList<>(Arrays.asList(PASSIVE_PROVIDER, NETWORK_PROVIDER, GPS_PROVIDER));
++		if (android.os.Build.VERSION.SDK_INT >= 31)
++			out.add(FUSED_PROVIDER);
++		return out;
++	}
++
++	public List<String> getProviders(boolean enabledOnly) {
++		return getAllProviders();
++	}
++
++	public List<String> getProviders(Criteria criteria, boolean enabledOnly) {
++		return getAllProviders();
++	}
+ 
+ 	public String getBestProvider(Criteria criteria, boolean enabledOnly) {
+-		return "xdgportal";
++		return grantedLevel() == 1 ? NETWORK_PROVIDER : GPS_PROVIDER;
++	}
++
++	/** the source is the system's location service; whether this app may use it is a matter of its permission */
++	public boolean isProviderEnabled(String provider) {
++		return knownProvider(provider);
++	}
++
++	public boolean isLocationEnabled() {
++		return true;
++	}
++
++	public boolean hasProvider(String provider) {
++		return knownProvider(provider);
++	}
++
++	/* ---- what a caller may see of a fix ---- */
++
++	private static Location visible(Location fix, int level, String provider) {
++		if (fix == null || level == 0)
++			return null;
++		Location l = new Location(fix);
++		if (provider != null && !PASSIVE_PROVIDER.equals(provider))
++			l.setProvider(provider);
++		if (level >= 2)
++			return l;
++		// snap to a grid, so that repeated readings do not average out to the true position
++		double latStep = COARSE_GRID_METERS / 111320.0;
++		double lat = Math.round(fix.getLatitude() / latStep) * latStep;
++		double lonStep = COARSE_GRID_METERS / (111320.0 * Math.max(0.01, Math.cos(Math.toRadians(lat))));
++		double lon = Math.round(fix.getLongitude() / lonStep) * lonStep;
++		l.setLatitude(lat);
++		l.setLongitude(lon);
++		l.setAccuracy(Math.max(fix.getAccuracy(), (float)COARSE_GRID_METERS));
++		l.removeAltitude();
++		l.removeSpeed();
++		l.removeBearing();
++		return l;
+ 	}
+ 
+ 	public Location getLastKnownLocation(String provider) {
+-		return null;
++		if (!claimsPermission())
++			throw new SecurityException("\"" + provider + "\" location provider requires ACCESS_COARSE_LOCATION or ACCESS_FINE_LOCATION permission.");
++		synchronized (requests) {
++			return visible(lastFix, grantedLevel(), provider);
++		}
+ 	}
+ 
++	/* ---- updates ---- */
++
+ 	public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, LocationListener listener) {
+-		listeners.add(listener);
+-		nativeGetLocation();
++		requestLocationUpdates(provider, minTimeMs, minDistanceM, listener, Looper.getMainLooper());
+ 	}
+ 
+-	private native void nativeGetLocation();
++	public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, LocationListener listener, Looper looper) {
++		add(provider, minTimeMs, minDistanceM, listener, looper, false);
++	}
+ 
+-	@Export
+-	private static void locationUpdated(double latitude,
+-	                                    double longitude,
+-	                                    double altitude,
+-	                                    double accuracy,
+-	                                    double speed,
+-	                                    double bearing,
+-	                                    long timestamp) {
+-		for (LocationListener locationListener : listeners) {
+-			locationListener.onLocationChanged(new Location(latitude, longitude, altitude, accuracy, speed, bearing, timestamp));
+-		}
++	public void requestLocationUpdates(long minTimeMs, float minDistanceM, Criteria criteria, LocationListener listener, Looper looper) {
++		add(getBestProvider(criteria, true), minTimeMs, minDistanceM, listener, looper, false);
+ 	}
+ 
+-	public boolean sendExtraCommand(String provider, String command, Bundle extras) {
+-		return true;
++	public void requestSingleUpdate(String provider, LocationListener listener, Looper looper) {
++		add(provider, 0, 0, listener, looper, true);
+ 	}
+ 
+-	public GpsStatus getGpsStatus(GpsStatus status) {
+-		if (status == null) {
+-			status = new GpsStatus();
++	private void add(String provider, long minTimeMs, float minDistanceM, LocationListener listener, Looper looper, boolean single) {
++		if (listener == null)
++			throw new IllegalArgumentException("invalid listener: null");
++		if (!claimsPermission())
++			throw new SecurityException("\"" + provider + "\" location provider requires ACCESS_COARSE_LOCATION or ACCESS_FINE_LOCATION permission.");
++		Request r = new Request();
++		r.listener = listener;
++		r.provider = provider == null ? GPS_PROVIDER : provider;
++		r.minTimeMs = Math.max(0, minTimeMs);
++		r.minDistanceM = Math.max(0, minDistanceM);
++		r.handler = new Handler(looper != null ? looper : Looper.getMainLooper());
++		r.single = single;
++		synchronized (requests) {
++			for (int i = requests.size() - 1; i >= 0; i--) {
++				if (requests.get(i).listener == listener)
++					requests.remove(i);
++			}
++			requests.add(r);
+ 		}
+-		return status;
++		if (grantedLevel() == 0 && undecided()) {
++			// an app of an API level without a permission request: the first use asks the user
++			ATLPermissions.request(null, packageName(), new String[] {FINE, COARSE}, new ATLPermissions.Callback() {
++				@Override
++				public void onResult(String[] permissions, int[] grantResults) {
++					updateSession();
++				}
++			});
++			return;
++		}
++		updateSession();
+ 	}
+ 
+ 	public void removeUpdates(LocationListener listener) {
++		synchronized (requests) {
++			for (int i = requests.size() - 1; i >= 0; i--) {
++				if (requests.get(i).listener == listener)
++					requests.remove(i);
++			}
++		}
++		updateSession();
+ 	}
+ 
+-	public List<String> getAllProviders() {
+-		return Collections.emptyList();
++	public void removeUpdates(PendingIntent intent) {}
++
++	/** open, re-open or close the portal session to match the listeners that may receive positions now */
++	private static void updateSession() {
++		new Handler(Looper.getMainLooper()).post(new Runnable() {
++			@Override
++			public void run() {
++				int level = grantedLevel();
++				boolean wanted;
++				int time = Integer.MAX_VALUE;
++				int distance = Integer.MAX_VALUE;
++				synchronized (requests) {
++					wanted = level > 0 && !requests.isEmpty();
++					for (Request r : requests) {
++						time = (int)Math.min(time, r.minTimeMs / 1000);
++						distance = (int)Math.min(distance, (long)r.minDistanceM);
++					}
++				}
++				boolean exact = level >= 2;
++				if (sessionRunning && (!wanted || exact != sessionExact)) {
++					nativeStop();
++					sessionRunning = false;
++					Slog.i(TAG, "location session closed");
++				}
++				if (wanted && !sessionRunning) {
++					sessionExact = exact;
++					sessionRunning = true;
++					Slog.i(TAG, "location session opened (" + (exact ? "exact" : "approximate") + ")");
++					nativeStart(exact, exact ? distance : (int)COARSE_GRID_METERS / 2, exact ? time : (int)(COARSE_INTERVAL_MS / 1000));
++				}
++			}
++		});
+ 	}
+ 
+-	public List<String> getProviders(boolean enabledOnly) {
+-		return Collections.emptyList();
++	@Export
++	private static void locationSessionFailed(String message) {
++		Slog.w(TAG, "location session failed: " + message);
++		sessionRunning = false;
++	}
++
++	/**
++	 * A fix from the portal. Latitude and longitude in degrees, altitude and accuracy in metres,
++	 * speed in m/s, heading in degrees; the time as seconds since the epoch plus microseconds.
++	 * An absent altitude arrives as a hugely negative number, absent speed and heading as negative.
++	 */
++	@Export
++	private static void locationUpdated(double latitude, double longitude, double altitude, double accuracy,
++	                                    double speed, double bearing, long timestampSeconds, long timestampMicroseconds) {
++		Location fix = new Location(GPS_PROVIDER);
++		fix.setLatitude(latitude);
++		fix.setLongitude(longitude);
++		if (altitude > -1e300 && !Double.isNaN(altitude))
++			fix.setAltitude(altitude);
++		if (accuracy >= 0 && !Double.isNaN(accuracy))
++			fix.setAccuracy((float)accuracy);
++		if (speed >= 0 && !Double.isNaN(speed))
++			fix.setSpeed((float)speed);
++		if (bearing >= 0 && !Double.isNaN(bearing))
++			fix.setBearing((float)bearing);
++		fix.setTime(timestampSeconds * 1000 + timestampMicroseconds / 1000);
++		fix.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
++
++		int level = grantedLevel();
++		long now = SystemClock.elapsedRealtime();
++		List<Request> deliver = new ArrayList<>();
++		List<Request> revoked = new ArrayList<>();
++		synchronized (requests) {
++			lastFix = fix;
++			if (level == 0) {
++				revoked.addAll(requests);
++				requests.clear();
++			} else {
++				for (Request r : new ArrayList<>(requests)) {
++					long minInterval = level >= 2 ? r.minTimeMs : Math.max(r.minTimeMs, COARSE_INTERVAL_MS);
++					if (r.lastDelivered != null) {
++						if (now - r.lastDeliveryElapsed < minInterval)
++							continue;
++						if (r.minDistanceM > 0 && r.lastDelivered.distanceTo(fix) < r.minDistanceM)
++							continue;
++					}
++					r.lastDeliveryElapsed = now;
++					r.lastDelivered = fix;
++					deliver.add(r);
++					if (r.single)
++						requests.remove(r);
++				}
++			}
++		}
++		for (final Request r : deliver) {
++			final Location shown = visible(fix, level, r.provider);
++			r.handler.post(new Runnable() {
++				@Override
++				public void run() {
++					r.listener.onLocationChanged(shown);
++				}
++			});
++		}
++		for (final Request r : revoked) {
++			r.handler.post(new Runnable() {
++				@Override
++				public void run() {
++					try {
++						r.listener.onProviderDisabled(r.provider);
++					} catch (AbstractMethodError e) {
++						// listeners built for newer API levels need not implement it
++					}
++				}
++			});
++		}
++		if (!revoked.isEmpty() || !deliver.isEmpty())
++			updateSession();
++	}
++
++	/* ---- one position, now ---- */
++
++	public void getCurrentLocation(String provider, CancellationSignal cancellationSignal, Executor executor,
++	                               final java.util.function.Consumer<Location> consumer) {
++		if (!claimsPermission())
++			throw new SecurityException("\"" + provider + "\" location provider requires ACCESS_COARSE_LOCATION or ACCESS_FINE_LOCATION permission.");
++		final Executor exec = executor;
++		final boolean[] finished = {false};
++		final Handler main = new Handler(Looper.getMainLooper());
++		Location cached;
++		synchronized (requests) {
++			cached = lastFix != null && lastFix.getElapsedRealtimeAgeMillis() <= CURRENT_MAX_AGE_MS ? visible(lastFix, grantedLevel(), provider) : null;
++		}
++		if (cached != null) {
++			final Location answer = cached;
++			exec.execute(new Runnable() {
++				@Override
++				public void run() {
++					consumer.accept(answer);
++				}
++			});
++			return;
++		}
++		final LocationListener once = new LocationListener() {
++			@Override
++			public void onLocationChanged(final Location location) {
++				if (finished[0])
++					return;
++				finished[0] = true;
++				exec.execute(new Runnable() {
++					@Override
++					public void run() {
++						consumer.accept(location);
++					}
++				});
++			}
++			@Override
++			public void onStatusChanged(String provider, int status, Bundle extras) {}
++			@Override
++			public void onProviderEnabled(String provider) {}
++			@Override
++			public void onProviderDisabled(String provider) {
++				onLocationChanged(null);
++			}
++		};
++		if (cancellationSignal != null) {
++			cancellationSignal.setOnCancelListener(new CancellationSignal.OnCancelListener() {
++				@Override
++				public void onCancel() {
++					// a cancelled request is never answered
++					finished[0] = true;
++					removeUpdates(once);
++				}
++			});
++		}
++		add(provider, 0, 0, once, Looper.getMainLooper(), true);
++		main.postDelayed(new Runnable() {
++			@Override
++			public void run() {
++				if (finished[0])
++					return;
++				removeUpdates(once);
++				once.onLocationChanged(null);
++			}
++		}, CURRENT_TIMEOUT_MS);
++	}
++
++	/* ---- satellites: not reported by the portal ---- */
++
++	public boolean sendExtraCommand(String provider, String command, Bundle extras) {
++		return false;
++	}
++
++	public GpsStatus getGpsStatus(GpsStatus status) {
++		if (status == null) {
++			status = new GpsStatus();
++		}
++		return status;
+ 	}
+ 
+ 	public boolean registerGnssStatusCallback(GnssStatus.Callback callback, Handler handler) {
+@@ -76,8 +429,4 @@ public class LocationManager {
+ 
+ 	public void unregisterGnssStatusCallback(GnssStatus.Callback callback) {
+ 	}
+-
+-	public boolean isProviderEnabled(String provider) {
+-		return System.getenv("ATL_UGLY_ENABLE_LOCATION") != null;
+-	}
+ }
+diff --git a/src/api-impl/android/net/ConnectivityManager.java b/src/api-impl/android/net/ConnectivityManager.java
+index dd9dd7e..98bc524 100644
+--- a/src/api-impl/android/net/ConnectivityManager.java
++++ b/src/api-impl/android/net/ConnectivityManager.java
+@@ -2,68 +2,300 @@ package android.net;
+ 
+ import android.atl.annotation.Export;
+ import android.os.Handler;
++import android.os.Looper;
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileReader;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ class ProxyInfo {}
+ 
++/**
++ * The state of the default network: whether there is one (GNetworkMonitor), and what carries it,
++ * read from the interface of the default route: Wi-Fi, mobile data or a cable. Registered callbacks
++ * hear about every change until they are unregistered.
++ */
+ public class ConnectivityManager {
++	public static final int TYPE_NONE = -1;
++	public static final int TYPE_MOBILE = 0;
++	public static final int TYPE_WIFI = 1;
++	public static final int TYPE_ETHERNET = 9;
++	public static final String CONNECTIVITY_ACTION = "android.net.conn.CONNECTIVITY_CHANGE";
+ 
+-	public class NetworkCallback {
+-		@Export
++	public static class NetworkCallback {
+ 		public void onAvailable(Network network) {}
+ 
+-		@Export
+ 		public void onLost(Network network) {}
++
++		public void onUnavailable() {}
++
++		public void onLosing(Network network, int maxMsToLive) {}
++
++		public void onCapabilitiesChanged(Network network, NetworkCapabilities networkCapabilities) {}
++
++		public void onLinkPropertiesChanged(Network network, LinkProperties linkProperties) {}
++
++		public void onBlockedStatusChanged(Network network, boolean blocked) {}
+ 	}
+ 
+-	public NetworkInfo getNetworkInfo(int networkType) {
+-		return new NetworkInfo(nativeGetNetworkAvailable());
++	private static final class Registration {
++		NetworkCallback callback;
++		Handler handler;
+ 	}
+ 
+-	public NetworkInfo getActiveNetworkInfo() {
+-		return new NetworkInfo(nativeGetNetworkAvailable());
++	private static final List<Registration> registrations = new ArrayList<>();
++	private static boolean watching;
++	/** the transport last announced to the callbacks, TYPE_NONE while there is no network */
++	private static int announced = TYPE_NONE;
++	private static final Network NETWORK = new Network();
++
++	private static native void nativeWatch();
++	private static native boolean nativeGetNetworkAvailable();
++	public native boolean isActiveNetworkMetered();
++
++	/* ---- what carries the default route ---- */
++
++	private static String defaultRouteInterface() {
++		String best = null;
++		long bestMetric = Long.MAX_VALUE;
++		try (BufferedReader r = new BufferedReader(new FileReader("/proc/net/route"))) {
++			String line = r.readLine(); // header
++			while ((line = r.readLine()) != null) {
++				String[] f = line.trim().split("\\s+");
++				if (f.length < 8 || !f[1].equals("00000000") || !f[7].equals("00000000"))
++					continue;
++				long metric = Long.parseLong(f[6]);
++				if (metric < bestMetric) {
++					bestMetric = metric;
++					best = f[0];
++				}
++			}
++		} catch (IOException | NumberFormatException e) {
++			// no IPv4 routing table to read
++		}
++		if (best != null)
++			return best;
++		// IPv6 only: the default route has an all-zero destination with prefix length 00
++		try (BufferedReader r = new BufferedReader(new FileReader("/proc/net/ipv6_route"))) {
++			String line;
++			while ((line = r.readLine()) != null) {
++				String[] f = line.trim().split("\\s+");
++				if (f.length >= 10 && f[0].equals("00000000000000000000000000000000") && f[1].equals("00") && !f[9].equals("lo"))
++					return f[9];
++			}
++		} catch (IOException e) {
++			// none
++		}
++		return null;
++	}
++
++	private static String readLine(File f) {
++		try (BufferedReader r = new BufferedReader(new FileReader(f))) {
++			return r.readLine();
++		} catch (IOException e) {
++			return null;
++		}
+ 	}
+ 
+-	public native void registerNetworkCallback(NetworkRequest request, NetworkCallback callback);
++	private static int transportOf(String iface) {
++		if (iface == null)
++			return TYPE_NONE;
++		File dir = new File("/sys/class/net", iface);
++		if (new File(dir, "wireless").exists() || new File(dir, "phy80211").exists())
++			return TYPE_WIFI;
++		try (BufferedReader r = new BufferedReader(new FileReader(new File(dir, "uevent")))) {
++			String line;
++			while ((line = r.readLine()) != null) {
++				if (line.equals("DEVTYPE=wlan"))
++					return TYPE_WIFI;
++				if (line.equals("DEVTYPE=wwan"))
++					return TYPE_MOBILE;
++			}
++		} catch (IOException e) {
++			// decide by the link type below
++		}
++		String type = readLine(new File(dir, "type"));
++		// 1 Ethernet framing; point-to-point and raw-IP links are how modems deliver data
++		if ("1".equals(type))
++			return TYPE_ETHERNET;
++		return TYPE_MOBILE;
++	}
+ 
+-	public void unregisterNetworkCallback(NetworkCallback callback) {}
++	private static int currentTransport() {
++		if (!nativeGetNetworkAvailable())
++			return TYPE_NONE;
++		int t = transportOf(defaultRouteInterface());
++		// the monitor says there is a network although no default route is visible (yet): do not guess mobile
++		return t == TYPE_NONE ? TYPE_ETHERNET : t;
++	}
+ 
+-	public native boolean isActiveNetworkMetered();
++	private NetworkCapabilities capabilitiesFor(int transport) {
++		if (transport == TYPE_NONE)
++			return null;
++		NetworkCapabilities capabilities = new NetworkCapabilities();
++		capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
++		capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
++		capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED);
++		capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
++		if (!isActiveNetworkMetered())
++			capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
++		capabilities.addTransportType(transport == TYPE_WIFI ? NetworkCapabilities.TRANSPORT_WIFI
++		                              : transport == TYPE_MOBILE ? NetworkCapabilities.TRANSPORT_CELLULAR
++		                                                         : NetworkCapabilities.TRANSPORT_ETHERNET);
++		return capabilities;
++	}
++
++	/* ---- queries ---- */
++
++	public NetworkInfo getActiveNetworkInfo() {
++		int t = currentTransport();
++		return t == TYPE_NONE ? null : new NetworkInfo(t, true);
++	}
+ 
+-	protected native boolean nativeGetNetworkAvailable();
++	public NetworkInfo getNetworkInfo(int networkType) {
++		return new NetworkInfo(networkType, currentTransport() == networkType);
++	}
++
++	public NetworkInfo getNetworkInfo(Network network) {
++		return network == null ? null : getActiveNetworkInfo();
++	}
+ 
+ 	public NetworkInfo[] getAllNetworkInfo() {
+-		return new NetworkInfo[] {getActiveNetworkInfo()};
++		NetworkInfo active = getActiveNetworkInfo();
++		return active == null ? new NetworkInfo[0] : new NetworkInfo[] {active};
+ 	}
+ 
+ 	public Network getActiveNetwork() {
+-		return new Network();
++		return currentTransport() == TYPE_NONE ? null : NETWORK;
+ 	}
+ 
+ 	public Network[] getAllNetworks() {
+-		return new Network[] {getActiveNetwork()};
++		Network active = getActiveNetwork();
++		return active == null ? new Network[0] : new Network[] {active};
+ 	}
+ 
+ 	public NetworkCapabilities getNetworkCapabilities(Network network) {
+-		// as in getActiveNetworkInfo, a null network means there is none to report on
+-		if (network == null || !nativeGetNetworkAvailable())
++		// a null network means there is none to report on
++		if (network == null)
+ 			return null;
++		return capabilitiesFor(currentTransport());
++	}
+ 
+-		NetworkCapabilities capabilities = new NetworkCapabilities();
+-		capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
++	public boolean isDefaultNetworkActive() {
++		return currentTransport() != TYPE_NONE;
++	}
+ 
+-		if (!isActiveNetworkMetered())
+-			capabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
++	public ProxyInfo getDefaultProxy() { return null; }
+ 
+-		capabilities.addTransportType(NetworkCapabilities.TRANSPORT_WIFI);
++	public LinkProperties getLinkProperties(Network network) { return null; }
+ 
+-		return capabilities;
++	/* ---- callbacks ---- */
++
++	private void register(NetworkCallback callback, Handler handler) {
++		if (callback == null)
++			throw new IllegalArgumentException("null NetworkCallback");
++		final Registration r = new Registration();
++		r.callback = callback;
++		r.handler = handler != null ? handler : new Handler(Looper.getMainLooper());
++		final int transport;
++		synchronized (registrations) {
++			for (Registration other : registrations) {
++				if (other.callback == callback)
++					throw new IllegalArgumentException("NetworkCallback was already registered");
++			}
++			registrations.add(r);
++			if (!watching) {
++				watching = true;
++				announced = currentTransport();
++				nativeWatch();
++			}
++			transport = announced;
++		}
++		// a new callback first hears the present state
++		if (transport != TYPE_NONE) {
++			final NetworkCapabilities caps = capabilitiesFor(transport);
++			r.handler.post(new Runnable() {
++				@Override
++				public void run() {
++					if (!isRegistered(r))
++						return;
++					r.callback.onAvailable(NETWORK);
++					if (caps != null)
++						r.callback.onCapabilitiesChanged(NETWORK, caps);
++				}
++			});
++		}
+ 	}
+ 
+-	public void registerDefaultNetworkCallback(NetworkCallback cb, Handler hdl) {}
++	private static boolean isRegistered(Registration r) {
++		synchronized (registrations) {
++			return registrations.contains(r);
++		}
++	}
+ 
+-	public void registerDefaultNetworkCallback(NetworkCallback cb) {}
++	public void registerNetworkCallback(NetworkRequest request, NetworkCallback callback) {
++		register(callback, null);
++	}
+ 
+-	public ProxyInfo getDefaultProxy() { return null; }
++	public void registerNetworkCallback(NetworkRequest request, NetworkCallback callback, Handler handler) {
++		register(callback, handler);
++	}
+ 
+-	public LinkProperties getLinkProperties(Network network) { return null; }
++	public void registerDefaultNetworkCallback(NetworkCallback callback, Handler handler) {
++		register(callback, handler);
++	}
++
++	public void registerDefaultNetworkCallback(NetworkCallback callback) {
++		register(callback, null);
++	}
++
++	public void requestNetwork(NetworkRequest request, NetworkCallback callback) {
++		register(callback, null);
++	}
++
++	/** after this returns the callback is not called any more */
++	public void unregisterNetworkCallback(NetworkCallback callback) {
++		synchronized (registrations) {
++			for (int i = registrations.size() - 1; i >= 0; i--) {
++				if (registrations.get(i).callback == callback)
++					registrations.remove(i);
++			}
++		}
++	}
++
++	/** GNetworkMonitor saw a change: availability, or the route moved to another interface */
++	@Export
++	private static void networkChanged() {
++		final int now = currentTransport();
++		final int before;
++		final List<Registration> targets;
++		synchronized (registrations) {
++			before = announced;
++			if (now == before)
++				return;
++			announced = now;
++			targets = new ArrayList<>(registrations);
++		}
++		final ConnectivityManager cm = new ConnectivityManager();
++		final NetworkCapabilities caps = cm.capabilitiesFor(now);
++		for (final Registration r : targets) {
++			r.handler.post(new Runnable() {
++				@Override
++				public void run() {
++					if (!isRegistered(r))
++						return;
++					// a change of the carrier is the old network going and a new one coming
++					if (before != TYPE_NONE)
++						r.callback.onLost(NETWORK);
++					if (now != TYPE_NONE) {
++						r.callback.onAvailable(NETWORK);
++						if (caps != null)
++							r.callback.onCapabilitiesChanged(NETWORK, caps);
++					}
++				}
++			});
++		}
++	}
+ }
+diff --git a/src/api-impl/android/net/NetworkInfo.java b/src/api-impl/android/net/NetworkInfo.java
+index 75fba76..c1ac7b8 100644
+--- a/src/api-impl/android/net/NetworkInfo.java
++++ b/src/api-impl/android/net/NetworkInfo.java
+@@ -10,12 +10,32 @@ public class NetworkInfo {
+ 		UNKNOWN
+ 	}
+ 
+-	public enum DetailedState {}
++	public enum DetailedState {
++		IDLE,
++		SCANNING,
++		CONNECTING,
++		AUTHENTICATING,
++		OBTAINING_IPADDR,
++		CONNECTED,
++		SUSPENDED,
++		DISCONNECTING,
++		DISCONNECTED,
++		FAILED,
++		BLOCKED,
++		VERIFYING_POOR_LINK,
++		CAPTIVE_PORTAL_CHECK
++	}
+ 
+-	private State state = State.DISCONNECTED;
++	private final int type;
++	private final State state;
+ 
+ 	public NetworkInfo(boolean available) {
+-		state = available ? State.CONNECTED : State.DISCONNECTED;
++		this(ConnectivityManager.TYPE_WIFI, available);
++	}
++
++	public NetworkInfo(int type, boolean connected) {
++		this.type = type;
++		this.state = connected ? State.CONNECTED : State.DISCONNECTED;
+ 	}
+ 
+ 	public NetworkInfo.State getState() {
+@@ -23,7 +43,7 @@ public class NetworkInfo {
+ 	}
+ 
+ 	public int getType() {
+-		return state == State.CONNECTED ? /*TYPE_WIFI*/ 0x1 : 0x0;
++		return type;
+ 	}
+ 
+ 	public boolean isConnected() {
+@@ -47,19 +67,28 @@ public class NetworkInfo {
+ 	}
+ 
+ 	public String getTypeName() {
+-		return "UNKNOWN";
++		switch (type) {
++			case ConnectivityManager.TYPE_MOBILE:
++				return "MOBILE";
++			case ConnectivityManager.TYPE_WIFI:
++				return "WIFI";
++			case ConnectivityManager.TYPE_ETHERNET:
++				return "ETHERNET";
++			default:
++				return "UNKNOWN";
++		}
+ 	}
+ 
+ 	public String getSubtypeName() {
+-		return "UNKNOWN";
++		return "";
+ 	}
+ 
+ 	public boolean isAvailable() {
+-		return false;
++		return state == State.CONNECTED;
+ 	}
+ 
+ 	public DetailedState getDetailedState() {
+-		return null;
++		return state == State.CONNECTED ? DetailedState.CONNECTED : DetailedState.DISCONNECTED;
+ 	}
+ 
+ 	public String getExtraInfo() {

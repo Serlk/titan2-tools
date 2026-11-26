@@ -1,0 +1,115 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] api-impl: add android.widget.SearchView stub
+
+Apps that implement SearchView.OnQueryTextListener (menu search boxes,
+e.g. org.billthefarmer.editor) fail to load their Activity class with
+NoClassDefFoundError without it. The stub is a LinearLayout that keeps the
+query text and the listeners; typing into a real search box is not wired up
+yet, submitting the stored query reaches the listener.
+
+SPDX-License-Identifier: GPL-3.0-only
+---
+--- /dev/null
++++ b/src/api-impl/android/widget/SearchView.java
+@@ -0,0 +1,91 @@
++package android.widget;
++
++import android.content.Context;
++import android.util.AttributeSet;
++import android.view.View;
++
++/* Stub: a search box in the action bar. The GTK header bar has no search entry yet, so the
++ * query is only stored and handed to the listener on setQuery(..., true). */
++public class SearchView extends LinearLayout {
++	public interface OnQueryTextListener {
++		boolean onQueryTextSubmit(String query);
++		boolean onQueryTextChange(String newText);
++	}
++
++	public interface OnCloseListener {
++		boolean onClose();
++	}
++
++	public interface OnSuggestionListener {
++		boolean onSuggestionSelect(int position);
++		boolean onSuggestionClick(int position);
++	}
++
++	private OnQueryTextListener queryTextListener;
++	private OnCloseListener closeListener;
++	private OnSuggestionListener suggestionListener;
++	private View.OnFocusChangeListener focusChangeListener;
++	private CharSequence query = "";
++	private CharSequence queryHint;
++	private boolean iconifiedByDefault = true;
++	private boolean iconified = true;
++	private boolean submitButtonEnabled;
++	private int imeOptions;
++	private int inputType;
++	private int maxWidth;
++
++	public SearchView(Context context) {
++		this(context, null);
++	}
++
++	public SearchView(Context context, AttributeSet attrs) {
++		this(context, attrs, 0);
++	}
++
++	public SearchView(Context context, AttributeSet attrs, int defStyleAttr) {
++		super(context, attrs, defStyleAttr);
++	}
++
++	public void setOnQueryTextListener(OnQueryTextListener listener) { queryTextListener = listener; }
++	public void setOnCloseListener(OnCloseListener listener) { closeListener = listener; }
++	public void setOnSuggestionListener(OnSuggestionListener listener) { suggestionListener = listener; }
++	public void setOnQueryTextFocusChangeListener(View.OnFocusChangeListener listener) { focusChangeListener = listener; }
++	public void setOnSearchClickListener(View.OnClickListener listener) {}
++
++	public CharSequence getQuery() { return query; }
++	public void setQuery(CharSequence text, boolean submit) {
++		query = text != null ? text : "";
++		if (queryTextListener != null) {
++			queryTextListener.onQueryTextChange(query.toString());
++			if (submit)
++				queryTextListener.onQueryTextSubmit(query.toString());
++		}
++	}
++	public void setQueryHint(CharSequence hint) { queryHint = hint; }
++	public CharSequence getQueryHint() { return queryHint; }
++
++	public void setIconifiedByDefault(boolean iconified) { iconifiedByDefault = iconified; this.iconified = iconified; }
++	public boolean isIconifiedByDefault() { return iconifiedByDefault; }
++	public void setIconified(boolean iconify) {
++		iconified = iconify;
++		if (iconify && closeListener != null)
++			closeListener.onClose();
++	}
++	public boolean isIconified() { return iconified; }
++	public void onActionViewExpanded() { iconified = false; }
++	public void onActionViewCollapsed() { iconified = true; }
++
++	public void setSubmitButtonEnabled(boolean enabled) { submitButtonEnabled = enabled; }
++	public boolean isSubmitButtonEnabled() { return submitButtonEnabled; }
++	public void setQueryRefinementEnabled(boolean enable) {}
++	public boolean isQueryRefinementEnabled() { return false; }
++	public void setImeOptions(int imeOptions) { this.imeOptions = imeOptions; }
++	public int getImeOptions() { return imeOptions; }
++	public void setInputType(int inputType) { this.inputType = inputType; }
++	public int getInputType() { return inputType; }
++	public void setMaxWidth(int maxpixels) { maxWidth = maxpixels; }
++	public int getMaxWidth() { return maxWidth; }
++	public void setSuggestionsAdapter(Object adapter) {}
++	public Object getSuggestionsAdapter() { return null; }
++	public void setSearchableInfo(Object searchable) {}
++}
+--- a/src/api-impl/meson.build
++++ b/src/api-impl/meson.build
+@@ -777,6 +777,7 @@
+ 	'android/widget/RemoteViews.java',
+ 	'android/widget/Scroller.java',
+ 	'android/widget/ScrollView.java',
++	'android/widget/SearchView.java',
+ 	'android/widget/SectionIndexer.java',
+ 	'android/widget/SeekBar.java',
+ 	'android/widget/SimpleAdapter.java',

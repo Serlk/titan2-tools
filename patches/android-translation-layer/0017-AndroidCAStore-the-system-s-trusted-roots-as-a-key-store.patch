@@ -1,0 +1,232 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] AndroidCAStore: the system's trusted roots as a key store
+
+KeyStore.getInstance("AndroidCAStore") did not exist. Applications use it
+to list the certificate authorities the system trusts (to pin, to show
+them, or to write a bundle for a TLS library they bring along). The store
+is read-only and holds the roots of the host system, read from its CA
+bundle (SSL_CERT_FILE or the usual bundle paths), so it follows the
+distribution's updates; aliases are "system:" plus the name the
+certificate has in Android's hashed certificate directory (old subject
+hash and a counter).
+
+The message "app trying to access /system/..., which will certainly fail"
+is no longer printed for a path that exists: the certificate directory
+/system/etc/security/cacerts is a real directory on a system set up for
+Android applications.
+
+---
+  src/api-impl/android/content/Context.java                  |   1 +
+  src/api-impl/android/security/keystore/AndroidCAStore.java | 164 +++++++++++++++++++++++++++++++++
+  src/api-impl/meson.build                                   |   1 +
+  src/main-executable/libc_bio_path_overrides.c              |   3 +-
+  4 files changed, 168 insertions(+), 1 deletion(-)
+
+diff --git a/src/api-impl/android/content/Context.java b/src/api-impl/android/content/Context.java
+index 25b21be..f3c04ed 100644
+--- a/src/api-impl/android/content/Context.java
++++ b/src/api-impl/android/content/Context.java
+@@ -136,6 +136,7 @@ public abstract class Context {
+ 
+ 		Provider provider = new Provider("AndroidKeyStore", 1.0, "Android KeyStore provider") {};
+ 		provider.put("KeyStore.AndroidKeyStore", "android.security.keystore.AndroidKeyStore");
++		provider.put("KeyStore.AndroidCAStore", "android.security.keystore.AndroidCAStore");
+ 		provider.put("KeyGenerator.AES", "android.security.keystore.KeyGenerator$AES");
+ 		provider.put("KeyGenerator.HmacSHA512", "android.security.keystore.KeyGenerator$HmacSHA512");
+ 		Security.addProvider(provider);
+diff --git a/src/api-impl/android/security/keystore/AndroidCAStore.java b/src/api-impl/android/security/keystore/AndroidCAStore.java
+new file mode 100644
+index 0000000..f0b2f86
+--- /dev/null
++++ b/src/api-impl/android/security/keystore/AndroidCAStore.java
+@@ -0,0 +1,164 @@
++package android.security.keystore;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.security.Key;
++import java.security.KeyStoreException;
++import java.security.KeyStoreSpi;
++import java.security.MessageDigest;
++import java.security.cert.Certificate;
++import java.security.cert.CertificateFactory;
++import java.security.cert.X509Certificate;
++import java.util.Collections;
++import java.util.Date;
++import java.util.Enumeration;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * The KeyStore type "AndroidCAStore": the certificate authorities the system trusts, read-only.
++ * They are the roots of the host system (its CA bundle, kept current by the distribution), under
++ * the aliases Android gives them: "system:" and the name the certificate has in the hashed
++ * certificate directory.
++ */
++public class AndroidCAStore extends KeyStoreSpi {
++	private static final String[] BUNDLES = {
++		"/etc/ssl/certs/ca-certificates.crt", // Alpine, Debian
++		"/etc/pki/tls/certs/ca-bundle.crt",   // Fedora
++		"/etc/ssl/ca-bundle.pem",             // openSUSE
++		"/etc/ssl/cert.pem",
++	};
++
++	private static Map<String, X509Certificate> cached;
++	private static long cachedStamp;
++
++	/** the name of the certificate's file in a hashed directory, without the counter: eight hex digits */
++	static String subjectHash(X509Certificate cert) throws java.security.GeneralSecurityException {
++		byte[] md5 = MessageDigest.getInstance("MD5").digest(cert.getSubjectX500Principal().getEncoded());
++		return String.format("%02x%02x%02x%02x", md5[3] & 0xff, md5[2] & 0xff, md5[1] & 0xff, md5[0] & 0xff);
++	}
++
++	private static synchronized Map<String, X509Certificate> roots() {
++		File bundle = null;
++		String env = System.getenv("SSL_CERT_FILE");
++		if (env != null && new File(env).isFile())
++			bundle = new File(env);
++		for (int i = 0; bundle == null && i < BUNDLES.length; i++) {
++			if (new File(BUNDLES[i]).isFile())
++				bundle = new File(BUNDLES[i]);
++		}
++		if (bundle == null)
++			return Collections.emptyMap();
++		long stamp = bundle.lastModified() ^ bundle.length();
++		if (cached != null && stamp == cachedStamp)
++			return cached;
++		Map<String, X509Certificate> out = new LinkedHashMap<>();
++		try (InputStream in = new FileInputStream(bundle)) {
++			for (Certificate c : CertificateFactory.getInstance("X.509").generateCertificates(in)) {
++				if (!(c instanceof X509Certificate))
++					continue;
++				X509Certificate cert = (X509Certificate)c;
++				String hash = subjectHash(cert);
++				int n = 0;
++				while (out.containsKey("system:" + hash + "." + n))
++					n++;
++				out.put("system:" + hash + "." + n, cert);
++			}
++		} catch (IOException | java.security.GeneralSecurityException e) {
++			android.util.Slog.e("AndroidCAStore", "cannot read " + bundle, e);
++		}
++		cached = out;
++		cachedStamp = stamp;
++		return out;
++	}
++
++	@Override
++	public Key engineGetKey(String alias, char[] password) {
++		return null;
++	}
++
++	@Override
++	public Certificate[] engineGetCertificateChain(String alias) {
++		return null;
++	}
++
++	@Override
++	public Certificate engineGetCertificate(String alias) {
++		return alias == null ? null : roots().get(alias);
++	}
++
++	@Override
++	public Date engineGetCreationDate(String alias) {
++		X509Certificate cert = alias == null ? null : roots().get(alias);
++		return cert == null ? null : cert.getNotBefore();
++	}
++
++	@Override
++	public void engineSetKeyEntry(String alias, Key key, char[] password, Certificate[] chain) {
++		throw new UnsupportedOperationException("the system certificate store is read-only");
++	}
++
++	@Override
++	public void engineSetKeyEntry(String alias, byte[] key, Certificate[] chain) {
++		throw new UnsupportedOperationException("the system certificate store is read-only");
++	}
++
++	@Override
++	public void engineSetCertificateEntry(String alias, Certificate cert) {
++		throw new UnsupportedOperationException("the system certificate store is read-only");
++	}
++
++	@Override
++	public void engineDeleteEntry(String alias) throws KeyStoreException {
++		throw new UnsupportedOperationException("the system certificate store is read-only");
++	}
++
++	@Override
++	public Enumeration<String> engineAliases() {
++		return Collections.enumeration(roots().keySet());
++	}
++
++	@Override
++	public boolean engineContainsAlias(String alias) {
++		return alias != null && roots().containsKey(alias);
++	}
++
++	@Override
++	public int engineSize() {
++		return roots().size();
++	}
++
++	@Override
++	public boolean engineIsKeyEntry(String alias) {
++		return false;
++	}
++
++	@Override
++	public boolean engineIsCertificateEntry(String alias) {
++		return engineContainsAlias(alias);
++	}
++
++	@Override
++	public String engineGetCertificateAlias(Certificate cert) {
++		for (Map.Entry<String, X509Certificate> e : roots().entrySet()) {
++			if (e.getValue().equals(cert))
++				return e.getKey();
++		}
++		return null;
++	}
++
++	@Override
++	public void engineStore(OutputStream stream, char[] password) {
++		throw new UnsupportedOperationException("the system certificate store is read-only");
++	}
++
++	@Override
++	public void engineLoad(InputStream stream, char[] password) {
++		if (stream != null)
++			throw new IllegalArgumentException("the system certificate store is not loaded from a stream");
++		roots();
++	}
++}
+diff --git a/src/api-impl/meson.build b/src/api-impl/meson.build
+index acfc69a..ec7089a 100644
+--- a/src/api-impl/meson.build
++++ b/src/api-impl/meson.build
+@@ -485,6 +485,7 @@ srcs = [
+ 	'android/provider/Settings.java',
+ 	'android/provider/Telephony.java',
+ 	'android/provider/UserDictionary.java',
++	'android/security/keystore/AndroidCAStore.java',
+ 	'android/security/keystore/AndroidKeyStore.java',
+ 	'android/security/keystore/KeyGenerator.java',
+ 	'android/security/keystore/KeyGenParameterSpec.java',
+diff --git a/src/main-executable/libc_bio_path_overrides.c b/src/main-executable/libc_bio_path_overrides.c
+index e055ce0..14ea724 100644
+--- a/src/main-executable/libc_bio_path_overrides.c
++++ b/src/main-executable/libc_bio_path_overrides.c
+@@ -124,7 +124,8 @@ bool apply_path_overrides(char **path)
+ 		free_path = true;
+ 	}
+ 
+-	if (starts_with(*path, "/system/") || starts_with(*path, "/data/")) {
++	/* paths this system really has (the trusted certificates in /system/etc/security/cacerts) are fine */
++	if ((starts_with(*path, "/system/") || starts_with(*path, "/data/")) && !file_exists(*path)) {
+ 		fprintf(stderr, "%s: !!! app trying to access >%s<, which will certainly fail\n", __func__, *path);
+ 		fflush(stderr);
+ 	}

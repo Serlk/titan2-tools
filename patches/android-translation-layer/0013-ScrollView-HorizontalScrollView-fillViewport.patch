@@ -1,0 +1,115 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] ScrollView, HorizontalScrollView: fillViewport
+
+fillViewport was ignored. A text editor that puts an empty EditText of
+wrap_content width into a HorizontalScrollView inside a ScrollView, both
+with fillViewport, got a field of no width: nothing to touch, no focus, no
+visible text. A child smaller than the viewport is now measured again at
+the viewport's size, as the attribute asks (width for the horizontal view,
+height for the vertical one); the attribute is read from the layout and
+setFillViewport/isFillViewport work.
+
+---
+  src/api-impl/android/widget/HorizontalScrollView.java | 31 ++++++++++++++++++++++++++++++-
+  src/api-impl/android/widget/ScrollView.java           | 24 +++++++++++++++++++++++-
+  2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/src/api-impl/android/widget/HorizontalScrollView.java b/src/api-impl/android/widget/HorizontalScrollView.java
+index aecddf8..022f356 100644
+--- a/src/api-impl/android/widget/HorizontalScrollView.java
++++ b/src/api-impl/android/widget/HorizontalScrollView.java
+@@ -2,8 +2,11 @@ package android.widget;
+ 
+ import android.content.Context;
+ import android.util.AttributeSet;
++import android.view.View;
++import android.view.ViewGroup;
+ 
+ public class HorizontalScrollView extends FrameLayout {
++	private boolean atl_fill_viewport;
+ 
+ 	public HorizontalScrollView(Context context) {
+ 		super(context);
+@@ -11,11 +14,37 @@ public class HorizontalScrollView extends FrameLayout {
+ 
+ 	public HorizontalScrollView(Context context, AttributeSet attributeSet) {
+ 		super(context, attributeSet);
++		if (attributeSet != null)
++			atl_fill_viewport = attributeSet.getAttributeBooleanValue("http://schemas.android.com/apk/res/android", "fillViewport", false);
+ 	}
+ 
+ 	public void setHorizontalScrollBarEnabled(boolean enabled) {}
+ 
+ 	public void smoothScrollTo(int x, int y) {}
+ 
+-	public void setFillViewport(boolean fillViewport) {}
++	public boolean isFillViewport() {
++		return atl_fill_viewport;
++	}
++
++	public void setFillViewport(boolean fillViewport) {
++		if (fillViewport != atl_fill_viewport) {
++			atl_fill_viewport = fillViewport;
++			requestLayout();
++		}
++	}
++
++	/** with fillViewport a child narrower than the view is stretched to its width (an empty text field, for one) */
++	@Override
++	protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
++		super.onMeasure(widthMeasureSpec, heightMeasureSpec);
++		if (!atl_fill_viewport || MeasureSpec.getMode(widthMeasureSpec) == MeasureSpec.UNSPECIFIED || getChildCount() == 0)
++			return;
++		View child = getChildAt(0);
++		int width = getMeasuredWidth() - getPaddingLeft() - getPaddingRight();
++		if (child.getMeasuredWidth() < width) {
++			ViewGroup.LayoutParams lp = child.getLayoutParams();
++			int childHeightMeasureSpec = getChildMeasureSpec(heightMeasureSpec, getPaddingTop() + getPaddingBottom(), lp.height);
++			child.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), childHeightMeasureSpec);
++		}
++	}
+ }
+diff --git a/src/api-impl/android/widget/ScrollView.java b/src/api-impl/android/widget/ScrollView.java
+index d85e933..570b315 100644
+--- a/src/api-impl/android/widget/ScrollView.java
++++ b/src/api-impl/android/widget/ScrollView.java
+@@ -9,6 +9,8 @@ import android.view.ViewGroup;
+ public class ScrollView extends FrameLayout {
+ 	public ScrollView(Context context, AttributeSet attrs) {
+ 		super(context, attrs);
++		if (attrs != null)
++			atl_fill_viewport = attrs.getAttributeBooleanValue("http://schemas.android.com/apk/res/android", "fillViewport", false);
+ 	}
+ 
+ 	public ScrollView(Context context) {
+@@ -46,9 +48,29 @@ public class ScrollView extends FrameLayout {
+ 			height = child.getMeasuredHeight();
+ 		}
+ 		setMeasuredDimension(resolveSize(width, widthMeasureSpec), resolveSize(height, heightMeasureSpec));
++		// with fillViewport a child shorter than the view is stretched to its height
++		if (atl_fill_viewport && getChildCount() > 0 && MeasureSpec.getMode(heightMeasureSpec) != MeasureSpec.UNSPECIFIED) {
++			View child = getChildAt(0);
++			int fill = getMeasuredHeight() - getPaddingTop() - getPaddingBottom();
++			if (child.getMeasuredHeight() < fill) {
++				int childWidthMeasureSpec = getChildMeasureSpec(widthMeasureSpec, getPaddingLeft() + getPaddingRight(), child.getLayoutParams().width);
++				child.measure(childWidthMeasureSpec, MeasureSpec.makeMeasureSpec(fill, MeasureSpec.EXACTLY));
++			}
++		}
+ 	}
+ 
+-	public void setFillViewport(boolean fillViewport) {}
++	private boolean atl_fill_viewport;
++
++	public boolean isFillViewport() {
++		return atl_fill_viewport;
++	}
++
++	public void setFillViewport(boolean fillViewport) {
++		if (fillViewport != atl_fill_viewport) {
++			atl_fill_viewport = fillViewport;
++			requestLayout();
++		}
++	}
+ 
+ 	public boolean fullScroll(int direction) {
+ 		return true;

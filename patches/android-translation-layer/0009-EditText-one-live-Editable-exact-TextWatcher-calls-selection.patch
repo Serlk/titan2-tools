@@ -1,0 +1,1067 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] EditText: one live Editable, exact TextWatcher calls, selection, several lines
+
+getText() returned a fresh copy of the widget's text on every call, the
+selection always read as 0, a TextWatcher was told "everything changed"
+after each key, and the widget was a single-line GtkText.
+
+The text now lives in one Editable that the application gets from
+getText() and may change. Changes typed into the widget and changes made
+through the Editable reach the watchers once each, as
+beforeTextChanged/onTextChanged/afterTextChanged with the start and
+lengths of that change in UTF-16 units, and both sides show the same text
+afterwards (positions cross JNI in code points). The selection is kept in
+the Editable's Selection spans in both directions: setSelection, selectAll,
+getSelectionStart/End and Selection.* agree with the cursor on screen.
+InputFilters are applied to typed text.
+
+The widget is a GtkTextView unless the field is single-line (singleLine,
+an inputType without the multi-line flag, a password): then it stays a
+GtkText, which can hide the input and reports the editor action. A touch
+gives the field the keyboard focus; focus changes reach
+OnFocusChangeListener.
+
+Editable gains the methods of the interfaces it has on Android (GetChars,
+Spannable, Appendable).
+
+---
+  src/api-impl-jni/generated_headers/android_widget_EditText.h |  74 +++---
+  src/api-impl-jni/widgets/android_widget_EditText.c           | 319 +++++++++++++++++++------
+  src/api-impl/android/text/Editable.java                      |  12 +-
+  src/api-impl/android/view/View.java                          |   9 +-
+  src/api-impl/android/widget/EditText.java                    | 398 +++++++++++++++++++++++++++++--
+  src/main-executable/css/default-stylesheet.css               |   7 +
+  6 files changed, 698 insertions(+), 121 deletions(-)
+
+diff --git a/src/api-impl-jni/generated_headers/android_widget_EditText.h b/src/api-impl-jni/generated_headers/android_widget_EditText.h
+index 11466be..cb0fa30 100644
+--- a/src/api-impl-jni/generated_headers/android_widget_EditText.h
++++ b/src/api-impl-jni/generated_headers/android_widget_EditText.h
+@@ -211,13 +211,35 @@ extern "C" {
+ #define android_widget_EditText_TEXT_DIRECTION_LTR 3L
+ #undef android_widget_EditText_TEXT_DIRECTION_RTL
+ #define android_widget_EditText_TEXT_DIRECTION_RTL 4L
++#undef android_widget_EditText_TYPE_MASK_CLASS
++#define android_widget_EditText_TYPE_MASK_CLASS 15L
++#undef android_widget_EditText_TYPE_MASK_VARIATION
++#define android_widget_EditText_TYPE_MASK_VARIATION 4080L
++#undef android_widget_EditText_TYPE_CLASS_TEXT
++#define android_widget_EditText_TYPE_CLASS_TEXT 1L
++#undef android_widget_EditText_TYPE_CLASS_NUMBER
++#define android_widget_EditText_TYPE_CLASS_NUMBER 2L
++#undef android_widget_EditText_TYPE_CLASS_PHONE
++#define android_widget_EditText_TYPE_CLASS_PHONE 3L
++#undef android_widget_EditText_TYPE_TEXT_FLAG_MULTI_LINE
++#define android_widget_EditText_TYPE_TEXT_FLAG_MULTI_LINE 131072L
++#undef android_widget_EditText_TYPE_TEXT_VARIATION_URI
++#define android_widget_EditText_TYPE_TEXT_VARIATION_URI 16L
++#undef android_widget_EditText_TYPE_TEXT_VARIATION_EMAIL_ADDRESS
++#define android_widget_EditText_TYPE_TEXT_VARIATION_EMAIL_ADDRESS 32L
++#undef android_widget_EditText_TYPE_TEXT_VARIATION_PASSWORD
++#define android_widget_EditText_TYPE_TEXT_VARIATION_PASSWORD 128L
++#undef android_widget_EditText_TYPE_TEXT_VARIATION_WEB_PASSWORD
++#define android_widget_EditText_TYPE_TEXT_VARIATION_WEB_PASSWORD 224L
++#undef android_widget_EditText_TYPE_NUMBER_VARIATION_PASSWORD
++#define android_widget_EditText_TYPE_NUMBER_VARIATION_PASSWORD 16L
+ /*
+  * Class:     android_widget_EditText
+- * Method:    native_constructor
+- * Signature: (Landroid/content/Context;Landroid/util/AttributeSet;)J
++ * Method:    native_create
++ * Signature: (Z)J
+  */
+-JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1constructor
+-  (JNIEnv *, jobject, jobject, jobject);
++JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1create
++  (JNIEnv *, jobject, jboolean);
+ 
+ /*
+  * Class:     android_widget_EditText
+@@ -229,51 +251,43 @@ JNIEXPORT jstring JNICALL Java_android_widget_EditText_native_1getText
+ 
+ /*
+  * Class:     android_widget_EditText
+- * Method:    native_addTextChangedListener
+- * Signature: (JLandroid/text/TextWatcher;)V
++ * Method:    native_replace
++ * Signature: (JIILjava/lang/String;)V
+  */
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1addTextChangedListener
+-  (JNIEnv *, jobject, jlong, jobject);
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1replace
++  (JNIEnv *, jobject, jlong, jint, jint, jstring);
+ 
+ /*
+  * Class:     android_widget_EditText
+- * Method:    native_removeTextChangedListener
+- * Signature: (JLandroid/text/TextWatcher;)V
++ * Method:    native_setSelection
++ * Signature: (JII)V
+  */
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1removeTextChangedListener
+-  (JNIEnv *, jobject, jlong, jobject);
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setSelection
++  (JNIEnv *, jobject, jlong, jint, jint);
+ 
+ /*
+  * Class:     android_widget_EditText
+- * Method:    native_setOnEditorActionListener
+- * Signature: (JLandroid/widget/TextView/OnEditorActionListener;)V
++ * Method:    native_getSelection
++ * Signature: (J)J
+  */
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setOnEditorActionListener
+-  (JNIEnv *, jobject, jlong, jobject);
+-
+-/*
+- * Class:     android_widget_EditText
+- * Method:    native_setText
+- * Signature: (JLjava/lang/String;)V
+- */
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setText
+-  (JNIEnv *, jobject, jlong, jstring);
++JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1getSelection
++  (JNIEnv *, jobject, jlong);
+ 
+ /*
+  * Class:     android_widget_EditText
+  * Method:    native_setHint
+- * Signature: (JLjava/lang/CharSequence;)V
++ * Signature: (JLjava/lang/String;)V
+  */
+ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setHint
+-  (JNIEnv *, jobject, jlong, jobject);
++  (JNIEnv *, jobject, jlong, jstring);
+ 
+ /*
+  * Class:     android_widget_EditText
+- * Method:    native_getHint
+- * Signature: (J)Ljava/lang/CharSequence;
++ * Method:    native_setInputMode
++ * Signature: (JZIZ)V
+  */
+-JNIEXPORT jobject JNICALL Java_android_widget_EditText_native_1getHint
+-  (JNIEnv *, jobject, jlong);
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setInputMode
++  (JNIEnv *, jobject, jlong, jboolean, jint, jboolean);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/api-impl-jni/widgets/android_widget_EditText.c b/src/api-impl-jni/widgets/android_widget_EditText.c
+index d53bc4f..f61a830 100644
+--- a/src/api-impl-jni/widgets/android_widget_EditText.c
++++ b/src/api-impl-jni/widgets/android_widget_EditText.c
+@@ -7,117 +7,302 @@
+ 
+ #include "../generated_headers/android_widget_EditText.h"
+ 
+-JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1constructor(JNIEnv *env, jobject this, jobject context, jobject attrs)
++/*
++ * The editing widget is a GtkText for a single line (it can hide a password and has an
++ * "activate" for the editor action) and a GtkTextView for several lines. The text itself is owned
++ * by the Java side (android.widget.EditText keeps the Editable the application works on); this file
++ * reports what the user did to the widget and applies what the application did to the Editable.
++ * All positions crossing JNI are counted in Unicode code points, as GTK counts them.
++ */
++
++struct edit_state {
++	jobject this; /* weak */
++	GObject *source; /* what emits the text signals: the GtkText, or the buffer of the GtkTextView */
++	int del_start;
++	int del_end;
++};
++
++static struct edit_state *edit_state_get(GtkWidget *widget)
+ {
+-	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
+-	GtkWidget *gtk_text = gtk_text_new();
+-	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), gtk_text);
+-	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
+-	wrapper_widget_register_invalidation_listener(WRAPPER_WIDGET(wrapper));
+-	return _INTPTR(gtk_text);
++	return g_object_get_data(G_OBJECT(widget), "atl_edit_state");
+ }
+ 
+-JNIEXPORT jstring JNICALL Java_android_widget_EditText_native_1getText(JNIEnv *env, jobject this, jlong widget_ptr)
++static void get_bounds(GtkWidget *widget, int *start, int *end)
+ {
+-	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
+-	const char *text = gtk_entry_buffer_get_text(gtk_text_get_buffer(gtk_text));
+-	return _JSTRING(text);
++	if (GTK_IS_TEXT_VIEW(widget)) {
++		GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
++		GtkTextIter a, b;
++		gtk_text_buffer_get_selection_bounds(buffer, &a, &b);
++		*start = gtk_text_iter_get_offset(&a);
++		*end = gtk_text_iter_get_offset(&b);
++	} else {
++		if (!gtk_editable_get_selection_bounds(GTK_EDITABLE(widget), start, end))
++			*start = *end = gtk_editable_get_position(GTK_EDITABLE(widget));
++	}
+ }
+ 
+-struct changed_callback_data {
+-	jobject this;
+-	jobject listener;
+-	jmethodID getText;
+-};
+-
+-static void changed_cb(GtkEditable *self, jobject listener)
++static void call_replaced(GtkWidget *widget, int start, int end, const char *text)
+ {
++	struct edit_state *state = edit_state_get(widget);
+ 	JNIEnv *env = get_jni_env();
+-
+-	const char *text = gtk_editable_get_text(self);
+-	jobject text_obj = J_new__SpannableStringBuilder(env, _JSTRING(text));
+-	J__TextWatcher__onTextChanged(env, listener, text_obj, 0, 0, strlen(text));
++	jobject this = (*env)->NewLocalRef(env, state->this);
++	if (!this)
++		return;
++	jmethodID method = _METHOD(_CLASS(this), "atl_gtk_replaced", "(IILjava/lang/String;)V");
++	(*env)->CallVoidMethod(env, this, method, start, end, _JSTRING(text));
+ 	if ((*env)->ExceptionCheck(env))
+ 		(*env)->ExceptionDescribe(env);
+-	J__TextWatcher__afterTextChanged(env, listener, text_obj);
++	(*env)->DeleteLocalRef(env, this);
++}
++
++static void call_selection(GtkWidget *widget)
++{
++	struct edit_state *state = edit_state_get(widget);
++	JNIEnv *env = get_jni_env();
++	jobject this = (*env)->NewLocalRef(env, state->this);
++	int start, end;
++	if (!this)
++		return;
++	get_bounds(widget, &start, &end);
++	jmethodID method = _METHOD(_CLASS(this), "atl_gtk_selection", "(II)V");
++	(*env)->CallVoidMethod(env, this, method, start, end);
+ 	if ((*env)->ExceptionCheck(env))
+ 		(*env)->ExceptionDescribe(env);
++	(*env)->DeleteLocalRef(env, this);
+ }
+ 
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1addTextChangedListener(JNIEnv *env, jobject this, jlong widget_ptr, jobject listener)
++/* --- several lines: GtkTextBuffer --- */
++
++static void buffer_insert_after(GtkTextBuffer *buffer, GtkTextIter *location, char *text, int len, GtkWidget *widget)
+ {
+-	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
+-	listener = _REF(listener);
++	char *copy = g_strndup(text, len < 0 ? strlen(text) : len);
++	int end = gtk_text_iter_get_offset(location);
++	int count = g_utf8_strlen(copy, -1);
++	call_replaced(widget, end - count, end - count, copy);
++	g_free(copy);
++}
+ 
+-	GList *listeners = g_object_get_data(G_OBJECT(gtk_text), "text_changed_listeners");
+-	listeners = g_list_append(listeners, listener);
+-	g_object_set_data(G_OBJECT(gtk_text), "text_changed_listeners", listeners);
+-	g_signal_connect(GTK_EDITABLE(gtk_text), "changed", G_CALLBACK(changed_cb), listener);
++static void buffer_delete_before(GtkTextBuffer *buffer, GtkTextIter *start, GtkTextIter *end, GtkWidget *widget)
++{
++	struct edit_state *state = edit_state_get(widget);
++	state->del_start = gtk_text_iter_get_offset(start);
++	state->del_end = gtk_text_iter_get_offset(end);
+ }
+ 
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1removeTextChangedListener(JNIEnv *env, jobject this, jlong widget_ptr, jobject listener)
++static void buffer_delete_after(GtkTextBuffer *buffer, GtkTextIter *start, GtkTextIter *end, GtkWidget *widget)
+ {
+-	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
++	struct edit_state *state = edit_state_get(widget);
++	if (state->del_end > state->del_start)
++		call_replaced(widget, state->del_start, state->del_end, "");
++}
+ 
+-	GList *listeners = g_object_get_data(G_OBJECT(gtk_text), "text_changed_listeners");
+-	GList *l;
+-	for (l = listeners; l != NULL; l = l->next) {
+-		if ((*env)->IsSameObject(env, l->data, listener)) {
+-			g_signal_handlers_disconnect_by_func(GTK_EDITABLE(gtk_text), changed_cb, l->data);
+-			_UNREF(l->data);
+-			listeners = g_list_delete_link(listeners, l);
+-			break;
+-		}
+-	}
+-	g_object_set_data(G_OBJECT(gtk_text), "text_changed_listeners", listeners);
++static void buffer_mark_set(GtkTextBuffer *buffer, GtkTextIter *location, GtkTextMark *mark, GtkWidget *widget)
++{
++	if (mark == gtk_text_buffer_get_insert(buffer) || mark == gtk_text_buffer_get_selection_bound(buffer))
++		call_selection(widget);
++}
++
++/* --- one line: GtkText as a GtkEditable --- */
++
++static void text_insert_after(GtkEditable *editable, char *text, int len, int *position, GtkWidget *widget)
++{
++	char *copy = g_strndup(text, len < 0 ? strlen(text) : len);
++	int count = g_utf8_strlen(copy, -1);
++	call_replaced(widget, *position - count, *position - count, copy);
++	g_free(copy);
++}
++
++static void text_delete_before(GtkEditable *editable, int start, int end, GtkWidget *widget)
++{
++	struct edit_state *state = edit_state_get(widget);
++	int length = gtk_entry_buffer_get_length(gtk_text_get_buffer(GTK_TEXT(widget)));
++	if (end < 0 || end > length)
++		end = length;
++	state->del_start = MIN(start, end);
++	state->del_end = end;
++}
++
++static void text_delete_after(GtkEditable *editable, int start, int end, GtkWidget *widget)
++{
++	struct edit_state *state = edit_state_get(widget);
++	if (state->del_end > state->del_start)
++		call_replaced(widget, state->del_start, state->del_end, "");
++}
++
++static void text_cursor_notify(GObject *object, GParamSpec *pspec, GtkWidget *widget)
++{
++	call_selection(widget);
+ }
+ 
+-#define IME_ACTION_SEARCH 3
+-#define KEYCODE_ENTER     66
++#define IME_ACTION_UNSPECIFIED 0
++#define KEYCODE_ENTER          66
+ 
+-static void on_activate(GtkText *gtk_text, struct changed_callback_data *d)
++static void text_activate(GtkText *gtk_text, GtkWidget *widget)
+ {
++	struct edit_state *state = edit_state_get(widget);
+ 	JNIEnv *env = get_jni_env();
++	jobject this = (*env)->NewLocalRef(env, state->this);
++	if (!this)
++		return;
++	jmethodID method = _METHOD(_CLASS(this), "atl_gtk_activate", "()V");
++	(*env)->CallVoidMethod(env, this, method);
++	if ((*env)->ExceptionCheck(env))
++		(*env)->ExceptionDescribe(env);
++	(*env)->DeleteLocalRef(env, this);
++}
+ 
+-	jobject key_event = J_new__KeyEvent(env, (jlong)0, (jlong)0, IME_ACTION_SEARCH, KEYCODE_ENTER, 0, 0);
+-	J__TextView__OnEditorActionListener__onEditorAction(env, d->listener, d->this, 0, key_event);
++static void focus_notify(GtkEventControllerFocus *controller, GParamSpec *pspec, GtkWidget *widget)
++{
++	struct edit_state *state = edit_state_get(widget);
++	JNIEnv *env = get_jni_env();
++	jobject this = (*env)->NewLocalRef(env, state->this);
++	if (!this)
++		return;
++	jmethodID method = _METHOD(_CLASS(this), "atl_gtk_focus", "(Z)V");
++	(*env)->CallVoidMethod(env, this, method, gtk_event_controller_focus_contains_focus(controller));
+ 	if ((*env)->ExceptionCheck(env))
+ 		(*env)->ExceptionDescribe(env);
++	(*env)->DeleteLocalRef(env, this);
+ }
+ 
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setOnEditorActionListener(JNIEnv *env, jobject this, jlong widget_ptr, jobject listener)
++static void edit_state_free(gpointer data)
+ {
+-	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
++	struct edit_state *state = data;
++	JNIEnv *env = get_jni_env();
++	(*env)->DeleteWeakGlobalRef(env, state->this);
++	g_free(state);
++}
+ 
+-	if (!listener)
+-		return;
++JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1create(JNIEnv *env, jobject this, jboolean single_line)
++{
++	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
++	GtkWidget *widget;
++	struct edit_state *state = g_new0(struct edit_state, 1);
+ 
+-	struct changed_callback_data *callback_data = malloc(sizeof(struct changed_callback_data));
+-	callback_data->this = _WEAK_REF(this);
+-	callback_data->listener = _REF(listener);
++	state->this = _WEAK_REF(this);
++	if (single_line) {
++		widget = gtk_text_new();
++		state->source = G_OBJECT(widget);
++		g_object_set_data_full(G_OBJECT(widget), "atl_edit_state", state, edit_state_free);
++		g_signal_connect_after(widget, "insert-text", G_CALLBACK(text_insert_after), widget);
++		g_signal_connect(widget, "delete-text", G_CALLBACK(text_delete_before), widget);
++		g_signal_connect_after(widget, "delete-text", G_CALLBACK(text_delete_after), widget);
++		g_signal_connect(widget, "notify::cursor-position", G_CALLBACK(text_cursor_notify), widget);
++		g_signal_connect(widget, "notify::selection-bound", G_CALLBACK(text_cursor_notify), widget);
++		g_signal_connect(widget, "activate", G_CALLBACK(text_activate), widget);
++	} else {
++		widget = gtk_text_view_new();
++		gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(widget), GTK_WRAP_WORD_CHAR);
++		gtk_widget_add_css_class(widget, "atl-edit");
++		GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
++		state->source = G_OBJECT(buffer);
++		g_object_set_data_full(G_OBJECT(widget), "atl_edit_state", state, edit_state_free);
++		g_signal_connect_after(buffer, "insert-text", G_CALLBACK(buffer_insert_after), widget);
++		g_signal_connect(buffer, "delete-range", G_CALLBACK(buffer_delete_before), widget);
++		g_signal_connect_after(buffer, "delete-range", G_CALLBACK(buffer_delete_after), widget);
++		g_signal_connect_after(buffer, "mark-set", G_CALLBACK(buffer_mark_set), widget);
++	}
++	GtkEventController *focus = gtk_event_controller_focus_new();
++	g_signal_connect(focus, "notify::contains-focus", G_CALLBACK(focus_notify), widget);
++	gtk_widget_add_controller(widget, focus);
+ 
+-	g_signal_handlers_disconnect_matched(gtk_text, G_SIGNAL_MATCH_FUNC, 0, 0, NULL, on_activate, NULL);
+-	g_signal_connect(gtk_text, "activate", G_CALLBACK(on_activate), callback_data);
++	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), widget);
++	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
++	wrapper_widget_register_invalidation_listener(WRAPPER_WIDGET(wrapper));
++	return _INTPTR(widget);
+ }
+ 
+-JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setText(JNIEnv *env, jobject this, jlong widget_ptr, jstring text_jstr)
++JNIEXPORT jstring JNICALL Java_android_widget_EditText_native_1getText(JNIEnv *env, jobject this, jlong widget_ptr)
+ {
+-	const char *gtk_text = (*env)->GetStringUTFChars(env, text_jstr, NULL);
+-	jsize length = (*env)->GetStringUTFLength(env, text_jstr);
+-	gtk_entry_buffer_set_text(gtk_text_get_buffer(GTK_TEXT(_PTR(widget_ptr))), gtk_text, length);
+-	(*env)->ReleaseStringUTFChars(env, text_jstr, gtk_text);
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	if (GTK_IS_TEXT_VIEW(widget)) {
++		GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
++		GtkTextIter start, end;
++		gtk_text_buffer_get_bounds(buffer, &start, &end);
++		char *text = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
++		jstring ret = _JSTRING(text);
++		g_free(text);
++		return ret;
++	}
++	return _JSTRING(gtk_entry_buffer_get_text(gtk_text_get_buffer(GTK_TEXT(widget))));
++}
++
++/* apply a change the application made to its Editable; the widget's own change signals stay quiet */
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1replace(JNIEnv *env, jobject this, jlong widget_ptr, jint start, jint end, jstring text_jstr)
++{
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	struct edit_state *state = edit_state_get(widget);
++	const char *text = (*env)->GetStringUTFChars(env, text_jstr, NULL);
++
++	g_signal_handlers_block_matched(state->source, G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, widget);
++	if (GTK_IS_TEXT_VIEW(widget)) {
++		GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->source);
++		GtkTextIter a, b;
++		gtk_text_buffer_get_iter_at_offset(buffer, &a, start);
++		gtk_text_buffer_get_iter_at_offset(buffer, &b, end);
++		if (end > start)
++			gtk_text_buffer_delete(buffer, &a, &b);
++		if (*text)
++			gtk_text_buffer_insert(buffer, &a, text, -1);
++	} else {
++		int position = start;
++		if (end > start)
++			gtk_editable_delete_text(GTK_EDITABLE(widget), start, end);
++		if (*text)
++			gtk_editable_insert_text(GTK_EDITABLE(widget), text, -1, &position);
++	}
++	g_signal_handlers_unblock_matched(state->source, G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, widget);
++	(*env)->ReleaseStringUTFChars(env, text_jstr, text);
++}
++
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setSelection(JNIEnv *env, jobject this, jlong widget_ptr, jint start, jint end)
++{
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	struct edit_state *state = edit_state_get(widget);
++
++	g_signal_handlers_block_matched(state->source, G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, widget);
++	if (GTK_IS_TEXT_VIEW(widget)) {
++		GtkTextBuffer *buffer = GTK_TEXT_BUFFER(state->source);
++		GtkTextIter a, b;
++		gtk_text_buffer_get_iter_at_offset(buffer, &a, start);
++		gtk_text_buffer_get_iter_at_offset(buffer, &b, end);
++		/* the cursor ("insert") sits at the end of the selection, as on Android */
++		gtk_text_buffer_select_range(buffer, &b, &a);
++	} else {
++		gtk_editable_select_region(GTK_EDITABLE(widget), start, end);
++	}
++	g_signal_handlers_unblock_matched(state->source, G_SIGNAL_MATCH_DATA, 0, 0, NULL, NULL, widget);
++}
++
++/* selection start in the high word, end in the low word */
++JNIEXPORT jlong JNICALL Java_android_widget_EditText_native_1getSelection(JNIEnv *env, jobject this, jlong widget_ptr)
++{
++	int start, end;
++	get_bounds(GTK_WIDGET(_PTR(widget_ptr)), &start, &end);
++	return ((jlong)start << 32) | (uint32_t)end;
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setHint(JNIEnv *env, jobject this, jlong widget_ptr, jstring text_jstr)
+ {
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	if (!GTK_IS_TEXT(widget))
++		return;
+ 	const char *text = (*env)->GetStringUTFChars(env, text_jstr, NULL);
+-	gtk_text_set_placeholder_text(GTK_TEXT(_PTR(widget_ptr)), text);
++	gtk_text_set_placeholder_text(GTK_TEXT(widget), text);
+ 	(*env)->ReleaseStringUTFChars(env, text_jstr, text);
+ }
+ 
+-JNIEXPORT jstring JNICALL Java_android_widget_EditText_native_1getHint(JNIEnv *env, jobject this, jlong widget_ptr)
++/* purpose: a GtkInputPurpose value */
++JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setInputMode(JNIEnv *env, jobject this, jlong widget_ptr, jboolean hidden, jint purpose, jboolean editable)
+ {
+-	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
+-	const char *text = gtk_text_get_placeholder_text(gtk_text);
+-	return _JSTRING(text);
++	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	if (GTK_IS_TEXT_VIEW(widget)) {
++		gtk_text_view_set_input_purpose(GTK_TEXT_VIEW(widget), purpose);
++		gtk_text_view_set_editable(GTK_TEXT_VIEW(widget), editable);
++		gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(widget), editable);
++	} else {
++		gtk_text_set_visibility(GTK_TEXT(widget), !hidden);
++		gtk_text_set_input_purpose(GTK_TEXT(widget), purpose);
++		gtk_editable_set_editable(GTK_EDITABLE(widget), editable);
++	}
+ }
+diff --git a/src/api-impl/android/text/Editable.java b/src/api-impl/android/text/Editable.java
+index a0eb4ac..dfc4d8c 100644
+--- a/src/api-impl/android/text/Editable.java
++++ b/src/api-impl/android/text/Editable.java
+@@ -1,6 +1,6 @@
+ package android.text;
+ 
+-public interface Editable extends CharSequence {
++public interface Editable extends CharSequence, GetChars, Spannable, Appendable {
+ 
+ 	public class Factory {
+ 		public static Factory getInstance() {
+@@ -24,6 +24,16 @@ public interface Editable extends CharSequence {
+ 
+ 	public Editable insert(int where, CharSequence text);
+ 
++	public Editable insert(int where, CharSequence text, int start, int end);
++
++	public Editable append(CharSequence text);
++
++	public Editable append(CharSequence text, int start, int end);
++
++	public Editable append(char text);
++
++	public void clearSpans();
++
+ 	public void clear();
+ 
+ 	public <T> T[] getSpans(int queryStart, int queryEnd, Class<T> kind);
+diff --git a/src/api-impl/android/view/View.java b/src/api-impl/android/view/View.java
+index c200fbd..507a5f4 100644
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -730,7 +730,7 @@ public class View implements Drawable.Callback {
+ 	}
+ 
+ 	public interface OnFocusChangeListener {
+-		// TODO
++		void onFocusChange(View v, boolean hasFocus);
+ 	}
+ 
+ 	public interface OnCreateContextMenuListener {
+@@ -2087,7 +2087,10 @@ public class View implements Drawable.Callback {
+ 
+ 	public void jumpDrawablesToCurrentState() {}
+ 
+-	public void setOnFocusChangeListener(View.OnFocusChangeListener l) {}
++	private OnFocusChangeListener atl_focus_change_listener;
++	public void setOnFocusChangeListener(View.OnFocusChangeListener l) {
++		atl_focus_change_listener = l;
++	}
+ 
+ 	public boolean hasWindowFocus() { return true; }
+ 
+@@ -2757,7 +2760,7 @@ public class View implements Drawable.Callback {
+ 
+ 	public float getCameraDistance() { return 0; }
+ 
+-	public OnFocusChangeListener getOnFocusChangeListener() { return null; }
++	public OnFocusChangeListener getOnFocusChangeListener() { return atl_focus_change_listener; }
+ 
+ 	public int getTextDirection() { return 0; /* TEXT_DIRECTION_INHERIT */ }
+ 
+diff --git a/src/api-impl/android/widget/EditText.java b/src/api-impl/android/widget/EditText.java
+index 763c2ea..e965be4 100644
+--- a/src/api-impl/android/widget/EditText.java
++++ b/src/api-impl/android/widget/EditText.java
+@@ -1,69 +1,361 @@
+ package android.widget;
+ 
+ import android.content.Context;
++import android.content.res.TypedArray;
+ import android.graphics.drawable.Drawable;
+ import android.text.Editable;
++import android.text.InputFilter;
++import android.text.Selection;
++import android.text.SpanWatcher;
++import android.text.Spannable;
+ import android.text.SpannableStringBuilder;
++import android.text.Spanned;
+ import android.text.TextWatcher;
+ import android.util.AttributeSet;
++import android.view.KeyEvent;
+ import android.view.MotionEvent;
++import java.util.ArrayList;
++import java.util.List;
+ 
++/**
++ * The text lives in one Editable that the application gets from getText() and may change; every
++ * change, whether typed into the widget or made through the Editable, reaches the registered
++ * TextWatchers once, with the position and lengths of that change in UTF-16 units, and both sides
++ * show the same text afterwards. The selection is kept in the Editable's Selection spans.
++ */
+ public class EditText extends TextView {
++	private static final int TYPE_MASK_CLASS = 0x0000000f;
++	private static final int TYPE_MASK_VARIATION = 0x00000ff0;
++	private static final int TYPE_CLASS_TEXT = 1;
++	private static final int TYPE_CLASS_NUMBER = 2;
++	private static final int TYPE_CLASS_PHONE = 3;
++	private static final int TYPE_TEXT_FLAG_MULTI_LINE = 0x00020000;
++	private static final int TYPE_TEXT_VARIATION_URI = 0x10;
++	private static final int TYPE_TEXT_VARIATION_EMAIL_ADDRESS = 0x20;
++	private static final int TYPE_TEXT_VARIATION_PASSWORD = 0x80;
++	private static final int TYPE_TEXT_VARIATION_WEB_PASSWORD = 0xe0;
++	private static final int TYPE_NUMBER_VARIATION_PASSWORD = 0x10;
++
++	// no initializers on these fields: the superclass constructor already uses them (setText, setHint)
++	private SpannableStringBuilder atl_buffer;
++	private List<TextWatcher> atl_watchers;
++	private OnEditorActionListener atl_editor_action_listener;
++	private CharSequence atl_hint;
++	private int atl_input_type;
++	private boolean atl_single_line;
++	private boolean atl_widget_change; // the change being announced was made in the widget
++	private boolean atl_widget_selection;
++	private boolean atl_has_focus;
++	private int atl_removed_code_points;
++
+ 	public EditText(Context context) {
+-		super(context);
++		this(context, null);
+ 	}
+ 
+ 	public EditText(Context context, AttributeSet attrs) {
+-		super(context, attrs);
++		this(context, attrs, 0, 0);
++	}
++
++	public EditText(Context context, AttributeSet attrs, int defStyle) {
++		this(context, attrs, defStyle, 0);
+ 	}
+ 
+ 	public EditText(Context context, AttributeSet attrs, int defStyle, int defStyleRes) {
+ 		super(context, attrs, defStyle, defStyleRes);
++		setFocusable(true);
++		atl_apply_input_mode();
+ 	}
+ 
++	private native long native_create(boolean singleLine);
++	private native String native_getText(long widget);
++	private native void native_replace(long widget, int start, int end, String text);
++	private native void native_setSelection(long widget, int start, int end);
++	private native long native_getSelection(long widget);
++	private native void native_setHint(long widget, String s);
++	private native void native_setInputMode(long widget, boolean hidden, int purpose, boolean editable);
++
++	/** one line or several is a property of the widget and is decided when it is created */
+ 	@Override
+-	protected native long native_constructor(Context context, AttributeSet attrs);
+-	protected native String native_getText(long widget);
+-	protected native void native_addTextChangedListener(long widget, TextWatcher watcher);
+-	protected native void native_removeTextChangedListener(long widget, TextWatcher watcher);
+-	protected native void native_setOnEditorActionListener(long widget, OnEditorActionListener l);
+-	protected native void native_setText(long widget, String text);
+-	protected native void native_setHint(long widget, CharSequence s);
+-	protected native CharSequence native_getHint(long widget); // gtk_entry_set_placeholder_text
++	protected long native_constructor(Context context, AttributeSet attrs) {
++		int inputType = 0;
++		boolean singleLine = false;
++		boolean password = false;
++		if (attrs != null) {
++			TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.TextView);
++			try {
++				inputType = a.getInt(com.android.internal.R.styleable.TextView_inputType, 0);
++				singleLine = a.getBoolean(com.android.internal.R.styleable.TextView_singleLine, false);
++				password = a.getBoolean(com.android.internal.R.styleable.TextView_password, false);
++				if (a.getInt(com.android.internal.R.styleable.TextView_maxLines, -1) == 1 || a.getInt(com.android.internal.R.styleable.TextView_lines, -1) == 1)
++					singleLine = true;
++			} catch (RuntimeException e) {
++				// attributes that do not resolve leave the defaults
++			}
++			a.recycle();
++		}
++		if (password && inputType == 0)
++			inputType = TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_PASSWORD;
++		// an input type without the multi-line flag means one line; no input type at all means free text
++		if (inputType != 0 && (inputType & TYPE_TEXT_FLAG_MULTI_LINE) == 0)
++			singleLine = true;
++		if (atl_is_password(inputType))
++			singleLine = true;
++		atl_input_type = inputType;
++		atl_single_line = singleLine;
++		return native_create(singleLine);
++	}
++
++	private static boolean atl_is_password(int inputType) {
++		int cls = inputType & TYPE_MASK_CLASS;
++		int variation = inputType & TYPE_MASK_VARIATION;
++		return (cls == TYPE_CLASS_TEXT && (variation == TYPE_TEXT_VARIATION_PASSWORD || variation == TYPE_TEXT_VARIATION_WEB_PASSWORD))
++		    || (cls == TYPE_CLASS_NUMBER && variation == TYPE_NUMBER_VARIATION_PASSWORD);
++	}
++
++	private void atl_apply_input_mode() {
++		int cls = atl_input_type & TYPE_MASK_CLASS;
++		int variation = atl_input_type & TYPE_MASK_VARIATION;
++		int purpose = 0; // GTK_INPUT_PURPOSE_FREE_FORM
++		if (cls == TYPE_CLASS_NUMBER)
++			purpose = 3; // NUMBER
++		else if (cls == TYPE_CLASS_PHONE)
++			purpose = 4; // PHONE
++		else if (cls == TYPE_CLASS_TEXT && variation == TYPE_TEXT_VARIATION_URI)
++			purpose = 5; // URL
++		else if (cls == TYPE_CLASS_TEXT && variation == TYPE_TEXT_VARIATION_EMAIL_ADDRESS)
++			purpose = 6; // EMAIL
++		boolean hidden = atl_is_password(atl_input_type);
++		if (hidden)
++			purpose = 8; // PASSWORD
++		native_setInputMode(widget, hidden, purpose, isEnabled());
++	}
++
++	/* ---- the Editable ---- */
++
++	private final class Watcher implements TextWatcher, SpanWatcher {
++		@Override
++		public void beforeTextChanged(CharSequence s, int start, int count, int after) {
++			atl_removed_code_points = Character.codePointCount(s, start, start + count);
++			for (TextWatcher w : atl_watcher_snapshot())
++				w.beforeTextChanged(s, start, count, after);
++		}
++
++		@Override
++		public void onTextChanged(CharSequence s, int start, int before, int count) {
++			boolean fromWidget = atl_widget_change;
++			// whatever a watcher changes from here on is the application's change, not the widget's
++			atl_widget_change = false;
++			if (!fromWidget) {
++				int cpStart = Character.codePointCount(s, 0, start);
++				native_replace(widget, cpStart, cpStart + atl_removed_code_points, s.subSequence(start, start + count).toString());
++			}
++			for (TextWatcher w : atl_watcher_snapshot())
++				w.onTextChanged(s, start, before, count);
++			EditText.this.onTextChanged(s, start, before, count);
++		}
++
++		@Override
++		public void afterTextChanged(Editable s) {
++			for (TextWatcher w : atl_watcher_snapshot())
++				w.afterTextChanged(s);
++		}
++
++		@Override
++		public void onSpanAdded(Spannable text, Object what, int start, int end) {
++			atl_selection_span_moved(what);
++		}
++
++		@Override
++		public void onSpanRemoved(Spannable text, Object what, int start, int end) {
++		}
++
++		@Override
++		public void onSpanChanged(Spannable text, Object what, int ostart, int oend, int nstart, int nend) {
++			atl_selection_span_moved(what);
++		}
++	}
++
++	private void atl_selection_span_moved(Object what) {
++		if (atl_widget_selection || (what != Selection.SELECTION_START && what != Selection.SELECTION_END))
++			return;
++		SpannableStringBuilder b = atl_buffer;
++		int start = Selection.getSelectionStart(b);
++		int end = Selection.getSelectionEnd(b);
++		if (start < 0 || end < 0)
++			return;
++		native_setSelection(widget, Character.codePointCount(b, 0, Math.min(start, end)), Character.codePointCount(b, 0, Math.max(start, end)));
++		onSelectionChanged(start, end);
++	}
++
++	private TextWatcher[] atl_watcher_snapshot() {
++		return atl_watchers == null ? new TextWatcher[0] : atl_watchers.toArray(new TextWatcher[0]);
++	}
++
++	private SpannableStringBuilder atl_buffer() {
++		if (atl_buffer == null) {
++			atl_buffer = new SpannableStringBuilder(native_getText(widget));
++			atl_attach_watcher(atl_buffer);
++		}
++		return atl_buffer;
++	}
++
++	private void atl_attach_watcher(SpannableStringBuilder b) {
++		// first among the watchers of this text, so the widget is up to date before anyone else looks
++		b.setSpan(new Watcher(), 0, b.length(), Spanned.SPAN_INCLUSIVE_INCLUSIVE | (100 << Spanned.SPAN_PRIORITY_SHIFT));
++		long sel = native_getSelection(widget);
++		atl_widget_selection = true;
++		try {
++			Selection.setSelection(b, atl_utf16(b, (int)(sel >> 32)), atl_utf16(b, (int)sel));
++		} finally {
++			atl_widget_selection = false;
++		}
++	}
++
++	private static int atl_utf16(CharSequence s, int codePoints) {
++		int index = 0;
++		int length = s.length();
++		while (codePoints > 0 && index < length) {
++			index += Character.charCount(Character.codePointAt(s, index));
++			codePoints--;
++		}
++		return Math.min(index, length);
++	}
++
++	/* ---- called by the widget (native code) ---- */
++
++	/** the user replaced the code points [start, end) of the widget's text with `inserted` */
++	private void atl_gtk_replaced(int start, int end, String inserted) {
++		SpannableStringBuilder b = atl_buffer();
++		if (atl_single_line && inserted.indexOf('\n') >= 0) {
++			// a pasted line break has no place in a one-line field: redo the insertion without it
++			int cp = inserted.codePointCount(0, inserted.length());
++			native_replace(widget, start, start + cp, inserted.replace("\r", "").replace('\n', ' '));
++			inserted = inserted.replace("\r", "").replace('\n', ' ');
++		}
++		int st = atl_utf16(b, start);
++		int en = atl_utf16(b, end);
++		atl_widget_change = true;
++		try {
++			b.replace(st, en, inserted);
++		} finally {
++			atl_widget_change = false;
++		}
++		// an InputFilter may have changed or refused the input: the Editable is what counts
++		if (b.getFilters().length > 0) {
++			String shown = native_getText(widget);
++			String kept = b.toString();
++			if (!shown.equals(kept))
++				native_replace(widget, 0, shown.codePointCount(0, shown.length()), kept);
++		}
++		long sel = native_getSelection(widget);
++		atl_gtk_selection((int)(sel >> 32), (int)sel);
++	}
++
++	private void atl_gtk_selection(int start, int end) {
++		if (atl_buffer == null)
++			return;
++		SpannableStringBuilder b = atl_buffer;
++		int st = atl_utf16(b, start);
++		int en = atl_utf16(b, end);
++		if (Selection.getSelectionStart(b) == st && Selection.getSelectionEnd(b) == en)
++			return;
++		atl_widget_selection = true;
++		try {
++			Selection.setSelection(b, st, en);
++		} finally {
++			atl_widget_selection = false;
++		}
++		onSelectionChanged(st, en);
++	}
++
++	private void atl_gtk_activate() {
++		if (atl_editor_action_listener != null)
++			atl_editor_action_listener.onEditorAction(this, 0 /* IME_ACTION_UNSPECIFIED */,
++			                                          new KeyEvent(0, 0, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER, 0, 0));
++	}
++
++	private void atl_gtk_focus(boolean focused) {
++		if (atl_has_focus == focused)
++			return;
++		atl_has_focus = focused;
++		OnFocusChangeListener l = getOnFocusChangeListener();
++		if (l != null)
++			l.onFocusChange(this, focused);
++	}
++
++	/* ---- TextView API ---- */
++
++	protected void onSelectionChanged(int selStart, int selEnd) {}
++
++	protected void onTextChanged(CharSequence text, int start, int lengthBefore, int lengthAfter) {}
+ 
+ 	@Override
+ 	public boolean onTouchEvent(MotionEvent event) {
++		// a touch puts the keyboard focus into the field, the widget then places the cursor
++		if (event.getAction() == MotionEvent.ACTION_DOWN && isEnabled())
++			requestFocus();
+ 		return native_gtkEventPropagation();
+ 	}
+ 
++	@Override
++	public boolean hasFocus() {
++		return isFocused();
++	}
++
++	@Override
+ 	public Editable getText() {
+-		return new SpannableStringBuilder(native_getText(widget));
++		return atl_buffer();
+ 	}
+ 
++	@Override
+ 	public Editable getEditableText() {
+-		return new SpannableStringBuilder(native_getText(widget));
++		return atl_buffer();
++	}
++
++	@Override
++	public int length() {
++		return atl_buffer().length();
++	}
++
++	@Override
++	public void setText(CharSequence text, BufferType type) {
++		SpannableStringBuilder b = atl_buffer();
++		b.replace(0, b.length(), text == null ? "" : text);
++		// as on Android, new text starts with the cursor in front
++		Selection.setSelection(b, 0);
+ 	}
+ 
+ 	@Override
+ 	public void setText(CharSequence text) {
+-		native_setText(widget, text == null ? "" : text.toString());
++		setText(text, BufferType.EDITABLE);
++	}
++
++	@Override
++	public void append(CharSequence text, int start, int end) {
++		atl_buffer().append(text, start, end);
+ 	}
++
+ 	@Override
+ 	public void setTextSize(float size) {}
+ 
+ 	@Override
+-	public void removeTextChangedListener(TextWatcher watcher) {
+-		native_removeTextChangedListener(widget, watcher);
++	public void addTextChangedListener(TextWatcher watcher) {
++		if (watcher == null)
++			return;
++		if (atl_watchers == null)
++			atl_watchers = new ArrayList<>();
++		atl_watchers.add(watcher);
+ 	}
+ 
+ 	@Override
+-	public void addTextChangedListener(TextWatcher watcher) {
+-		native_addTextChangedListener(widget, watcher);
++	public void removeTextChangedListener(TextWatcher watcher) {
++		if (atl_watchers != null)
++			atl_watchers.remove(watcher);
+ 	}
+ 
+ 	@Override
+ 	public void setOnEditorActionListener(OnEditorActionListener l) {
+-		native_setOnEditorActionListener(widget, l);
++		atl_editor_action_listener = l;
+ 	}
+ 
+ 	@Override
+@@ -71,13 +363,79 @@ public class EditText extends TextView {
+ 
+ 	@Override
+ 	public void setHint(CharSequence s) {
++		atl_hint = s;
+ 		native_setHint(widget, s == null ? "" : s.toString());
+ 	}
+ 
+ 	@Override
+ 	public CharSequence getHint() {
+-		return native_getHint(widget);
++		return atl_hint;
++	}
++
++	@Override
++	public void setFilters(InputFilter[] filters) {
++		atl_buffer().setFilters(filters == null ? new InputFilter[0] : filters);
++	}
++
++	@Override
++	public InputFilter[] getFilters() {
++		return atl_buffer().getFilters();
++	}
++
++	@Override
++	public void setInputType(int type) {
++		boolean multi = type == 0 || (type & TYPE_TEXT_FLAG_MULTI_LINE) != 0;
++		if (multi == atl_single_line && !atl_is_password(type))
++			android.util.Slog.w("EditText", "setInputType(0x" + Integer.toHexString(type) + "): the field stays " + (atl_single_line ? "single-line" : "multi-line") + ", as it was created");
++		atl_input_type = type;
++		atl_apply_input_mode();
++	}
++
++	@Override
++	public void setRawInputType(int type) {
++		setInputType(type);
+ 	}
+ 
+-	public void selectAll() {}
++	@Override
++	public int getInputType() {
++		return atl_input_type != 0 ? atl_input_type : (TYPE_CLASS_TEXT | TYPE_TEXT_FLAG_MULTI_LINE);
++	}
++
++	@Override
++	public void setEnabled(boolean enabled) {
++		super.setEnabled(enabled);
++		atl_apply_input_mode();
++	}
++
++	@Override
++	public void setSelection(int index) {
++		Selection.setSelection(atl_buffer(), index);
++	}
++
++	@Override
++	public void setSelection(int start, int stop) {
++		Selection.setSelection(atl_buffer(), start, stop);
++	}
++
++	public void selectAll() {
++		Selection.selectAll(atl_buffer());
++	}
++
++	public void extendSelection(int index) {
++		Selection.extendSelection(atl_buffer(), index);
++	}
++
++	@Override
++	public int getSelectionStart() {
++		return Selection.getSelectionStart(atl_buffer());
++	}
++
++	@Override
++	public int getSelectionEnd() {
++		return Selection.getSelectionEnd(atl_buffer());
++	}
++
++	public boolean hasSelection() {
++		return getSelectionStart() != getSelectionEnd();
++	}
+ }
+diff --git a/src/main-executable/css/default-stylesheet.css b/src/main-executable/css/default-stylesheet.css
+index c1a5d29..5324e84 100644
+--- a/src/main-executable/css/default-stylesheet.css
++++ b/src/main-executable/css/default-stylesheet.css
+@@ -33,3 +33,10 @@
+ 	background-color: rgba(0,0,0,0);
+ 	background-image: none;
+ }
++
++/* multi-line EditText: the page behind the text is the Android view's own background, not the GTK "view" colour */
++textview.atl-edit,
++textview.atl-edit > text {
++	background: none;
++	color: inherit;
++}

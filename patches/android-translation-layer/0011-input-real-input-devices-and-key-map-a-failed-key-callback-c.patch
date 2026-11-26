@@ -1,0 +1,963 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] input: real input devices and key map; a failed key callback cannot abort the process
+
+A key press in an application that asks about its keyboard ended the
+process: InputDevice.getKeyboardType() did not exist, the NoSuchMethodError
+stayed pending after the key-down callback (ExceptionDescribe reports an
+exception, it does not clear it), and creating the KeyEvent for the key-up
+then ran into the JNI check.
+
+- Key delivery reports and clears whatever the application throws, before
+  and after the callback; a key whose handler failed counts as not handled
+  and goes on to the focused widget.
+- InputDevice lists the machine's input devices from
+  /proc/bus/input/devices: id, name, hardware ids, sources, keyboard type
+  (alphabetic if the letter keys are there), hasKeys() from the kernel's key
+  bitmap, plus the virtual keyboard (-1). getDevice() of an unknown id is
+  null. Key events carry the id of the alphabetic hardware keyboard and
+  SOURCE_KEYBOARD, the scan code and real down/event times; touch events
+  the id of the touchscreen.
+- KeyCharacterMap has a map instead of unimplemented native methods (each
+  of them would have thrown UnsatisfiedLinkError): get, getNumber,
+  getMatch, getDisplayLabel, getEvents, isPrintingKey, deviceHasKey(s).
+  Its type is FULL for a keyboard with a digit row and ALPHA for one with
+  letters only. KeyEvent.getUnicodeChar() stays the character the active
+  layout produced and falls back to the map for events an application
+  made itself.
+- The Android key code is taken from the hardware key, so it is the same
+  under any layout (a Cyrillic letter used to leak its key value into the
+  key code); modifier, Back and Menu keys have their codes; an unknown key
+  is KEYCODE_UNKNOWN.
+- View.setOnKeyListener and onKeyUp work. Key callbacks run before the
+  child widget acts on the key (capture phase), so an EditText's listener
+  sees Enter before the text changes, as on Android.
+
+---
+  src/api-impl-jni/generated_headers/android_view_View.h |   8 +
+  src/api-impl-jni/views/android_view_View.c             |   7 +
+  src/api-impl-jni/widgets/WrapperWidget.c               | 144 +++++++++++++++---
+  src/api-impl-jni/widgets/WrapperWidget.h               |   1 +
+  src/api-impl/android/hardware/input/InputManager.java  |   3 +
+  src/api-impl/android/view/InputDevice.java             | 293 +++++++++++++++++++++++++++++++++----
+  src/api-impl/android/view/InputEvent.java              |   2 +-
+  src/api-impl/android/view/KeyCharacterMap.java         | 195 +++++++++++++++++++++---
+  src/api-impl/android/view/KeyEvent.java                |   7 +-
+  src/api-impl/android/view/MotionEvent.java             |   2 +-
+  src/api-impl/android/view/View.java                    |  18 ++-
+  11 files changed, 614 insertions(+), 66 deletions(-)
+
+diff --git a/src/api-impl-jni/generated_headers/android_view_View.h b/src/api-impl-jni/generated_headers/android_view_View.h
+index 37788fd..459c94f 100644
+--- a/src/api-impl-jni/generated_headers/android_view_View.h
++++ b/src/api-impl-jni/generated_headers/android_view_View.h
+@@ -355,6 +355,14 @@ JNIEXPORT jboolean JNICALL Java_android_view_View_native_1gtkEventPropagation
+ JNIEXPORT void JNICALL Java_android_view_View_native_1registerTouchEventPropagation
+   (JNIEnv *, jobject, jlong);
+ 
++/*
++ * Class:     android_view_View
++ * Method:    native_registerKeyEvents
++ * Signature: (J)V
++ */
++JNIEXPORT void JNICALL Java_android_view_View_native_1registerKeyEvents
++  (JNIEnv *, jobject, jlong);
++
+ /*
+  * Class:     android_view_View
+  * Method:    nativeRequestFocus
+diff --git a/src/api-impl-jni/views/android_view_View.c b/src/api-impl-jni/views/android_view_View.c
+index 17c76b1..6005590 100644
+--- a/src/api-impl-jni/views/android_view_View.c
++++ b/src/api-impl-jni/views/android_view_View.c
+@@ -1039,6 +1039,13 @@ JNIEXPORT jboolean JNICALL Java_android_view_View_native_1gtkEventPropagation(JN
+ 	return true;
+ }
+ 
++JNIEXPORT void JNICALL Java_android_view_View_native_1registerKeyEvents(JNIEnv *env, jobject this, jlong widget_ptr)
++{
++	GtkWidget *wrapper = gtk_widget_get_parent(GTK_WIDGET(_PTR(widget_ptr)));
++	if (WRAPPER_IS_WIDGET(wrapper))
++		wrapper_widget_register_key_events(WRAPPER_WIDGET(wrapper));
++}
++
+ JNIEXPORT void JNICALL Java_android_view_View_native_1registerTouchEventPropagation(JNIEnv *env, jobject this, jlong widget_ptr)
+ {
+ 	GtkWidget *wrapper = gtk_widget_get_parent(GTK_WIDGET(_PTR(widget_ptr)));
+diff --git a/src/api-impl-jni/widgets/WrapperWidget.c b/src/api-impl-jni/widgets/WrapperWidget.c
+index baa8d00..190b163 100644
+--- a/src/api-impl-jni/widgets/WrapperWidget.c
++++ b/src/api-impl-jni/widgets/WrapperWidget.c
+@@ -410,28 +410,137 @@ static int map_meta_state(GdkModifierType state)
+ #define ACTION_DOWN 0
+ #define ACTION_UP   1
+ 
+-static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, WrapperWidget *wrapper)
++#define KEYCODE_UNKNOWN    0
++#define KEYCODE_BACK       4
++#define KEYCODE_ALT_LEFT   57
++#define KEYCODE_ALT_RIGHT  58
++#define KEYCODE_SHIFT_LEFT 59
++#define KEYCODE_SHIFT_RIGHT 60
++#define KEYCODE_MENU       82
++#define KEYCODE_CTRL_LEFT  113
++#define KEYCODE_CTRL_RIGHT 114
++#define KEYCODE_CAPS_LOCK  115
++#define KEYCODE_META_LEFT  117
++#define KEYCODE_META_RIGHT 118
++#define SOURCE_KEYBOARD    0x101
++
++/*
++ * An Android key code names a key, not the character on it. The key is known from the hardware
++ * key code (letters, digits and punctuation keep their code under any layout); the key value only
++ * decides for keys the table does not know. A key value that is no key (a Cyrillic letter, say)
++ * must not leak into the key code.
++ */
++static int android_key_code(JNIEnv *env, guint keyval, guint hardware_keycode)
++{
++	switch (keyval) {
++		case GDK_KEY_Shift_L:
++			return KEYCODE_SHIFT_LEFT;
++		case GDK_KEY_Shift_R:
++			return KEYCODE_SHIFT_RIGHT;
++		case GDK_KEY_Alt_L:
++			return KEYCODE_ALT_LEFT;
++		case GDK_KEY_Alt_R:
++		case GDK_KEY_ISO_Level3_Shift:
++			return KEYCODE_ALT_RIGHT;
++		case GDK_KEY_Control_L:
++			return KEYCODE_CTRL_LEFT;
++		case GDK_KEY_Control_R:
++			return KEYCODE_CTRL_RIGHT;
++		case GDK_KEY_Super_L:
++		case GDK_KEY_Meta_L:
++			return KEYCODE_META_LEFT;
++		case GDK_KEY_Super_R:
++		case GDK_KEY_Meta_R:
++			return KEYCODE_META_RIGHT;
++		case GDK_KEY_Caps_Lock:
++			return KEYCODE_CAPS_LOCK;
++		case GDK_KEY_Back:
++			return KEYCODE_BACK;
++		case GDK_KEY_Menu:
++			return KEYCODE_MENU;
++	}
++	/* on Wayland and X11 the hardware key code is the Linux input code plus 8 */
++	if (hardware_keycode > 8) {
++		int code = J__KeyCharacterMap__atl_key_code(env, (jint)(hardware_keycode - 8));
++		if ((*env)->ExceptionCheck(env))
++			(*env)->ExceptionClear(env);
++		else if (code != KEYCODE_UNKNOWN)
++			return code;
++	}
++	int code = map_key_code(keyval);
++	/* map_key_code hands a key value it does not know back unchanged: that is no key code */
++	return code == (int)keyval ? KEYCODE_UNKNOWN : code;
++}
++
++/*
++ * Deliver one key event. Whatever the application throws while handling it is reported and
++ * cleared here: an exception left pending would abort the process at the next JNI call.
++ */
++static gboolean deliver_key(WrapperWidget *wrapper, int action, guint keyval, guint keycode, GdkModifierType state)
+ {
+ 	JNIEnv *env = get_jni_env();
++	gboolean ret = FALSE;
+ 
+-	jobject key_event = J_new__KeyEvent(env, (jlong)0, (jlong)0, ACTION_DOWN, map_key_code(keyval), 0, map_meta_state(state));
+-	_SET_INT_FIELD(key_event, "unicodeValue", gdk_keyval_to_unicode(keyval));
+-	gboolean ret = J__View__dispatchKeyEvent(env, wrapper->jobj, key_event);
++	if ((*env)->ExceptionCheck(env)) {
++		(*env)->ExceptionDescribe(env);
++		(*env)->ExceptionClear(env);
++	}
++	jlong now = g_get_monotonic_time() / 1000; /* the clock of SystemClock.uptimeMillis() */
++	static jlong down_time = 0;
++	if (action == ACTION_DOWN || down_time == 0)
++		down_time = now;
++	jobject key_event = J_new__KeyEvent(env, down_time, now, action, android_key_code(env, keyval, keycode), 0, map_meta_state(state));
++	if (!key_event || (*env)->ExceptionCheck(env))
++		goto out;
++	guint32 unicode = gdk_keyval_to_unicode(keyval);
++	if (unicode == '\r') /* Enter is a line feed on Android */
++		unicode = '\n';
++	_SET_INT_FIELD(key_event, "unicodeValue", unicode);
++	_SET_INT_FIELD(key_event, "mDeviceId", J__InputDevice__atl_keyboard_id(env));
++	_SET_INT_FIELD(key_event, "mSource", SOURCE_KEYBOARD);
++	_SET_INT_FIELD(key_event, "mScanCode", keycode > 8 ? (jint)(keycode - 8) : 0);
+ 	if ((*env)->ExceptionCheck(env))
++		goto out;
++	ret = J__View__dispatchKeyEvent(env, wrapper->jobj, key_event);
++out:
++	if ((*env)->ExceptionCheck(env)) {
+ 		(*env)->ExceptionDescribe(env);
++		(*env)->ExceptionClear(env);
++		ret = FALSE; /* not handled: the key goes on to the widget that has the focus */
++	}
++	if (key_event)
++		(*env)->DeleteLocalRef(env, key_event);
+ 	return ret;
+ }
+ 
++static gboolean on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, WrapperWidget *wrapper)
++{
++	return deliver_key(wrapper, ACTION_DOWN, keyval, keycode, state);
++}
++
+ static gboolean on_key_released(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, WrapperWidget *wrapper)
+ {
+-	JNIEnv *env = get_jni_env();
++	return deliver_key(wrapper, ACTION_UP, keyval, keycode, state);
++}
+ 
+-	jobject key_event = J_new__KeyEvent(env, (jlong)0, (jlong)0, ACTION_UP, map_key_code(keyval), 0, map_meta_state(state));
+-	_SET_INT_FIELD(key_event, "unicodeValue", gdk_keyval_to_unicode(keyval));
+-	gboolean ret = J__View__dispatchKeyEvent(env, wrapper->jobj, key_event);
+-	if ((*env)->ExceptionCheck(env))
+-		(*env)->ExceptionDescribe(env);
+-	return ret;
++/*
++ * Key events for a view whose Java side wants them (it overrides the key callbacks or has an
++ * OnKeyListener). The controller runs in the capture phase: the view sees the key before a child
++ * widget (the text widget of an EditText) acts on it, and only a key it does not handle goes on.
++ */
++void wrapper_widget_register_key_events(WrapperWidget *wrapper)
++{
++	if (g_object_get_data(G_OBJECT(wrapper), "atl_key_controller"))
++		return;
++	GtkEventController *controller = GTK_EVENT_CONTROLLER(gtk_event_controller_key_new());
++	gtk_event_controller_set_propagation_phase(controller, GTK_PHASE_CAPTURE);
++	g_signal_connect(controller, "key-pressed", G_CALLBACK(on_key_pressed), wrapper);
++	g_signal_connect(controller, "key-released", G_CALLBACK(on_key_released), wrapper);
++	gtk_widget_add_controller(GTK_WIDGET(wrapper), controller);
++	g_object_set_data(G_OBJECT(wrapper), "atl_key_controller", controller);
++	/* a widget that edits text keeps the focus itself; anything else takes it on the wrapper */
++	if (!wrapper->child || !gtk_widget_get_focusable(wrapper->child))
++		gtk_widget_set_focusable(GTK_WIDGET(wrapper), TRUE);
+ }
+ 
+ GtkWidget *currently_unmapping = NULL;
+@@ -491,13 +600,12 @@ void wrapper_widget_set_jobject(WrapperWidget *wrapper, JNIEnv *env, jobject job
+ 
+ 	jmethodID dispatch_key_event_method = _METHOD(_CLASS(jobj), "dispatchKeyEvent", "(Landroid/view/KeyEvent;)Z");
+ 	jmethodID on_key_down_method = _METHOD(_CLASS(jobj), "onKeyDown", "(ILandroid/view/KeyEvent;)Z");
+-	if (dispatch_key_event_method != _CACHED_METHOD(View__dispatchKeyEvent) || on_key_down_method != _CACHED_METHOD(View__onKeyDown)) {
+-		GtkEventController *controller = GTK_EVENT_CONTROLLER(gtk_event_controller_key_new());
+-		g_signal_connect(controller, "key-pressed", G_CALLBACK(on_key_pressed), wrapper);
+-		g_signal_connect(controller, "key-released", G_CALLBACK(on_key_released), wrapper);
+-		gtk_widget_add_controller(GTK_WIDGET(wrapper), controller);
+-		gtk_widget_set_focusable(GTK_WIDGET(wrapper), TRUE);
+-	}
++	jmethodID on_key_up_method = _METHOD(_CLASS(jobj), "onKeyUp", "(ILandroid/view/KeyEvent;)Z");
++	if ((*env)->ExceptionCheck(env))
++		(*env)->ExceptionClear(env);
++	if (dispatch_key_event_method != _CACHED_METHOD(View__dispatchKeyEvent) || on_key_down_method != _CACHED_METHOD(View__onKeyDown)
++	    || (on_key_up_method && on_key_up_method != _METHOD(_CACHED_CLASS(View), "onKeyUp", "(ILandroid/view/KeyEvent;)Z")))
++		wrapper_widget_register_key_events(wrapper);
+ 	g_signal_connect(wrapper, "notify::root", G_CALLBACK(root_changed_cb), NULL);
+ }
+ 
+diff --git a/src/api-impl-jni/widgets/WrapperWidget.h b/src/api-impl-jni/widgets/WrapperWidget.h
+index 0599b5d..c88a3a5 100644
+--- a/src/api-impl-jni/widgets/WrapperWidget.h
++++ b/src/api-impl-jni/widgets/WrapperWidget.h
+@@ -35,6 +35,7 @@ extern GtkWidget *currently_unmapping;
+ 
+ GtkWidget *wrapper_widget_new(void);
+ void wrapper_widget_set_child(WrapperWidget *parent, GtkWidget *child);
++void wrapper_widget_register_key_events(WrapperWidget *wrapper);
+ void wrapper_widget_set_jobject(WrapperWidget *wrapper, JNIEnv *env, jobject jobj);
+ void wrapper_widget_queue_draw(WrapperWidget *wrapper);
+ void wrapper_widget_set_layout_params(WrapperWidget *wrapper, int width, int height);
+diff --git a/src/api-impl/android/hardware/input/InputManager.java b/src/api-impl/android/hardware/input/InputManager.java
+index 4e1ecb6..21281c5 100644
+--- a/src/api-impl/android/hardware/input/InputManager.java
++++ b/src/api-impl/android/hardware/input/InputManager.java
+@@ -13,6 +13,9 @@ public class InputManager {
+ 	public void registerInputDeviceListener(InputManager.InputDeviceListener listener, Handler handler) {
+ 	}
+ 
++	public void unregisterInputDeviceListener(InputManager.InputDeviceListener listener) {
++	}
++
+ 	public int[] getInputDeviceIds() {
+ 		return InputDevice.getDeviceIds();
+ 	}
+diff --git a/src/api-impl/android/view/InputDevice.java b/src/api-impl/android/view/InputDevice.java
+index 535d3b1..90a7c2f 100644
+--- a/src/api-impl/android/view/InputDevice.java
++++ b/src/api-impl/android/view/InputDevice.java
+@@ -1,81 +1,322 @@
+ package android.view;
+ 
++import java.io.BufferedReader;
++import java.io.FileReader;
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
++/**
++ * The input devices of this machine as the kernel lists them (/proc/bus/input/devices): keyboards
++ * with the keys they really have, touchscreens, and the virtual keyboard that stands for input
++ * without a hardware key (on-screen keyboard, injected events).
++ */
+ public class InputDevice {
+-
++	public static final int SOURCE_CLASS_MASK = 0x000000ff;
++	public static final int SOURCE_CLASS_NONE = 0x00000000;
+ 	public static final int SOURCE_CLASS_BUTTON = 0x00000001;
+ 	public static final int SOURCE_CLASS_POINTER = 0x00000002;
++	public static final int SOURCE_CLASS_TRACKBALL = 0x00000004;
++	public static final int SOURCE_CLASS_POSITION = 0x00000008;
+ 	public static final int SOURCE_CLASS_JOYSTICK = 0x00000010;
+-	public static final int SOURCE_CLASS_GAMEPAD = 0x00000400 | SOURCE_CLASS_BUTTON;
++	public static final int SOURCE_UNKNOWN = 0x00000000;
+ 	public static final int SOURCE_KEYBOARD = 0x00000100 | SOURCE_CLASS_BUTTON;
++	public static final int SOURCE_DPAD = 0x00000200 | SOURCE_CLASS_BUTTON;
++	public static final int SOURCE_GAMEPAD = 0x00000400 | SOURCE_CLASS_BUTTON;
++	public static final int SOURCE_CLASS_GAMEPAD = SOURCE_GAMEPAD;
+ 	public static final int SOURCE_TOUCHSCREEN = 0x00001000 | SOURCE_CLASS_POINTER;
++	public static final int SOURCE_MOUSE = 0x00002000 | SOURCE_CLASS_POINTER;
++	public static final int SOURCE_STYLUS = 0x00004000 | SOURCE_CLASS_POINTER;
++	public static final int SOURCE_TRACKBALL = 0x00010000 | SOURCE_CLASS_TRACKBALL;
++	public static final int SOURCE_TOUCHPAD = 0x00100000 | SOURCE_CLASS_POSITION;
++	public static final int SOURCE_JOYSTICK = 0x01000000 | SOURCE_CLASS_JOYSTICK;
++	public static final int SOURCE_ANY = 0xffffff00;
++
++	public static final int KEYBOARD_TYPE_NONE = 0;
++	public static final int KEYBOARD_TYPE_NON_ALPHABETIC = 1;
++	public static final int KEYBOARD_TYPE_ALPHABETIC = 2;
++
++	private final int id;
++	private final String name;
++	private final int makerId;
++	private final int product;
++	private final int sources;
++	private final int keyboardType;
++	private final boolean virtual;
++	/** the kernel's key bitmap, least significant word first; null for the virtual keyboard (it has every key) */
++	private final long[] keys;
++
++	private InputDevice(int id, String name, int makerId, int product, int sources, int keyboardType, boolean virtual, long[] keys) {
++		this.id = id;
++		this.name = name;
++		this.makerId = makerId;
++		this.product = product;
++		this.sources = sources;
++		this.keyboardType = keyboardType;
++		this.virtual = virtual;
++		this.keys = keys;
++	}
++
++	/* ---- the device list ---- */
++
++	private static final InputDevice VIRTUAL = new InputDevice(KeyCharacterMap.VIRTUAL_KEYBOARD, "Virtual", 0, 0, SOURCE_KEYBOARD, KEYBOARD_TYPE_ALPHABETIC, true, null);
++	private static List<InputDevice> devices;
++	private static long devicesReadAt;
++
++	private static boolean bit(long[] map, int n) {
++		return map != null && n / 64 < map.length && (map[n / 64] & (1L << (n % 64))) != 0;
++	}
++
++	/** "B: KEY=" and friends print the bitmap as hex words, most significant first */
++	private static long[] bitmap(String value) {
++		String[] words = value.trim().split(" ");
++		long[] out = new long[words.length];
++		for (int i = 0; i < words.length; i++) {
++			try {
++				out[words.length - 1 - i] = Long.parseUnsignedLong(words[i], 16);
++			} catch (NumberFormatException e) {
++				out[words.length - 1 - i] = 0;
++			}
++		}
++		return out;
++	}
++
++	private static final int KEY_1 = 2, KEY_0 = 11, KEY_Q = 16, KEY_P = 25, KEY_A = 30, KEY_L = 38, KEY_Z = 44, KEY_M = 50, KEY_ENTER = 28;
++	private static final int ABS_X = 0, ABS_MT_POSITION_X = 0x35, BTN_TOUCH = 0x14a, BTN_LEFT = 0x110, BTN_GAMEPAD = 0x130;
++	private static final int INPUT_PROP_DIRECT = 1;
++
++	private static synchronized List<InputDevice> devices() {
++		long now = System.nanoTime();
++		// devices come and go (USB, Bluetooth): look again after a while
++		if (devices != null && now - devicesReadAt < 5000000000L)
++			return devices;
++		List<InputDevice> list = new ArrayList<>();
++		String name = "";
++		int makerId = 0, product = 0;
++		long[] key = null, abs = null, prop = null;
++		int event = -1;
++		try (BufferedReader r = new BufferedReader(new FileReader("/proc/bus/input/devices"))) {
++			String line;
++			while (true) {
++				line = r.readLine();
++				if (line == null || line.isEmpty()) {
++					if (event >= 0) {
++						boolean letters = true;
++						for (int k : new int[] {KEY_Q, KEY_P, KEY_A, KEY_L, KEY_Z, KEY_M})
++							letters &= bit(key, k);
++						boolean anyKey = false;
++						if (key != null) {
++							// keys below BTN_MISC (0x100) are keyboard keys
++							for (int w = 0; w < key.length && w < 4; w++)
++								anyKey |= key[w] != 0;
++						}
++						boolean touchscreen = bit(prop, INPUT_PROP_DIRECT) && (bit(abs, ABS_MT_POSITION_X) || (bit(abs, ABS_X) && bit(key, BTN_TOUCH)));
++						int src = 0;
++						if (anyKey)
++							src |= SOURCE_KEYBOARD;
++						if (touchscreen)
++							src |= SOURCE_TOUCHSCREEN;
++						else if (bit(key, BTN_LEFT))
++							src |= SOURCE_MOUSE;
++						if (bit(key, BTN_GAMEPAD))
++							src |= SOURCE_GAMEPAD;
++						if (src != 0) {
++							int type = !anyKey ? KEYBOARD_TYPE_NONE : letters ? KEYBOARD_TYPE_ALPHABETIC : KEYBOARD_TYPE_NON_ALPHABETIC;
++							// ids start at 1: 0 is reserved, as on Android
++							list.add(new InputDevice(event + 1, name, makerId, product, src, type, false, key));
++						}
++					}
++					name = "";
++					makerId = product = 0;
++					key = abs = prop = null;
++					event = -1;
++					if (line == null)
++						break;
++					continue;
++				}
++				if (line.startsWith("I:")) {
++					for (String f : line.substring(2).trim().split(" ")) {
++						try {
++							if (f.startsWith("Vendor="))
++								makerId = Integer.parseInt(f.substring(7), 16);
++							else if (f.startsWith("Product="))
++								product = Integer.parseInt(f.substring(8), 16);
++						} catch (NumberFormatException e) {
++							// leave 0
++						}
++					}
++				} else if (line.startsWith("N: Name=")) {
++					name = line.substring(8).replace("\"", "");
++				} else if (line.startsWith("H: Handlers=")) {
++					for (String h : line.substring(12).trim().split(" ")) {
++						if (h.startsWith("event")) {
++							try {
++								event = Integer.parseInt(h.substring(5));
++							} catch (NumberFormatException e) {
++								// not an event node
++							}
++						}
++					}
++				} else if (line.startsWith("B: KEY=")) {
++					key = bitmap(line.substring(7));
++				} else if (line.startsWith("B: ABS=")) {
++					abs = bitmap(line.substring(7));
++				} else if (line.startsWith("B: PROP=")) {
++					prop = bitmap(line.substring(8));
++				}
++			}
++		} catch (IOException e) {
++			// no device list: only the virtual keyboard is known
++		}
++		devices = list;
++		devicesReadAt = now;
++		return list;
++	}
+ 
+ 	public static int[] getDeviceIds() {
+-		return new int[] {0}; // might work?
++		List<InputDevice> list = devices();
++		int[] ids = new int[list.size()];
++		for (int i = 0; i < ids.length; i++)
++			ids[i] = list.get(i).id;
++		return ids;
+ 	}
+ 
++	/** null for an id that names no device */
+ 	public static InputDevice getDevice(int id) {
+-		return new InputDevice();
++		if (id == KeyCharacterMap.VIRTUAL_KEYBOARD)
++			return VIRTUAL;
++		for (InputDevice d : devices()) {
++			if (d.id == id)
++				return d;
++		}
++		return null;
+ 	}
+ 
++	/** the id key events of a hardware key carry: the alphabetic keyboard if there is one, else any keyboard, else the virtual one */
++	@android.atl.annotation.Export
++	public static int atl_keyboard_id() {
++		int other = KeyCharacterMap.VIRTUAL_KEYBOARD;
++		for (InputDevice d : devices()) {
++			if (d.keyboardType == KEYBOARD_TYPE_ALPHABETIC)
++				return d.id;
++			if (d.keyboardType == KEYBOARD_TYPE_NON_ALPHABETIC && other == KeyCharacterMap.VIRTUAL_KEYBOARD && bit(d.keys, KEY_ENTER))
++				other = d.id;
++		}
++		return other;
++	}
++
++	/** the id touch events carry: the first touchscreen, 0 if the machine has none */
++	public static int atl_touchscreen_id() {
++		for (InputDevice d : devices()) {
++			if ((d.sources & SOURCE_TOUCHSCREEN) == SOURCE_TOUCHSCREEN)
++				return d.id;
++		}
++		return 0;
++	}
++
++	/* ---- one device ---- */
++
+ 	public int getId() {
+-		return 0; // might work?
++		return id;
++	}
++
++	public int getControllerNumber() {
++		return 0;
+ 	}
+ 
+ 	public int getProductId() {
+-		return 0x69;
++		return product;
+ 	}
+ 
+ 	public int getVendorId() {
+-		return 0x420;
++		return makerId;
+ 	}
+ 
+ 	public String getName() {
+-		return "FIXME-name";
++		return name;
+ 	}
+ 
++	/** stable for the same device model across restarts */
+ 	public String getDescriptor() {
+-		return "FIXME-descriptor";
++		return String.format("%04x:%04x:%s", makerId, product, name).replace(' ', '_');
+ 	}
+ 
+ 	public boolean isVirtual() {
++		return virtual;
++	}
++
++	public boolean isExternal() {
+ 		return false;
+ 	}
+ 
++	public boolean isEnabled() {
++		return true;
++	}
++
+ 	public int getSources() {
+-		return 2 | 4098 /* SOURCE_CLASS_POINTER | SOURCE_TOUCHSCREEN */; // FIXME
++		return sources;
++	}
++
++	public boolean supportsSource(int source) {
++		return (sources & source) == source;
+ 	}
+ 
+-	/*
+-	 * FIXME: We pretend we can do literally everything here...
+-	 */
++	public int getKeyboardType() {
++		return keyboardType;
++	}
+ 
+-	public boolean[] hasKeys(int... keys) {
+-		boolean[] ret = new boolean[keys.length];
+-		for (int i = 0; i < keys.length; i++) {
+-			ret[i] = true;
++	/** has the keyboard its own row of digit keys? Without one, digits and symbols need a modifier */
++	public boolean atl_has_number_row() {
++		if (keys == null)
++			return true;
++		for (int k = KEY_1; k <= KEY_0; k++) {
++			if (!bit(keys, k))
++				return false;
+ 		}
+-		return ret;
++		return true;
+ 	}
+ 
+-	public List<InputDevice.MotionRange> getMotionRanges() {
+-		MotionRange[] ranges = new MotionRange[32];
++	public KeyCharacterMap getKeyCharacterMap() {
++		return KeyCharacterMap.load(id);
++	}
+ 
+-		for (int i = 0; i < ranges.length; i++) {
+-			ranges[i] = new MotionRange(i);
+-		}
++	public boolean hasMicrophone() {
++		return false;
++	}
++
++	public android.os.Vibrator getVibrator() {
++		return null;
++	}
+ 
++	public boolean[] hasKeys(int... keyCodes) {
++		boolean[] ret = new boolean[keyCodes.length];
++		for (int i = 0; i < keyCodes.length; i++)
++			ret[i] = atl_has_key(keyCodes[i]);
++		return ret;
++	}
++
++	public boolean atl_has_key(int keyCode) {
++		if (keys == null)
++			return KeyCharacterMap.atl_linux_key(keyCode) != 0;
++		int linux = KeyCharacterMap.atl_linux_key(keyCode);
++		return linux != 0 && bit(keys, linux);
++	}
++
++	public List<InputDevice.MotionRange> getMotionRanges() {
+ 		return new ArrayList<InputDevice.MotionRange>();
+ 	}
+ 
+-	public boolean supportsSource(int source) {
+-		return true;
++	public MotionRange getMotionRange(int axis) {
++		return getMotionRange(axis, 0);
+ 	}
+ 
+ 	public MotionRange getMotionRange(int axis, int source) {
+-		return new MotionRange(axis);
++		return null;
++	}
++
++	@Override
++	public String toString() {
++		return "Input Device " + id + ": " + name + " sources=0x" + Integer.toHexString(sources) + " keyboardType=" + keyboardType;
+ 	}
+ 
+ 	public class MotionRange {
+diff --git a/src/api-impl/android/view/InputEvent.java b/src/api-impl/android/view/InputEvent.java
+index cd8b0eb..e3f9547 100644
+--- a/src/api-impl/android/view/InputEvent.java
++++ b/src/api-impl/android/view/InputEvent.java
+@@ -68,7 +68,7 @@ public abstract class InputEvent {
+ 	 * @return The device, or null if unknown.
+ 	 */
+ 	public final InputDevice getDevice() {
+-		return InputDevice.getDevice(0 /*FIXME*/);
++		return InputDevice.getDevice(getDeviceId());
+ 	}
+ 
+ 	/**
+diff --git a/src/api-impl/android/view/KeyCharacterMap.java b/src/api-impl/android/view/KeyCharacterMap.java
+index 8d9faa9..044271c 100644
+--- a/src/api-impl/android/view/KeyCharacterMap.java
++++ b/src/api-impl/android/view/KeyCharacterMap.java
+@@ -271,16 +271,173 @@ public class KeyCharacterMap {
+ 
+ 	private int mPtr;
+ 
+-	private static native void nativeDispose(int ptr);
++	/*
++	 * The map of key codes to characters. Android key codes name the keys of the US layout, so
++	 * the map is that layout; the character a key press really produced under the active layout
++	 * travels with its KeyEvent (getUnicodeChar). mPtr is the id of the device the map was
++	 * loaded for.
++	 */
++	private static final char[] BASE = new char[256];
++	private static final char[] SHIFTED = new char[256];
++	/** Linux input key code by Android key code, 0 where there is none */
++	private static final int[] LINUX_KEY = new int[256];
++
++	private static void key(int keyCode, int linux, char base, char shifted) {
++		BASE[keyCode] = base;
++		SHIFTED[keyCode] = shifted;
++		LINUX_KEY[keyCode] = linux;
++	}
++
++	static {
++		// letters in the order of the Linux key codes of the three rows
++		String[] rows = {"qwertyuiop", "asdfghjkl", "zxcvbnm"};
++		int[] first = {16, 30, 44};
++		for (int r = 0; r < rows.length; r++) {
++			for (int i = 0; i < rows[r].length(); i++) {
++				char c = rows[r].charAt(i);
++				key(KeyEvent.KEYCODE_A + (c - 'a'), first[r] + i, c, Character.toUpperCase(c));
++			}
++		}
++		String digitShift = ")!@#$%^&*(";
++		for (int d = 0; d <= 9; d++)
++			key(KeyEvent.KEYCODE_0 + d, d == 0 ? 11 : 1 + d, (char)('0' + d), digitShift.charAt(d));
++		key(KeyEvent.KEYCODE_SPACE, 57, ' ', ' ');
++		key(KeyEvent.KEYCODE_ENTER, 28, '\n', '\n');
++		key(KeyEvent.KEYCODE_TAB, 15, '\t', '\t');
++		key(KeyEvent.KEYCODE_COMMA, 51, ',', '<');
++		key(KeyEvent.KEYCODE_PERIOD, 52, '.', '>');
++		key(KeyEvent.KEYCODE_SLASH, 53, '/', '?');
++		key(KeyEvent.KEYCODE_SEMICOLON, 39, ';', ':');
++		key(KeyEvent.KEYCODE_APOSTROPHE, 40, '\'', '"');
++		key(KeyEvent.KEYCODE_GRAVE, 41, '`', '~');
++		key(KeyEvent.KEYCODE_MINUS, 12, '-', '_');
++		key(KeyEvent.KEYCODE_EQUALS, 13, '=', '+');
++		key(KeyEvent.KEYCODE_LEFT_BRACKET, 26, '[', '{');
++		key(KeyEvent.KEYCODE_RIGHT_BRACKET, 27, ']', '}');
++		key(KeyEvent.KEYCODE_BACKSLASH, 43, '\\', '|');
++		key(KeyEvent.KEYCODE_AT, 0, '@', '@');
++		key(KeyEvent.KEYCODE_PLUS, 0, '+', '+');
++		key(KeyEvent.KEYCODE_STAR, 0, '*', '*');
++		key(KeyEvent.KEYCODE_POUND, 0, '#', '#');
++		// keys without a character
++		LINUX_KEY[KeyEvent.KEYCODE_DEL] = 14;
++		LINUX_KEY[KeyEvent.KEYCODE_BACK] = 158;
++		LINUX_KEY[KeyEvent.KEYCODE_MENU] = 139;
++		LINUX_KEY[KeyEvent.KEYCODE_ESCAPE] = 1;
++		LINUX_KEY[KeyEvent.KEYCODE_FORWARD_DEL] = 111;
++		LINUX_KEY[KeyEvent.KEYCODE_DPAD_UP] = 103;
++		LINUX_KEY[KeyEvent.KEYCODE_DPAD_DOWN] = 108;
++		LINUX_KEY[KeyEvent.KEYCODE_DPAD_LEFT] = 105;
++		LINUX_KEY[KeyEvent.KEYCODE_DPAD_RIGHT] = 106;
++		LINUX_KEY[KeyEvent.KEYCODE_SHIFT_LEFT] = 42;
++		LINUX_KEY[KeyEvent.KEYCODE_SHIFT_RIGHT] = 54;
++		LINUX_KEY[KeyEvent.KEYCODE_ALT_LEFT] = 56;
++		LINUX_KEY[KeyEvent.KEYCODE_ALT_RIGHT] = 100;
++		LINUX_KEY[KeyEvent.KEYCODE_CTRL_LEFT] = 29;
++		LINUX_KEY[KeyEvent.KEYCODE_CTRL_RIGHT] = 97;
++		LINUX_KEY[KeyEvent.KEYCODE_VOLUME_UP] = 115;
++		LINUX_KEY[KeyEvent.KEYCODE_VOLUME_DOWN] = 114;
++		LINUX_KEY[KeyEvent.KEYCODE_POWER] = 116;
++	}
++
++	/** @hide the Linux input key code behind an Android key code, 0 if none */
++	public static int atl_linux_key(int keyCode) {
++		return keyCode >= 0 && keyCode < LINUX_KEY.length ? LINUX_KEY[keyCode] : 0;
++	}
++
++	/** @hide the Android key code of a Linux input key code, 0 (KEYCODE_UNKNOWN) if none */
++	@android.atl.annotation.Export
++	public static int atl_key_code(int linuxKey) {
++		if (linuxKey <= 0)
++			return 0;
++		for (int k = 0; k < LINUX_KEY.length; k++) {
++			if (LINUX_KEY[k] == linuxKey)
++				return k;
++		}
++		return 0;
++	}
++
++	private static void nativeDispose(int ptr) {}
++
++	private static char nativeGetCharacter(int ptr, int keyCode, int metaState) {
++		if (keyCode < 0 || keyCode >= BASE.length)
++			return 0;
++		boolean shift = (metaState & KeyEvent.META_SHIFT_ON) != 0;
++		char base = BASE[keyCode];
++		if (Character.isLetter(base) && (metaState & KeyEvent.META_CAPS_LOCK_ON) != 0)
++			shift = !shift;
++		return shift ? SHIFTED[keyCode] : base;
++	}
++
++	private static boolean nativeGetFallbackAction(int ptr, int keyCode, int metaState, FallbackAction outFallbackAction) {
++		return false;
++	}
++
++	private static char nativeGetNumber(int ptr, int keyCode) {
++		char c = nativeGetCharacter(ptr, keyCode, 0);
++		return (c >= '0' && c <= '9') || c == '*' || c == '#' || c == '+' ? c : 0;
++	}
++
++	private static char nativeGetMatch(int ptr, int keyCode, char[] chars, int metaState) {
++		char plain = nativeGetCharacter(ptr, keyCode, metaState);
++		char other = nativeGetCharacter(ptr, keyCode, metaState ^ KeyEvent.META_SHIFT_ON);
++		for (char c : chars) {
++			if (c != 0 && c == plain)
++				return c;
++		}
++		for (char c : chars) {
++			if (c != 0 && c == other)
++				return c;
++		}
++		return 0;
++	}
++
++	private static char nativeGetDisplayLabel(int ptr, int keyCode) {
++		char c = nativeGetCharacter(ptr, keyCode, 0);
++		return Character.isLetter(c) ? Character.toUpperCase(c) : c;
++	}
+ 
+-	private static native char nativeGetCharacter(int ptr, int keyCode, int metaState);
+-	private static native boolean nativeGetFallbackAction(int ptr, int keyCode, int metaState,
+-	                                                      FallbackAction outFallbackAction);
+-	private static native char nativeGetNumber(int ptr, int keyCode);
+-	private static native char nativeGetMatch(int ptr, int keyCode, char[] chars, int metaState);
+-	private static native char nativeGetDisplayLabel(int ptr, int keyCode);
+-	private static native int nativeGetKeyboardType(int ptr);
+-	private static native KeyEvent[] nativeGetEvents(int ptr, char[] chars);
++	/** a keyboard with its own digit row is a full one; letters only (digits behind a modifier) is an alphabetic one */
++	private static int nativeGetKeyboardType(int ptr) {
++		InputDevice device = InputDevice.getDevice(ptr);
++		if (device == null || device.isVirtual())
++			return FULL;
++		if (device.getKeyboardType() != InputDevice.KEYBOARD_TYPE_ALPHABETIC)
++			return SPECIAL_FUNCTION;
++		return device.atl_has_number_row() ? FULL : ALPHA;
++	}
++
++	/** null if a character cannot be typed with this map */
++	private static KeyEvent[] nativeGetEvents(int ptr, char[] chars) {
++		java.util.ArrayList<KeyEvent> out = new java.util.ArrayList<>();
++		long now = android.os.SystemClock.uptimeMillis();
++		for (char c : chars) {
++			int code = -1;
++			boolean shift = false;
++			for (int k = 0; k < BASE.length && code < 0; k++) {
++				if (BASE[k] != 0 && BASE[k] == c) {
++					code = k;
++				} else if (SHIFTED[k] != 0 && SHIFTED[k] == c) {
++					code = k;
++					shift = true;
++				}
++			}
++			if (code < 0)
++				return null;
++			int meta = shift ? KeyEvent.META_SHIFT_ON | KeyEvent.META_SHIFT_LEFT_ON : 0;
++			if (shift)
++				out.add(new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT, 0, meta, ptr, 0, 0, InputDevice.SOURCE_KEYBOARD));
++			KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0, meta, ptr, 0, 0, InputDevice.SOURCE_KEYBOARD);
++			KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0, meta, ptr, 0, 0, InputDevice.SOURCE_KEYBOARD);
++			down.unicodeValue = c;
++			up.unicodeValue = c;
++			out.add(down);
++			out.add(up);
++			if (shift)
++				out.add(new KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0, ptr, 0, 0, InputDevice.SOURCE_KEYBOARD));
++		}
++		return out.toArray(new KeyEvent[0]);
++	}
+ 
+ 	// Called from native
+ 	private KeyCharacterMap(int ptr) {
+@@ -307,7 +464,8 @@ public class KeyCharacterMap {
+ 			}
+ 		}
+ 		return inputDevice.getKeyCharacterMap();*/
+-		return new KeyCharacterMap(0);
++		// an unknown device gets the map of the virtual keyboard, as on Android
++		return new KeyCharacterMap(InputDevice.getDevice(deviceId) != null ? deviceId : VIRTUAL_KEYBOARD);
+ 	}
+ 
+ 	/**
+@@ -332,7 +490,7 @@ public class KeyCharacterMap {
+ 	 * @return The associated character or combining accent, or 0 if none.
+ 	 */
+ 	public int get(int keyCode, int metaState) {
+-		return 0;
++		return nativeGetCharacter(mPtr, keyCode, KeyEvent.normalizeMetaState(metaState));
+ 		/*metaState = KeyEvent.normalizeMetaState(metaState);
+ 		char ch = nativeGetCharacter(mPtr, keyCode, metaState);
+ 
+@@ -610,7 +768,7 @@ public class KeyCharacterMap {
+ 	 * @return The keyboard type.
+ 	 */
+ 	public int getKeyboardType() {
+-		return FULL;
++		return nativeGetKeyboardType(mPtr);
+ 		// return nativeGetKeyboardType(mPtr);
+ 	}
+ 
+@@ -664,8 +822,7 @@ public class KeyCharacterMap {
+ 	 * @return True if at least one attached keyboard supports the specified key code.
+ 	 */
+ 	public static boolean deviceHasKey(int keyCode) {
+-		//return InputManager.getInstance().deviceHasKeys(new int[] {keyCode})[0];
+-		return false;
++		return deviceHasKeys(new int[] {keyCode})[0];
+ 	}
+ 
+ 	/**
+@@ -679,9 +836,13 @@ public class KeyCharacterMap {
+ 	 * at the same index in the key codes array.
+ 	 */
+ 	public static boolean[] deviceHasKeys(int[] keyCodes) {
+-		//return InputManager.getInstance().deviceHasKeys(keyCodes);
+-		System.out.println("deviceHasKeys: FIXME");
+-		return null;
++		boolean[] out = new boolean[keyCodes.length];
++		for (int id : InputDevice.getDeviceIds()) {
++			InputDevice device = InputDevice.getDevice(id);
++			for (int i = 0; device != null && i < keyCodes.length; i++)
++				out[i] |= device.atl_has_key(keyCodes[i]);
++		}
++		return out;
+ 	}
+ 
+ 	/**
+diff --git a/src/api-impl/android/view/KeyEvent.java b/src/api-impl/android/view/KeyEvent.java
+index a22e5e6..e8f4582 100644
+--- a/src/api-impl/android/view/KeyEvent.java
++++ b/src/api-impl/android/view/KeyEvent.java
+@@ -2989,8 +2989,11 @@ public class KeyEvent extends InputEvent implements Parcelable {
+ 	 * @return The associated character or combining accent, or 0 if none.
+ 	 */
+ 	public int getUnicodeChar(int metaState) {
+-		// return getKeyCharacterMap().get(mKeyCode, metaState);
+-		return unicodeValue;
++		// what the key press produced under the active keyboard layout; an event made by the
++		// application itself has only its key code
++		if (unicodeValue != 0)
++			return unicodeValue;
++		return getKeyCharacterMap().get(mKeyCode, metaState);
+ 	}
+ 
+ 	/**
+diff --git a/src/api-impl/android/view/MotionEvent.java b/src/api-impl/android/view/MotionEvent.java
+index 442d7b1..fa94a2d 100644
+--- a/src/api-impl/android/view/MotionEvent.java
++++ b/src/api-impl/android/view/MotionEvent.java
+@@ -1735,7 +1735,7 @@ public final class MotionEvent extends InputEvent {
+ 	 */
+ 	@Override
+ 	public final int getDeviceId() {
+-		return 1; // FIXME: implement this properly
++		return InputDevice.atl_touchscreen_id();
+ 			  //return nativeGetDeviceId(mNativePtr);
+ 	}
+ 
+diff --git a/src/api-impl/android/view/View.java b/src/api-impl/android/view/View.java
+index 507a5f4..574bcd2 100644
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -1351,7 +1351,15 @@ public class View implements Drawable.Callback {
+ 		this.id = id;
+ 	}
+ 
+-	public void setOnKeyListener(OnKeyListener l) {}
++	private OnKeyListener atl_key_listener;
++	private native void native_registerKeyEvents(long widget);
++
++	/** the listener sees a key before the view itself does (and before a text field edits) */
++	public void setOnKeyListener(OnKeyListener l) {
++		atl_key_listener = l;
++		if (l != null)
++			native_registerKeyEvents(widget);
++	}
+ 
+ 	public void setFocusable(boolean focusable) {
+ 		atl_focusable = focusable;
+@@ -2534,10 +2542,18 @@ public class View implements Drawable.Callback {
+ 		return false;
+ 	}
+ 
++	public boolean onKeyUp(int keyCode, KeyEvent event) {
++		return false;
++	}
++
+ 	@Export
+ 	public boolean dispatchKeyEvent(KeyEvent event) {
++		if (atl_key_listener != null && atl_key_listener.onKey(this, event.getKeyCode(), event))
++			return true;
+ 		if (event.getAction() == KeyEvent.ACTION_DOWN)
+ 			return onKeyDown(event.getKeyCode(), event);
++		else if (event.getAction() == KeyEvent.ACTION_UP)
++			return onKeyUp(event.getKeyCode(), event);
+ 		else
+ 			return false;
+ 	}

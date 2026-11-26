@@ -1,0 +1,580 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] activities of another package start in that package's own process
+
+Context.startActivity() and Activity.startActivityForResult() created
+every activity inside the calling process, also one whose component names
+another package: its classes are not there (ClassNotFoundException), and
+since other packages' code is no longer loaded into the caller, "Open" in
+an application store did nothing.
+
+An intent whose component or package names another installed package is
+now handed to that package (ATLExternalStart): the caller checks that the
+package is installed, the activity exists, is enabled and exported
+(ActivityNotFoundException otherwise) and that the caller holds the
+permission the activity asks for (SecurityException); then the session
+bus is asked to start the package's process if it is not running and the
+request goes to its "startActivity" action, with action, component, data
+and the extras that can be carried (strings, parcelables). A package the
+bus cannot start is started with `--package` directly. On the target's
+side the request is checked again, the application is brought in front
+(a process started for it gets its window and main activity now), and an
+activity other than the launcher one is put on top.
+
+A result cannot travel back from the other process yet:
+startActivityForResult() starts the activity and reports RESULT_CANCELED
+at once instead of leaving the caller waiting.
+
+ActivityNotFoundException is a RuntimeException with a message, as on
+Android (it was a checked exception without constructors).
+
+Callbacks that GTK calls for clicks, touches, hover and scrolling clear an
+exception the application threw after reporting it; left pending it
+aborted the process at the next JNI call. Hover callbacks without a
+current event (GTK makes up a crossing when a widget appears under the
+pointer) no longer ask it for a position.
+
+---
+  meson.build                                                     |   1 +
+  src/api-impl-jni/content/android_atl_ATLExternalStart.c         | 110 +++++++++++++++++++++++++
+  .../generated_headers/android_atl_ATLExternalStart.h            |  21 +++++
+  src/api-impl-jni/views/android_view_View.c                      |  21 +++--
+  src/api-impl-jni/widgets/WrapperWidget.c                        |   2 +-
+  src/api-impl/android/app/Activity.java                          |  14 ++++
+  src/api-impl/android/app/ContextImpl.java                       |   4 +
+  src/api-impl/android/atl/ATLExternalStart.java                  | 121 ++++++++++++++++++++++++++++
+  src/api-impl/android/atl/ATLLauncherEntry.java                  |   5 ++
+  src/api-impl/android/content/ActivityNotFoundException.java     |   8 +-
+  src/api-impl/android/content/Context.java                       |  24 +++++-
+  src/api-impl/meson.build                                        |   1 +
+  src/main-executable/actions.c                                   |  19 ++++-
+  13 files changed, 339 insertions(+), 12 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 9d168f4..1c3bff6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -165,6 +165,7 @@ libtranslationlayer_so = shared_library('translation_layer_main', [
+                                                                   	'src/api-impl-jni/audio/android_media_SoundPool.c',
+                                                                   	'src/api-impl-jni/audio/audio.c',
+                                                                   	'src/api-impl-jni/com_google_android_gles_jni_GLImpl.c',
++                                                                  	'src/api-impl-jni/content/android_atl_ATLExternalStart.c',
+                                                                   	'src/api-impl-jni/content/android_atl_ATLLauncherEntry.c',
+                                                                   	'src/api-impl-jni/content/android_atl_ATLMediaContentProvider.c',
+                                                                   	'src/api-impl-jni/content/android_content_ClipboardManager.c',
+diff --git a/src/api-impl-jni/content/android_atl_ATLExternalStart.c b/src/api-impl-jni/content/android_atl_ATLExternalStart.c
+new file mode 100644
+index 0000000..e31b85c
+--- /dev/null
++++ b/src/api-impl-jni/content/android_atl_ATLExternalStart.c
+@@ -0,0 +1,110 @@
++#include <gio/gio.h>
++
++#include "../defines.h"
++#include "../util.h"
++
++#include "../generated_headers/android_atl_ATLExternalStart.h"
++
++/*
++ * Hand an activity start to another package. The session bus is asked to start the package's
++ * process if it is not running (the activation file written at installation); the request then
++ * goes to the "startActivity" action of that process. A package the bus cannot start (no
++ * activation file: its name is not a valid bus name, or the file is missing) is started directly;
++ * such a start can only carry the data URI.
++ */
++struct external_start {
++	char *package;
++	char *command;
++	char *uri;
++	GVariant *intent;
++};
++
++static void external_start_free(struct external_start *s)
++{
++	g_free(s->package);
++	g_free(s->command);
++	g_free(s->uri);
++	g_variant_unref(s->intent);
++	g_free(s);
++}
++
++static void started_by_name(GObject *source, GAsyncResult *result, gpointer user_data)
++{
++	struct external_start *s = user_data;
++	GDBusConnection *connection = G_DBUS_CONNECTION(source);
++	GError *error = NULL;
++	GVariant *reply = g_dbus_connection_call_finish(connection, result, &error);
++
++	if (reply)
++		g_variant_unref(reply);
++	if (error && g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN)) {
++		GPtrArray *argv = g_ptr_array_new();
++		g_ptr_array_add(argv, s->command);
++		g_ptr_array_add(argv, "--package");
++		g_ptr_array_add(argv, s->package);
++		if (s->uri && *s->uri) {
++			g_ptr_array_add(argv, "--uri");
++			g_ptr_array_add(argv, s->uri);
++		}
++		g_ptr_array_add(argv, NULL);
++		GError *spawn_error = NULL;
++		if (!g_spawn_async(NULL, (char **)argv->pdata, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &spawn_error)) {
++			fprintf(stderr, "cannot start %s: %s\n", s->package, spawn_error->message);
++			g_error_free(spawn_error);
++		}
++		g_ptr_array_free(argv, TRUE);
++	} else {
++		/* running, started, or still starting: the bus holds the call until the name is taken */
++		if (error)
++			fprintf(stderr, "starting %s over the session bus: %s (sending the request anyway)\n", s->package, error->message);
++		char *object_path = g_strdup_printf("/%s", s->package);
++		g_strdelimit(object_path, ".", '/');
++		g_strdelimit(object_path, "-", '_');
++		GActionGroup *action_group = G_ACTION_GROUP(g_dbus_action_group_get(connection, s->package, object_path));
++		g_action_group_activate_action(action_group, "startActivity", s->intent);
++		g_object_unref(action_group);
++		g_free(object_path);
++	}
++	g_clear_error(&error);
++	external_start_free(s);
++}
++
++JNIEXPORT void JNICALL Java_android_atl_ATLExternalStart_nativeStartExternalActivity(JNIEnv *env, jclass this, jobject intent, jstring package_jstr, jstring command_jstr)
++{
++	GDBusConnection *connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
++	struct external_start *s = g_new0(struct external_start, 1);
++	const char *package = (*env)->GetStringUTFChars(env, package_jstr, NULL);
++	const char *command = (*env)->GetStringUTFChars(env, command_jstr, NULL);
++	jstring data_jstr = J__Intent__getDataString(env, intent);
++
++	s->package = g_strdup(package);
++	s->command = g_strdup(command);
++	if (data_jstr) {
++		const char *data = (*env)->GetStringUTFChars(env, data_jstr, NULL);
++		s->uri = g_strdup(data);
++		(*env)->ReleaseStringUTFChars(env, data_jstr, data);
++	}
++	s->intent = g_variant_ref_sink(intent_serialize(env, intent));
++	(*env)->ReleaseStringUTFChars(env, package_jstr, package);
++	(*env)->ReleaseStringUTFChars(env, command_jstr, command);
++
++	if (!connection || !g_dbus_is_name(s->package)) {
++		/* no bus, or a package name that cannot be a bus name: start it directly */
++		GError *error = g_error_new_literal(G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN, "no bus name");
++		char *argv[] = {s->command, "--package", s->package, (s->uri && *s->uri) ? "--uri" : NULL, s->uri, NULL};
++		GError *spawn_error = NULL;
++		if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &spawn_error)) {
++			fprintf(stderr, "cannot start %s: %s\n", s->package, spawn_error->message);
++			g_error_free(spawn_error);
++		}
++		g_error_free(error);
++		external_start_free(s);
++		if (connection)
++			g_object_unref(connection);
++		return;
++	}
++	g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
++	                       "StartServiceByName", g_variant_new("(su)", s->package, 0), G_VARIANT_TYPE("(u)"),
++	                       G_DBUS_CALL_FLAGS_NONE, 120000, NULL, started_by_name, s);
++	g_object_unref(connection);
++}
+diff --git a/src/api-impl-jni/generated_headers/android_atl_ATLExternalStart.h b/src/api-impl-jni/generated_headers/android_atl_ATLExternalStart.h
+new file mode 100644
+index 0000000..265c44c
+--- /dev/null
++++ b/src/api-impl-jni/generated_headers/android_atl_ATLExternalStart.h
+@@ -0,0 +1,21 @@
++/* DO NOT EDIT THIS FILE - it is machine generated */
++#include <jni.h>
++/* Header for class android_atl_ATLExternalStart */
++
++#ifndef _Included_android_atl_ATLExternalStart
++#define _Included_android_atl_ATLExternalStart
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Class:     android_atl_ATLExternalStart
++ * Method:    nativeStartExternalActivity
++ * Signature: (Landroid/content/Intent;Ljava/lang/String;Ljava/lang/String;)V
++ */
++JNIEXPORT void JNICALL Java_android_atl_ATLExternalStart_nativeStartExternalActivity
++  (JNIEnv *, jclass, jobject, jstring, jstring);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/api-impl-jni/views/android_view_View.c b/src/api-impl-jni/views/android_view_View.c
+index 6005590..4dcea8b 100644
+--- a/src/api-impl-jni/views/android_view_View.c
++++ b/src/api-impl-jni/views/android_view_View.c
+@@ -98,7 +98,7 @@ bool view_dispatch_motionevent(JNIEnv *env, WrapperWidget *wrapper, GtkPropagati
+ 			synthetic_propagation_failed = NULL;
+ 			ret = J__View__dispatchTouchEvent(env, this, motion_event);
+ 			if ((*env)->ExceptionCheck(env))
+-				(*env)->ExceptionDescribe(env);
++				{ (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); } /* an application's exception must not stay pending in a GTK callback */
+ 		}
+ 		if (synthetic_propagation_failed) {
+ 			// The app tried to synthetically propagate the event to a GTK widget, but that is not possible in GTK4,
+@@ -127,7 +127,7 @@ bool view_dispatch_motionevent(JNIEnv *env, WrapperWidget *wrapper, GtkPropagati
+ 	}
+ 
+ 	if ((*env)->ExceptionCheck(env))
+-		(*env)->ExceptionDescribe(env);
++		{ (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); } /* an application's exception must not stay pending in a GTK callback */
+ 
+ 	if (action == ACTION_UP || action == ACTION_CANCEL)
+ 		wrapper->intercepting_touch = false;
+@@ -168,7 +168,7 @@ static void call_hover_callback(jobject this, int action, float x, float y, floa
+ 	jobject motion_event = J_new__MotionEvent__single(env, SOURCE_CLASS_POINTER, action, 0, x, y, x, y);
+ 	J__View__dispatchHoverEvent(env, this, motion_event);
+ 	if ((*env)->ExceptionCheck(env))
+-		(*env)->ExceptionDescribe(env);
++		{ (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); } /* an application's exception must not stay pending in a GTK callback */
+ }
+ 
+ static void transform_coords_to_widget_relative(GtkWidget *widget, double *x, double *y)
+@@ -320,7 +320,7 @@ static void on_click(GtkGestureClick *gesture, int n_press, double x, double y,
+ 	jboolean handled = J__View__performClick(env, wrapper->jobj);
+ 
+ 	if ((*env)->ExceptionCheck(env))
+-		(*env)->ExceptionDescribe(env);
++		{ (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); } /* an application's exception must not stay pending in a GTK callback */
+ 
+ 	if (handled) {
+ 		gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+@@ -377,7 +377,7 @@ static gboolean scroll_cb(GtkEventControllerScroll *controller, gdouble dx, gdou
+ 
+ 	gboolean ret = J__View__dispatchGenericMotionEvent(env, this, motion_event);
+ 	if ((*env)->ExceptionCheck(env))
+-		(*env)->ExceptionDescribe(env);
++		{ (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); } /* an application's exception must not stay pending in a GTK callback */
+ 
+ 	// HACK: replay last hover event to work around scrolling issues in composeUI apps
+ 	if (wrapper->hover_x && wrapper->hover_y)
+@@ -391,7 +391,11 @@ static void hover_enter_cb(GtkEventControllerMotion *controller, double x, doubl
+ 	double raw_x;
+ 	double raw_y;
+ 	GdkEvent *event = gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(controller));
+-	gdk_event_get_position(event, &raw_x, &raw_y);
++	/* a crossing that GTK makes up itself (a widget appears under the pointer) has no event */
++	if (!event || !gdk_event_get_position(event, &raw_x, &raw_y)) {
++		raw_x = x;
++		raw_y = y;
++	}
+ 	wrapper->hover_exit_pending = FALSE;
+ 	wrapper->hover_x = x;
+ 	wrapper->hover_y = y;
+@@ -411,7 +415,10 @@ static void hover_motion_cb(GtkEventControllerMotion *controller, double x, doub
+ 	double raw_x;
+ 	double raw_y;
+ 	GdkEvent *event = gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(controller));
+-	gdk_event_get_position(event, &raw_x, &raw_y);
++	if (!event || !gdk_event_get_position(event, &raw_x, &raw_y)) {
++		raw_x = x;
++		raw_y = y;
++	}
+ 	wrapper->hover_x = x;
+ 	wrapper->hover_y = y;
+ 	call_hover_callback(wrapper->jobj, ACTION_HOVER_MOVE, x, y, raw_x, raw_y);
+diff --git a/src/api-impl-jni/widgets/WrapperWidget.c b/src/api-impl-jni/widgets/WrapperWidget.c
+index 190b163..75463ac 100644
+--- a/src/api-impl-jni/widgets/WrapperWidget.c
++++ b/src/api-impl-jni/widgets/WrapperWidget.c
+@@ -273,7 +273,7 @@ static bool on_click(GtkGestureClick *gesture, int n_press, double x, double y,
+ 
+ 	bool ret = J__View__performClick(env, this);
+ 	if ((*env)->ExceptionCheck(env))
+-		(*env)->ExceptionDescribe(env);
++		{ (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); } /* an application's exception must not stay pending in a GTK callback */
+ 
+ 	return ret;
+ }
+diff --git a/src/api-impl/android/app/Activity.java b/src/api-impl/android/app/Activity.java
+index a428e66..769d242 100644
+--- a/src/api-impl/android/app/Activity.java
++++ b/src/api-impl/android/app/Activity.java
+@@ -329,6 +329,20 @@ public class Activity extends ContextThemeWrapper implements Window.Callback, La
+ 			    }
+ 		    }))
+ 			return;
++		if (android.atl.ATLExternalStart.startActivity(this.get_atl_loaded_app(), intent)) {
++			// The activity now runs in the other package's process. Its result cannot be carried
++			// back yet: the caller is told "cancelled" right away instead of waiting for ever.
++			if (requestCode >= 0) {
++				Slog.w(TAG, "startActivityForResult(" + intent + "): started in another process, reporting RESULT_CANCELED");
++				runOnUiThread(new Runnable() {
++					@Override
++					public void run() {
++						onActivityResult(requestCode, 0 /*RESULT_CANCELED*/, null);
++					}
++				});
++			}
++			return;
++		}
+ 		if (intent.getComponent() != null) {
+ 			try {
+ 				final Activity activity = internalCreateActivity(intent.getComponent().getClassName(), getWindow().native_window, intent);
+diff --git a/src/api-impl/android/app/ContextImpl.java b/src/api-impl/android/app/ContextImpl.java
+index 3c4c313..a236e9f 100644
+--- a/src/api-impl/android/app/ContextImpl.java
++++ b/src/api-impl/android/app/ContextImpl.java
+@@ -332,6 +332,10 @@ public final class ContextImpl extends Context {
+ 			intent = (Intent)intent.getExtras().get("android.intent.extra.INTENT");
+ 		}
+ 
++		// an activity of another installed package runs in that package's process
++		if (android.atl.ATLExternalStart.startActivity(this.atl_loaded_app, intent))
++			return;
++
+ 		String className = null;
+ 		if (intent.getComponent() != null) {
+ 			className = intent.getComponent().getClassName();
+diff --git a/src/api-impl/android/atl/ATLExternalStart.java b/src/api-impl/android/atl/ATLExternalStart.java
+new file mode 100644
+index 0000000..048a030
+--- /dev/null
++++ b/src/api-impl/android/atl/ATLExternalStart.java
+@@ -0,0 +1,121 @@
++package android.atl;
++
++import android.content.ActivityNotFoundException;
++import android.content.ComponentName;
++import android.content.Intent;
++import android.content.pm.PackageParser;
++import android.util.Slog;
++
++/**
++ * Starting an activity of another installed package. Every package runs in a process of its own,
++ * so the request is handed to that package: to its running process, or to a process the session
++ * bus starts for it (the activation file the catalogue wrote), or, without one, to a new
++ * `--package` start. The intent travels with its action, component, data and those extras that
++ * can be carried (strings and parcelables).
++ *
++ * The caller's side checks what the caller may do: the target must be installed, enabled and
++ * exported, and the caller must hold the permission the activity asks for. The target's side
++ * checks again that the component is exported.
++ */
++public final class ATLExternalStart {
++	private static final String TAG = "ATLExternalStart";
++
++	private ATLExternalStart() {}
++
++	private static native void nativeStartExternalActivity(Intent intent, String packageName, String launchCommand);
++
++	/** the activity of `pkg` an intent means: by component, else the best match of the filters; null if none */
++	public static PackageParser.Activity resolve(PackageParser.Package pkg, Intent intent) {
++		ComponentName component = intent.getComponent();
++		if (component != null) {
++			for (PackageParser.Activity activity : pkg.activities) {
++				if (activity.className.equals(component.getClassName()))
++					return activity;
++			}
++			return null;
++		}
++		PackageParser.Activity found = null;
++		int best = 0;
++		for (PackageParser.Activity activity : pkg.activities) {
++			if (activity.intents == null || !activity.info.enabled)
++				continue;
++			for (PackageParser.IntentInfo filter : activity.intents) {
++				int score = filter.match(intent.getAction(), intent.getType(), intent.getScheme(), intent.getData(), intent.getCategories(), TAG);
++				if (score > best) {
++					best = score;
++					found = activity;
++				}
++			}
++		}
++		return found;
++	}
++
++	/** the activity a start from the launcher shows: the first enabled one with MAIN and LAUNCHER */
++	public static PackageParser.Activity launcherActivity(PackageParser.Package pkg) {
++		for (PackageParser.Activity activity : pkg.activities) {
++			if (!activity.info.enabled || activity.intents == null)
++				continue;
++			for (PackageParser.IntentInfo filter : activity.intents) {
++				if (filter.hasAction(Intent.ACTION_MAIN) && filter.hasCategory(Intent.CATEGORY_LAUNCHER))
++					return activity;
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * If the intent names another package, start its activity there and return true. Returns false
++	 * for an intent that stays in this process.
++	 *
++	 * @throws ActivityNotFoundException the package is not installed, or has no such activity, or
++	 *         the activity is disabled or not exported
++	 * @throws SecurityException the caller lacks the permission the activity requires
++	 */
++	public static boolean startActivity(ATLLoadedApp caller, Intent intent) {
++		String target = intent.getComponent() != null ? intent.getComponent().getPackageName() : intent.getPackage();
++		if (target == null || target.equals(caller.pkg.packageName) || "android".equals(target) || "atl".equals(target)
++		    || ATLLoadedAppManager.runsInThisProcess(target))
++			return false;
++
++		PackageParser.Package pkg = ATLPackageStore.get(target) != null ? ATLLoadedAppManager.getPackageFromPackageName(target) : null;
++		if (pkg == null)
++			throw new ActivityNotFoundException("No Activity found to handle " + intent + ": package " + target + " is not installed");
++		PackageParser.Activity activity = resolve(pkg, intent);
++		if (activity == null || !activity.info.enabled)
++			throw new ActivityNotFoundException("No Activity found to handle " + intent + " in " + target);
++		if (!activity.info.exported)
++			throw new ActivityNotFoundException("Unable to start " + target + "/" + activity.className + " from " + caller.pkg.packageName + ": the activity is not exported");
++		if (activity.info.permission != null && !ATLPermissions.holds(caller.pkg, activity.info.permission, false))
++			throw new SecurityException("Permission Denial: starting " + intent + " from " + caller.pkg.packageName + " requires " + activity.info.permission);
++
++		Intent out = new Intent(intent);
++		out.setComponent(new ComponentName(target, activity.className));
++		out.setPackage(target);
++		Slog.i(TAG, caller.pkg.packageName + " starts " + target + "/" + activity.className + " in its own process");
++		nativeStartExternalActivity(out, target, ATLLauncherEntry.launchCommandFor(target));
++		return true;
++	}
++
++	/**
++	 * A start request that arrived from another package, seen from the target's side:
++	 * 0 refuse it, 1 start the activity it names, 2 it is the launcher start: show the application
++	 * as a start from the launcher would.
++	 */
++	public static int incomingKind(Intent intent) {
++		PackageParser.Package pkg = ATLLoadedApp.getPrimaryApplication().pkg;
++		PackageParser.Activity activity = resolve(pkg, intent);
++		if (activity == null) {
++			Slog.w(TAG, "request from another package: no activity for " + intent);
++			return 0;
++		}
++		if (!activity.info.enabled || !activity.info.exported || activity.info.permission != null) {
++			Slog.w(TAG, "request from another package refused: " + pkg.packageName + "/" + activity.className
++			                + (!activity.info.enabled ? " is disabled" : !activity.info.exported ? " is not exported" : " requires " + activity.info.permission));
++			return 0;
++		}
++		// a start that carries data or extras is a request to that activity, not just "show the application"
++		boolean plain = intent.getData() == null && (intent.getAction() == null || Intent.ACTION_MAIN.equals(intent.getAction()))
++		                && (intent.getExtras() == null || intent.getExtras().isEmpty());
++		return plain && activity == launcherActivity(pkg) ? 2 : 1;
++	}
++}
+diff --git a/src/api-impl/android/atl/ATLLauncherEntry.java b/src/api-impl/android/atl/ATLLauncherEntry.java
+index 679736e..11f3f1d 100644
+--- a/src/api-impl/android/atl/ATLLauncherEntry.java
++++ b/src/api-impl/android/atl/ATLLauncherEntry.java
+@@ -57,6 +57,11 @@ public final class ATLLauncherEntry {
+ 	}
+ 
+ 	/** the command that starts ATL for an installed package; the wrapper of the distribution if there is one */
++	/** the program that starts an installed package with `--package NAME` */
++	static String launchCommandFor(String packageName) {
++		return launchCommand();
++	}
++
+ 	private static String launchCommand() {
+ 		String cmd = System.getenv("ATL_LAUNCH_COMMAND");
+ 		if (cmd != null && !cmd.isEmpty())
+diff --git a/src/api-impl/android/content/ActivityNotFoundException.java b/src/api-impl/android/content/ActivityNotFoundException.java
+index 1febd57..1edb4b7 100644
+--- a/src/api-impl/android/content/ActivityNotFoundException.java
++++ b/src/api-impl/android/content/ActivityNotFoundException.java
+@@ -1,4 +1,10 @@
+ package android.content;
+ 
+-public class ActivityNotFoundException extends Exception {
++public class ActivityNotFoundException extends RuntimeException {
++	public ActivityNotFoundException() {
++	}
++
++	public ActivityNotFoundException(String name) {
++		super(name);
++	}
+ }
+diff --git a/src/api-impl/android/content/Context.java b/src/api-impl/android/content/Context.java
+index 6a42767..25b21be 100644
+--- a/src/api-impl/android/content/Context.java
++++ b/src/api-impl/android/content/Context.java
+@@ -199,6 +199,12 @@ public abstract class Context {
+ 		Slog.w(TAG, "request from another package: no service for " + intent);
+ 	}
+ 
++	/** see ATLExternalStart.incomingKind(): 0 refuse, 1 start the named activity, 2 show the application */
++	@Export
++	static int atl_external_activity_kind(Intent intent) {
++		return android.atl.ATLExternalStart.incomingKind(intent);
++	}
++
+ 	@Export
+ 	static void atl_external_start_activity(Intent intent) {
+ 		ATLLoadedApp primary = ATLLoadedApp.getPrimaryApplication();
+@@ -280,10 +286,24 @@ public abstract class Context {
+ 
+ 	public abstract Object getSystemService(Class<?> serviceClass) throws InstantiationException, IllegalAccessException, InvocationTargetException;
+ 
+-	public Intent registerReceiver(BroadcastReceiver receiver, IntentFilter filter) {
++	public Intent registerReceiver(final BroadcastReceiver receiver, IntentFilter filter) {
++		// the battery state is a sticky broadcast: a registration, also one without a receiver,
++		// gets the current state back (work schedulers read "battery not low" this way)
++		final Intent battery = filter != null && filter.matchAction(Intent.ACTION_BATTERY_CHANGED)
++		    ? android.os.BatteryManager.atl_battery_changed() : null;
+ 		if (receiver == null)
+-			return null;
++			return battery;
+ 		receiverMap.put(filter, receiver);
++		if (battery != null) {
++			final Context context = this;
++			new Handler(Looper.getMainLooper()).post(new Runnable() {
++				@Override
++				public void run() {
++					receiver.onReceive(context, battery);
++				}
++			});
++			return battery;
++		}
+ 		return new Intent();
+ 	}
+ 
+diff --git a/src/api-impl/meson.build b/src/api-impl/meson.build
+index aee7faa..acfc69a 100644
+--- a/src/api-impl/meson.build
++++ b/src/api-impl/meson.build
+@@ -93,6 +93,7 @@ srcs = [
+ 	'android/atl/ATLKeyboardDialog.java',
+ 	'android/atl/ATLKeyboardViewer.java',
+ 	'android/atl/ATLApkVerifier.java',
++	'android/atl/ATLExternalStart.java',
+ 	'android/atl/ATLInstallIntents.java',
+ 	'android/atl/ATLLauncherEntry.java',
+ 	'android/atl/ATLLoadedApp.java',
+diff --git a/src/main-executable/actions.c b/src/main-executable/actions.c
+index 41f10e2..82c0dac 100644
+--- a/src/main-executable/actions.c
++++ b/src/main-executable/actions.c
+@@ -9,9 +9,26 @@ static void action_start_activity(GSimpleAction *action, GVariant *parameter, gp
+ 	JNIEnv *env = get_jni_env();
+ 
+ 	jobject intent = intent_deserialize(env, parameter);
+-	J__Context__atl_external_start_activity(env, intent);
++	int kind = J__Context__atl_external_activity_kind(env, intent);
+ 	if ((*env)->ExceptionCheck(env)) {
+ 		(*env)->ExceptionDescribe(env);
++		(*env)->ExceptionClear(env);
++		return;
++	}
++	if (!kind)
++		return;
++	/*
++	 * Bring the application in front of the user first: a process started for this request has no
++	 * window yet and gets its main activity now, a running one is raised. A start of the launcher
++	 * activity is complete with that; any other activity goes on top.
++	 */
++	g_application_activate(g_application_get_default());
++	if (kind == 1) {
++		J__Context__atl_external_start_activity(env, intent);
++		if ((*env)->ExceptionCheck(env)) {
++			(*env)->ExceptionDescribe(env);
++			(*env)->ExceptionClear(env);
++		}
+ 	}
+ }
+ 

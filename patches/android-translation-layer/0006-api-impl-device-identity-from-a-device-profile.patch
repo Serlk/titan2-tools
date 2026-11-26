@@ -1,0 +1,333 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] api-impl: device identity from a device profile
+
+android.os.Build and SystemProperties only had a few hard-coded values
+(brand "google", manufacturer "HTC", everything else "unknown"), so apps saw
+no real device. Read a build.prop-style profile (name=value lines, '#'
+comments) from $ATL_DEVICE_PROFILE or /etc/atl/device.prop on top of the
+built-in defaults; without a profile nothing changes. A distribution can
+generate the profile from the device's own firmware (ro.product.*,
+ro.build.*, ro.serialno, ro.hardware, ...), so Build.MANUFACTURER, BRAND,
+MODEL, DEVICE, PRODUCT, BOARD, HARDWARE, FINGERPRINT, ID, DISPLAY, TAGS,
+TYPE, VERSION.RELEASE/INCREMENTAL/SECURITY_PATCH, SERIAL and getprop-style
+reads through SystemProperties (also via reflection) report that device.
+
+What describes the runtime rather than the device is never taken from the
+profile: ro.build.version.sdk (and preview_sdk) always reads as
+Build.VERSION.SDK_INT, the API level ATL emulates for the app, and the ABI
+list (ro.product.cpu.*) stays what this runtime can execute.
+
+Also:
+- Build.MANUFACTURER reads ro.product.manufacturer (default still "HTC"),
+  Build.RADIO/getRadioVersion() gsm.version.baseband; new Build.getSerial(),
+  SKU, ODM_SKU, SOC_MANUFACTURER, SOC_MODEL.
+- SystemProperties: get(key) returns "" (not null) for unset keys and
+  get(key, def) returns def for empty values, as on Android; getBoolean is
+  static and understands 1/0/y/n/yes/no/on/off/true/false; getInt/getLong
+  fall back to the default on garbage; hidden set() for this process.
+- Settings.Secure.ANDROID_ID: instead of a constant string, 16 hex digits
+  derived from a random per-installation seed (<ATL data dir>/.android_id_seed)
+  and the app's signing certificate (package name if unsigned), stable across
+  runs and different per signer, like Android 8+.
+
+SPDX-License-Identifier: GPL-3.0-only
+---
+diff --git a/src/api-impl/android/os/Build.java b/src/api-impl/android/os/Build.java
+index 6b182da..8a60eb5 100644
+--- a/src/api-impl/android/os/Build.java
++++ b/src/api-impl/android/os/Build.java
+@@ -69,7 +69,7 @@ public class Build {
+ 	/**
+ 	 * The manufacturer of the product/hardware.
+ 	 */
+-	public static final String MANUFACTURER = "HTC" /* HTC picked at random; getString("ro.product.manufacturer")*/;
++	public static final String MANUFACTURER = getString("ro.product.manufacturer"); /* "HTC" unless a device profile sets it */
+ 
+ 	/**
+ 	 * The brand (e.g., carrier) the software is customized for, if any.
+@@ -95,7 +95,7 @@ public class Build {
+ 	 * {@link #getRadioVersion} instead.
+ 	 */
+ 	@Deprecated
+-	public static final String RADIO = getString("FIXME");
++	public static final String RADIO = getString("gsm.version.baseband");
+ 
+ 	/**
+ 	 * The name of the hardware (from the kernel command line or /proc).
+@@ -107,6 +107,22 @@ public class Build {
+ 	 */
+ 	public static final String SERIAL = getString("ro.serialno");
+ 
++	/**
++	 * The SKU of the hardware (SKU may be empty), the manufacturer and model of the SoC.
++	 */
++	public static final String SKU = getString("ro.boot.hardware.sku");
++	public static final String ODM_SKU = getString("ro.boot.product.hardware.sku");
++	public static final String SOC_MANUFACTURER = getString("ro.soc.manufacturer");
++	public static final String SOC_MODEL = getString("ro.soc.model");
++
++	/**
++	 * Gets the hardware serial number (ro.serialno from the device profile), or UNKNOWN.
++	 * Real Android requires READ_PRIVILEGED_PHONE_STATE for this; there are no such checks here.
++	 */
++	public static String getSerial() {
++		return SERIAL;
++	}
++
+ 	public static final String[] SUPPORTED_ABIS = getString("ro.product.cpu.abilist").split(",");
+ 
+ 	public static final String[] SUPPORTED_32_BIT_ABIS = getStringList("ro.product.cpu.abilist32", ",");
+@@ -1050,7 +1066,8 @@ public class Build {
+ 	 * null (if, for instance, the radio is not currently on).
+ 	 */
+ 	public static String getRadioVersion() {
+-		return null;
++		String radio = SystemProperties.get("gsm.version.baseband", null);
++		return (radio == null || radio.isEmpty()) ? null : radio;
+ 	}
+ 
+ 	private static String getString(String property) {
+diff --git a/src/api-impl/android/os/SystemProperties.java b/src/api-impl/android/os/SystemProperties.java
+index 814bdff..73e68eb 100644
+--- a/src/api-impl/android/os/SystemProperties.java
++++ b/src/api-impl/android/os/SystemProperties.java
+@@ -1,16 +1,24 @@
+ package android.os;
+ 
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
+ import java.util.Properties;
+ 
+ public class SystemProperties {
+ 	private static final Properties properties = new Properties();
+ 
++	/* Device profile: build.prop-style "name=value" lines describing the device the apps should
++	 * see (ro.product.*, ro.build.*, ro.serialno, ...). The path can be overridden with
++	 * ATL_DEVICE_PROFILE (an empty value disables the profile). Without a profile the built-in
++	 * defaults below are used. */
++	public static final String DEFAULT_DEVICE_PROFILE = "/etc/atl/device.prop";
++
+ 	static {
+-		String SDK_INT_str = System.getProperty("Build.VERSION.SDK_INT");
+-		if (SDK_INT_str == null)
+-			SDK_INT_str = "" + Build.VERSION_CODES.GINGERBREAD;
+-		properties.put("ro.build.version.sdk", SDK_INT_str);
+ 		properties.put("ro.product.brand", "google");
++		properties.put("ro.product.manufacturer", "HTC"); /* HTC picked at random */
+ 		properties.put("ro.build.tags", "release-keys");
+ 		properties.put("ro.build.type", "user");
+ 		// TODO how to actually get the system's supported abis?
+@@ -25,33 +33,105 @@ public class SystemProperties {
+ 			properties.put("ro.product.cpu.abilist", "arm64-v8a");
+ 			properties.put("ro.product.cpu.abilist64", "arm64-v8a");
+ 		}
++		String profile = System.getenv("ATL_DEVICE_PROFILE");
++		if (profile == null)
++			profile = DEFAULT_DEVICE_PROFILE;
++		if (!profile.isEmpty())
++			loadProfile(new File(profile));
++	}
++
++	/* Properties that describe what this runtime can do rather than the device; a profile
++	 * taken from the device's firmware must not change them. */
++	private static boolean isRuntimeProperty(String name) {
++		return name.equals("ro.build.version.sdk") || name.equals("ro.build.version.preview_sdk") || name.startsWith("ro.product.cpu.");
++	}
++
++	private static void loadProfile(File file) {
++		if (!file.isFile())
++			return;
++		int count = 0;
++		try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), "UTF-8"))) {
++			String line;
++			while ((line = reader.readLine()) != null) {
++				line = line.trim();
++				if (line.isEmpty() || line.startsWith("#"))
++					continue;
++				int eq = line.indexOf('=');
++				if (eq <= 0)
++					continue;
++				String name = line.substring(0, eq).trim();
++				String value = line.substring(eq + 1).trim();
++				if (isRuntimeProperty(name))
++					continue;
++				properties.put(name, value);
++				count++;
++			}
++		} catch (IOException e) {
++			System.err.println("SystemProperties: cannot read device profile " + file + ": " + e);
++			return;
++		}
++		System.out.println("SystemProperties: " + count + " properties from device profile " + file);
++	}
++
++	private static String lookup(String prop) {
++		/* the API level is the one this runtime emulates for the app (see Build.VERSION) */
++		if ("ro.build.version.sdk".equals(prop))
++			return String.valueOf(Build.VERSION.SDK_INT);
++		return properties.getProperty(prop);
+ 	}
+ 
+ 	public static String get(String prop) {
+ 		android.util.Log.i("SystemProperties", "Grabbing String prop " + prop);
+-		return properties.getProperty(prop);
++		String val = lookup(prop);
++		/* the Android API returns "" for unset properties, never null */
++		return val == null ? "" : val;
+ 	}
+ 
+ 	public static String get(String prop, String def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing String prop " + prop + ", default " + def);
+-		return properties.getProperty(prop, def);
++		String val = lookup(prop);
++		return (val == null || val.isEmpty()) ? def : val;
+ 	}
+ 
+-	public boolean getBoolean(String prop, boolean def) {
++	public static boolean getBoolean(String prop, boolean def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing boolean prop " + prop + ", default " + def);
+-		String val = properties.getProperty(prop);
+-		return val == null ? def : Boolean.parseBoolean(val);
++		String val = lookup(prop);
++		if (val == null || val.isEmpty())
++			return def;
++		if (val.equals("1") || val.equals("y") || val.equals("yes") || val.equals("on") || val.equals("true"))
++			return true;
++		if (val.equals("0") || val.equals("n") || val.equals("no") || val.equals("off") || val.equals("false"))
++			return false;
++		return def;
+ 	}
+ 
+ 	public static int getInt(String prop, int def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing int prop " + prop + ", default " + def);
+-		String val = properties.getProperty(prop);
+-		return val == null ? def : Integer.parseInt(val);
++		String val = lookup(prop);
++		try {
++			return val == null ? def : Integer.parseInt(val.trim());
++		} catch (NumberFormatException e) {
++			return def;
++		}
+ 	}
+ 
+ 	public static long getLong(String prop, long def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing long prop " + prop + ", default " + def);
+-		String val = properties.getProperty(prop);
+-		return val == null ? def : Long.parseLong(val);
++		String val = lookup(prop);
++		try {
++			return val == null ? def : Long.parseLong(val.trim());
++		} catch (NumberFormatException e) {
++			return def;
++		}
++	}
++
++	/* hidden API, used by some apps through reflection; only changes this process' copy */
++	public static void set(String prop, String val) {
++		if (prop == null || isRuntimeProperty(prop))
++			return;
++		if (val == null)
++			properties.remove(prop);
++		else
++			properties.put(prop, val);
+ 	}
+ }
+diff --git a/src/api-impl/android/provider/Settings.java b/src/api-impl/android/provider/Settings.java
+index ddee1de..b136d0c 100644
+--- a/src/api-impl/android/provider/Settings.java
++++ b/src/api-impl/android/provider/Settings.java
+@@ -1,10 +1,18 @@
+ package android.provider;
+ 
++import android.atl.ATLLoadedApp;
++import android.atl.ATLPaths;
+ import android.content.ContentResolver;
+ import android.content.Context;
+ import android.net.Uri;
+ import android.util.AndroidException;
+ import android.util.Slog;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.security.MessageDigest;
++import java.security.SecureRandom;
+ 
+ public class Settings {
+ 	public static class NameValueTable implements BaseColumns {}
+@@ -17,10 +25,71 @@ public class Settings {
+ 			return Uri.withAppendedPath(CONTENT_URI, name);
+ 		}
+ 
++		public static final String ANDROID_ID = "android_id";
++
++		private static String android_id;
++
++		/* Like Android 8+: a 64-bit value, as 16 hex digits, stable for this installation (a
++		 * random seed kept in the ATL data directory) and different for each app signing key
++		 * (or package name, for unsigned packages), so apps cannot correlate users by it. */
++		private static synchronized String getAndroidId() {
++			if (android_id != null)
++				return android_id;
++			byte[] seed = loadSeed(new File(ATLPaths.app_data_dir_base, ".android_id_seed"));
++			String scope = "";
++			try {
++				android.content.pm.PackageParser.Package pkg = ATLLoadedApp.getPrimaryApplication().pkg;
++				if (pkg.mSignatures != null && pkg.mSignatures.length > 0)
++					scope = pkg.mSignatures[0].toCharsString();
++				else
++					scope = pkg.packageName;
++			} catch (Exception e) {
++				Slog.w(TAG, "android_id: no package information: " + e);
++			}
++			try {
++				MessageDigest md = MessageDigest.getInstance("SHA-256");
++				md.update(seed);
++				md.update(scope.getBytes("UTF-8"));
++				byte[] d = md.digest();
++				StringBuilder sb = new StringBuilder();
++				for (int i = 0; i < 8; i++)
++					sb.append(String.format("%02x", d[i] & 0xff));
++				android_id = sb.toString();
++			} catch (Exception e) {
++				android_id = "0000000000000000";
++			}
++			return android_id;
++		}
++
++		private static byte[] loadSeed(File file) {
++			byte[] seed = new byte[32];
++			try (FileInputStream in = new FileInputStream(file)) {
++				int n = 0, r;
++				while (n < seed.length && (r = in.read(seed, n, seed.length - n)) > 0)
++					n += r;
++				if (n == seed.length)
++					return seed;
++			} catch (IOException e) {
++			}
++			new SecureRandom().nextBytes(seed);
++			try {
++				file.getParentFile().mkdirs();
++				File tmp = new File(file.getPath() + ".tmp");
++				try (FileOutputStream out = new FileOutputStream(tmp)) {
++					out.write(seed);
++				}
++				if (!tmp.renameTo(file))
++					Slog.w(TAG, "android_id: cannot store the seed in " + file);
++			} catch (IOException e) {
++				Slog.w(TAG, "android_id: cannot store the seed in " + file + ": " + e);
++			}
++			return seed;
++		}
++
+ 		public static String getString(ContentResolver content_resolver, String key) {
+ 			switch (key) {
+ 				case "android_id":
+-					return "_totally_an_androidID"; // TODO: is this a good ID? :P
++					return getAndroidId();
+ 				case "advertising_id":
+ 					return "";
+ 				default:

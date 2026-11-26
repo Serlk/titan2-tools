@@ -1,0 +1,24 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] jni_upcall_gen: build with a Java 8 compiler
+
+Alpine builds ATL with openjdk8 (the api-impl classes must stay at class
+file version 52 for the dex tools). The generator uses Path.of() (Java 11)
+and Files.mismatch() (Java 12); use Paths.get() and a byte comparison so
+javac 8 compiles it.
+
+SPDX-License-Identifier: GPL-3.0-only
+---
+--- a/tools/jni_upcall_gen/src/JNIUpcallWrapperGenerator.java
++++ b/tools/jni_upcall_gen/src/JNIUpcallWrapperGenerator.java
+@@ -199,8 +199,9 @@
+
+ 		if (destPath != null) {
+ 			out.close();
+-			Path _destPath = Path.of(destPath);
+-			if (Files.notExists(_destPath) || Files.mismatch(tempPath, _destPath) != -1)
++			Path _destPath = Paths.get(destPath);
++			if (Files.notExists(_destPath) ||
++					!java.util.Arrays.equals(Files.readAllBytes(tempPath), Files.readAllBytes(_destPath)))
+ 				Files.move(tempPath, _destPath, StandardCopyOption.REPLACE_EXISTING);
+ 		}
+ 	}

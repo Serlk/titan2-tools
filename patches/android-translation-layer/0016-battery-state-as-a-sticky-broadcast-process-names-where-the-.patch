@@ -1,0 +1,227 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] battery state as a sticky broadcast; process names where the manifest has none
+
+registerReceiver() for ACTION_BATTERY_CHANGED returned null without a
+receiver and an empty intent with one. Work schedulers read "battery not
+low" from that sticky intent and treat a missing one as "low", so work
+with that constraint never ran. The intent now carries level, scale,
+status, plugged, health, voltage and temperature from
+/sys/class/power_supply (a machine without a battery reads as full and
+on external power); a registered receiver gets it once. BatteryManager
+answers from the same data.
+
+ApplicationInfo.processName and the components' processName were null
+when the manifest names no process (the parser leaves that to the package
+manager). Libraries compare it with the name of the running process to
+tell the main process from a secondary one and refused to schedule work
+"in a secondary process". The name is the package name now.
+
+---
+  src/api-impl/android/atl/ATLLoadedApp.java    |  21 +++++++
+  src/api-impl/android/atl/ATLPackageStore.java |   1 +
+  src/api-impl/android/os/BatteryManager.java   | 137 +++++++++++++++++++++++++++++++++++++++++++++-
+  3 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/src/api-impl/android/atl/ATLLoadedApp.java b/src/api-impl/android/atl/ATLLoadedApp.java
+index 5a6d737..145dab2 100644
+--- a/src/api-impl/android/atl/ATLLoadedApp.java
++++ b/src/api-impl/android/atl/ATLLoadedApp.java
+@@ -126,6 +126,7 @@ public final class ATLLoadedApp {
+ 			throw new IOException(outError[0]);
+ 		}
+ 		pkg.applicationInfo.sourceDir = mainApk;
++		fixProcessNames(pkg);
+ 		ATLPackageStore.Record record = ATLPackageStore.forApkPath(mainApk);
+ 		if (record != null && record.packageName.equals(pkg.packageName)) {
+ 			// an installed package: signer, ids and directories come from the catalogue
+@@ -137,6 +138,26 @@ public final class ATLLoadedApp {
+ 		return new ATLLoadedApp(resources, classLoader, pkg);
+ 	}
+ 
++	/**
++	 * The manifest parser leaves the process name empty where the manifest names none; the name
++	 * of such a process is the package name. Libraries compare it with the name of the running
++	 * process to tell the main process from a secondary one.
++	 */
++	public static void fixProcessNames(PackageParser.Package pkg) {
++		if (pkg.applicationInfo.processName == null)
++			pkg.applicationInfo.processName = pkg.packageName;
++		java.util.List<PackageParser.Component<?>> all = new java.util.ArrayList<>();
++		all.addAll(pkg.activities);
++		all.addAll(pkg.receivers);
++		all.addAll(pkg.services);
++		all.addAll(pkg.providers);
++		for (PackageParser.Component<?> c : all) {
++			android.content.pm.ComponentInfo info = ATLPackageStore.componentInfo(c);
++			if (info != null && info.processName == null)
++				info.processName = pkg.applicationInfo.processName;
++		}
++	}
++
+ 	public Resources createDefaultResources() {
+ 		return this.createResources(this.default_resources.getDisplayMetrics(), Context.sys_config);
+ 	}
+diff --git a/src/api-impl/android/atl/ATLPackageStore.java b/src/api-impl/android/atl/ATLPackageStore.java
+index f1e8e1b..a58a6b1 100644
+--- a/src/api-impl/android/atl/ATLPackageStore.java
++++ b/src/api-impl/android/atl/ATLPackageStore.java
+@@ -513,6 +513,7 @@ public final class ATLPackageStore {
+ 		}
+ 		if (out.pkg == null)
+ 			throw new IOException(err[0] != null ? err[0] : "manifest could not be parsed");
++		ATLLoadedApp.fixProcessNames(out.pkg);
+ 		out.resources = res;
+ 		return out;
+ 	}
+diff --git a/src/api-impl/android/os/BatteryManager.java b/src/api-impl/android/os/BatteryManager.java
+index 10d720a..ee65be5 100644
+--- a/src/api-impl/android/os/BatteryManager.java
++++ b/src/api-impl/android/os/BatteryManager.java
+@@ -1,12 +1,145 @@
+ package android.os;
+ 
++import android.content.Intent;
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileReader;
++import java.io.IOException;
++
++/**
++ * The battery as the kernel reports it (/sys/class/power_supply). A machine without a battery
++ * reads as absent, full and on external power.
++ */
+ public class BatteryManager {
++	public static final String EXTRA_STATUS = "status";
++	public static final String EXTRA_HEALTH = "health";
++	public static final String EXTRA_PRESENT = "present";
++	public static final String EXTRA_LEVEL = "level";
++	public static final String EXTRA_BATTERY_LOW = "battery_low";
++	public static final String EXTRA_SCALE = "scale";
++	public static final String EXTRA_PLUGGED = "plugged";
++	public static final String EXTRA_VOLTAGE = "voltage";
++	public static final String EXTRA_TEMPERATURE = "temperature";
++	public static final String EXTRA_TECHNOLOGY = "technology";
++
++	public static final int BATTERY_STATUS_UNKNOWN = 1;
++	public static final int BATTERY_STATUS_CHARGING = 2;
++	public static final int BATTERY_STATUS_DISCHARGING = 3;
++	public static final int BATTERY_STATUS_NOT_CHARGING = 4;
++	public static final int BATTERY_STATUS_FULL = 5;
++	public static final int BATTERY_HEALTH_UNKNOWN = 1;
++	public static final int BATTERY_HEALTH_GOOD = 2;
++	public static final int BATTERY_PLUGGED_AC = 1;
++	public static final int BATTERY_PLUGGED_USB = 2;
++	public static final int BATTERY_PLUGGED_WIRELESS = 4;
++
++	public static final int BATTERY_PROPERTY_CHARGE_COUNTER = 1;
++	public static final int BATTERY_PROPERTY_CURRENT_NOW = 2;
++	public static final int BATTERY_PROPERTY_CURRENT_AVERAGE = 3;
++	public static final int BATTERY_PROPERTY_CAPACITY = 4;
++	public static final int BATTERY_PROPERTY_ENERGY_COUNTER = 5;
++	public static final int BATTERY_PROPERTY_STATUS = 6;
++
++	private static String read(File dir, String name) {
++		try (BufferedReader r = new BufferedReader(new FileReader(new File(dir, name)))) {
++			String line = r.readLine();
++			return line == null ? null : line.trim();
++		} catch (IOException e) {
++			return null;
++		}
++	}
++
++	private static int number(File dir, String name, int def) {
++		String v = read(dir, name);
++		if (v == null)
++			return def;
++		try {
++			return (int)Long.parseLong(v);
++		} catch (NumberFormatException e) {
++			return def;
++		}
++	}
++
++	/** the state as the sticky ACTION_BATTERY_CHANGED broadcast carries it */
++	public static Intent atl_battery_changed() {
++		File battery = null;
++		int plugged = 0;
++		File[] supplies = new File("/sys/class/power_supply").listFiles();
++		if (supplies != null) {
++			for (File s : supplies) {
++				String type = read(s, "type");
++				if (type == null)
++					continue;
++				if (type.equals("Battery")) {
++					// a phone's own battery, not that of a connected peripheral
++					String scope = read(s, "scope");
++					if (battery == null && !"Device".equals(scope))
++						battery = s;
++				} else if (number(s, "online", 0) == 1) {
++					if (type.equals("Mains"))
++						plugged |= BATTERY_PLUGGED_AC;
++					else if (type.startsWith("USB"))
++						plugged |= BATTERY_PLUGGED_USB;
++					else if (type.equals("Wireless"))
++						plugged |= BATTERY_PLUGGED_WIRELESS;
++				}
++			}
++		}
++		Intent intent = new Intent(Intent.ACTION_BATTERY_CHANGED);
++		intent.putExtra(EXTRA_SCALE, 100);
++		if (battery == null) {
++			intent.putExtra(EXTRA_PRESENT, false);
++			intent.putExtra(EXTRA_LEVEL, 100);
++			intent.putExtra(EXTRA_STATUS, BATTERY_STATUS_FULL);
++			intent.putExtra(EXTRA_PLUGGED, BATTERY_PLUGGED_AC);
++			intent.putExtra(EXTRA_HEALTH, BATTERY_HEALTH_UNKNOWN);
++			intent.putExtra(EXTRA_BATTERY_LOW, false);
++			return intent;
++		}
++		int level = number(battery, "capacity", -1);
++		String state = read(battery, "status");
++		int status = BATTERY_STATUS_UNKNOWN;
++		if ("Charging".equals(state))
++			status = BATTERY_STATUS_CHARGING;
++		else if ("Discharging".equals(state))
++			status = BATTERY_STATUS_DISCHARGING;
++		else if ("Not charging".equals(state))
++			status = BATTERY_STATUS_NOT_CHARGING;
++		else if ("Full".equals(state))
++			status = BATTERY_STATUS_FULL;
++		intent.putExtra(EXTRA_PRESENT, number(battery, "present", 1) != 0);
++		intent.putExtra(EXTRA_LEVEL, level);
++		intent.putExtra(EXTRA_STATUS, status);
++		intent.putExtra(EXTRA_PLUGGED, plugged);
++		intent.putExtra(EXTRA_HEALTH, "Good".equals(read(battery, "health")) ? BATTERY_HEALTH_GOOD : BATTERY_HEALTH_UNKNOWN);
++		intent.putExtra(EXTRA_BATTERY_LOW, level >= 0 && level <= 15 && plugged == 0);
++		// the kernel gives microvolts and tenths of a degree; Android wants millivolts and tenths of a degree
++		int microvolts = number(battery, "voltage_now", -1);
++		if (microvolts >= 0)
++			intent.putExtra(EXTRA_VOLTAGE, microvolts / 1000);
++		int temp = number(battery, "temp", Integer.MIN_VALUE);
++		if (temp != Integer.MIN_VALUE)
++			intent.putExtra(EXTRA_TEMPERATURE, temp);
++		String technology = read(battery, "technology");
++		if (technology != null)
++			intent.putExtra(EXTRA_TECHNOLOGY, technology);
++		return intent;
++	}
+ 
+ 	public int getIntProperty(int id) {
+-		return -1;
++		Intent state = atl_battery_changed();
++		switch (id) {
++			case BATTERY_PROPERTY_CAPACITY:
++				return state.getIntExtra(EXTRA_LEVEL, -1);
++			case BATTERY_PROPERTY_STATUS:
++				return state.getIntExtra(EXTRA_STATUS, BATTERY_STATUS_UNKNOWN);
++			default:
++				return Integer.MIN_VALUE;
++		}
+ 	}
+ 
+ 	public boolean isCharging() {
+-		return false;
++		int status = atl_battery_changed().getIntExtra(EXTRA_STATUS, BATTERY_STATUS_UNKNOWN);
++		return status == BATTERY_STATUS_CHARGING || status == BATTERY_STATUS_FULL;
+ 	}
+ }
