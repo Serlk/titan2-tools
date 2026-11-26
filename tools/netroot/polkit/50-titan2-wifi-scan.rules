@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+// Titan 2: the niri session is not a logind "active" session, so NetworkManager's default for
+// wifi.scan (allow_active) refused scan requests from session apps (e.g. a map app that locates by
+// Wi-Fi). Allow members of group netdev to request Wi-Fi scans; nothing else is granted.
+polkit.addRule(function(action, subject) {
+	if (action.id == "org.freedesktop.NetworkManager.wifi.scan" && subject.isInGroup("netdev"))
+		return polkit.Result.YES;
+});

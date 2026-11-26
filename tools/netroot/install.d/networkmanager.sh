@@ -9,3 +9,6 @@ mkdir -p $R/etc/NetworkManager/conf.d
 install -m 644 /work/tools/netroot/NetworkManager-titan2.conf $R/etc/NetworkManager/conf.d/titan2.conf
 rl default dbus
 rl default networkmanager
+# the niri session is not a logind "active" session: let members of group netdev request Wi-Fi
+# scans (add the session user to netdev: adduser <user> netdev)
+install -D -m 644 /work/tools/netroot/polkit/50-titan2-wifi-scan.rules $R/etc/polkit-1/rules.d/50-titan2-wifi-scan.rules
