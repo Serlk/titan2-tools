@@ -20,3 +20,12 @@ install -m 755 /work/tools/netroot/local.d/t2-quiet-log.start $R/etc/local.d/
 install -m 644 /work/tools/netroot/modprobe.d/titan2-panthor.conf $R/etc/modprobe.d/
 install -m 755 /work/tools/netroot/local.d/t2-gpu-policy.start $R/etc/local.d/
 install -D -m 755 /work/tools/netroot/t2-perfrun $R/usr/local/bin/t2-perfrun
+# GTK4 frame-pacing probe for the anim/launch scenarios of t2-perfrun (needs py3-gobject3, gtk4.0)
+install -D -m 755 /work/tools/perf/t2-frame-probe.py $R/usr/local/bin/t2-frame-probe
+# core dumps of crashed services: /var/crash, pruned at boot; the services opt in
+# with rc_ulimit="-c unlimited" (t2-powerd, t2-speechd, t2-modemd init scripts; modemmanager: the
+# packaged init script, or /etc/conf.d/modemmanager on an installed phone)
+install -D -m 644 /work/tools/netroot/sysctl.d/70-titan2-coredump.conf $R/etc/sysctl.d/70-titan2-coredump.conf
+install -m 755 /work/tools/netroot/local.d/t2-crash-prune.start $R/etc/local.d/
+mkdir -p $R/var/crash && chmod 1777 $R/var/crash
+install -D -m 644 /work/tools/netroot/sysctl.d/70-titan2-panic.conf $R/etc/sysctl.d/70-titan2-panic.conf

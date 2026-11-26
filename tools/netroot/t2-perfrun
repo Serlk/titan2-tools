@@ -2,25 +2,34 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
 #
-# Titan 2: the thermal measurement run: three scenarios of t2-perfstat (60 s each) with a state
-# snapshot before and after each: what the GPU, the CPUs, the thermal zones and the session
-# daemons do while the screen is on. Run as the session user
-# over SSH (root also works; the per-process files are world-readable):
-#   t2-perfrun                 all three scenarios, prompts between them
-#   t2-perfrun idle            one scenario: idle | camera | scroll
-#   T2_PERFRUN_SECS=30 t2-perfrun
+# Titan 2: the thermal and frame-pacing measurement run: scenarios of t2-perfstat with a state
+# snapshot before and after each: what the GPU, the CPUs, the thermal zones, the session daemons
+# and the frame pacing do while the screen is on. Run as the session user over SSH (root also
+# works; the per-process files are world-readable):
+#   t2-perfrun                 the three thermal scenarios, prompts between them: idle → camera → scroll
+#   t2-perfrun smooth          the frame-pacing set: anim → anim-opaque → launch → video (no prompts needed)
+#   t2-perfrun idle            one scenario: idle | camera | scroll | anim | anim-opaque | launch | video
+#   T2_PERFRUN_SECS=30 t2-perfrun ...
+#   T2_PERFRUN_TAG=panvk t2-perfrun smooth      # tag in the directory name for A/B series
+#   T2_PERFRUN_GSK=gl|vulkan                    # GSK_RENDERER for the probe (default: the session's)
+#   T2_PERFRUN_VIDEO=/path/clip.mp4             # video scenario clip (default: a generated 1440p60 test clip)
 #   T2_NIRI_USER=<user>        the session user (default: as in /etc/conf.d/t2-niri, "user")
 #   T2_PERFRUN_DAEMONS=<regex> the processes listed in daemons.txt (pgrep -f; default: niri,
 #                              PipeWire, WirePlumber, iio-sensor-proxy)
-# Output: /var/log/t2-perf/<timestamp>/ (or $T2_PERFRUN_DIR): <scenario>.perfstat, snapshots
-# <scenario>-{before,after}.txt, daemons.txt (timers, D-Bus, RT threads, CPU placement).
+# Output: /var/log/t2-perf/<timestamp>[-tag]/ (or $T2_PERFRUN_DIR): <scenario>.perfstat, snapshots
+# <scenario>-{before,after}.txt, <scenario>.json (probe summary), <scenario>.fdinfo (GPU time per
+# process), daemons.txt (timers, D-Bus, RT threads, CPU placement), digest.txt (one line per scenario).
 secs=${T2_PERFRUN_SECS:-60}
-out=${T2_PERFRUN_DIR:-/var/log/t2-perf/$(date +%Y%m%d-%H%M%S)}
+PATH=/usr/local/bin:$PATH		# t2-perfstat / t2-frame-probe live there; root's PATH lacks it over SSH
+out=${T2_PERFRUN_DIR:-/var/log/t2-perf/$(date +%Y%m%d-%H%M%S)${T2_PERFRUN_TAG:+-$T2_PERFRUN_TAG}}
 mkdir -p "$out" 2>/dev/null || { out=/tmp/t2-perf-$(date +%Y%m%d-%H%M%S); mkdir -p "$out"; }
+# the probe runs as the session user and writes its JSON here
+chmod 1777 "$out" 2>/dev/null || :
 G=/sys/class/devfreq/13000000.gpu
 P=/sys/devices/platform/soc@0/13000000.gpu/power
 [ -n "${T2_NIRI_USER:-}" ] || T2_NIRI_USER=$(sed -n 's/^T2_NIRI_USER=//p' /etc/conf.d/t2-niri 2>/dev/null | tail -1)
-uid=$(id -u "${T2_NIRI_USER:-user}" 2>/dev/null || id -u)
+user=${T2_NIRI_USER:-user}
+uid=$(id -u "$user" 2>/dev/null || id -u)
 daemons_re=${T2_PERFRUN_DAEMONS:-^niri|pipewire|wireplumber|iio-sensor-proxy}
 
 snapshot() {
@@ -29,6 +38,11 @@ snapshot() {
 		[ -r "$G/$f" ] && printf '%s=%s ' "$f" "$(cat "$G/$f")"; done
 	printf 'runtime=%s autosuspend_ms=%s\n' "$(cat $P/runtime_status 2>/dev/null)" "$(cat $P/autosuspend_delay_ms 2>/dev/null)"
 	[ -r $G/trans_stat ] && { echo "-- gpu trans_stat"; cat $G/trans_stat; }
+	echo "-- display"; for p in cmd_te_sync cmd_async_cursor syncobj dsi_te; do
+		printf '%s=%s ' "$p" "$(cat /sys/module/mediatek_drm/parameters/$p 2>/dev/null)"; done
+	printf 'panthor upthreshold=%s downdiff=%s\n' "$(cat /sys/module/panthor/parameters/devfreq_upthreshold 2>/dev/null)" \
+		"$(cat /sys/module/panthor/parameters/devfreq_downdifferential 2>/dev/null)"
+	grep -H . /sys/class/drm/card*-DSI-1/dpms 2>/dev/null
 	echo "-- cpufreq"; for p in /sys/devices/system/cpu/cpufreq/policy*; do
 		printf '%s gov=%s cur=%s rate_limit_us=%s\n' "${p##*/}" "$(cat $p/scaling_governor)" "$(cat $p/scaling_cur_freq)" "$(cat $p/schedutil/rate_limit_us 2>/dev/null)"
 		printf '  time_in_state: '; tr '\n' ' ' < $p/stats/time_in_state; echo
@@ -47,7 +61,24 @@ snapshot() {
 	echo "-- /proc/stat"; head -9 /proc/stat
 	echo "-- loadavg $(cat /proc/loadavg)"
 	echo "-- meminfo"; grep -E 'MemAvailable|Cma|AnonHuge|Dirty' /proc/meminfo
+	echo "-- powerd"; t2-powerctl status 2>/dev/null | grep -E '^(state|screen|gpu_boost)'
 	echo "-- dmesg tail"; dmesg 2>/dev/null | tail -5
+	echo "-- dmesg display"; dmesg 2>/dev/null | grep -cE 'frame not done|still busy in the interrupt|frame deferred|flip_done timed out'
+}
+
+# GPU time per process from the panthor fdinfo of its render node fds (ns of GPU engine time):
+# the difference before/after divided by the scenario length is that process's GPU load.
+fdinfo() {
+	for pid in $(pgrep -u "$uid" -f '^niri|python3|gtk4|mpv|t2-frame-probe|snapshot|qcam' 2>/dev/null); do
+		[ -d /proc/$pid/fdinfo ] || continue
+		cmd=$(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-50)
+		# one fd per DRM client; sum engine time and take the latest frequency
+		awk -v pid="$pid" -v cmd="$cmd" '
+			/drm-engine-panthor/ { e += $2 } /drm-cycles-panthor/ { c += $2 }
+			/drm-curfreq-panthor/ { f = $2 } /drm-maxfreq-panthor/ { m = $2 }
+			END { if (e) printf "%6s engine_ns=%s cycles=%s curfreq=%s maxfreq=%s  %s\n", pid, e, c, f, m, cmd }' \
+			/proc/$pid/fdinfo/* 2>/dev/null
+	done
 }
 
 daemons() {
@@ -69,6 +100,35 @@ daemons() {
 	awk 'NR>1 {s=0; for (i=2;i<=9;i++) s+=$i; printf "%8d %s\n", s, $0}' /proc/interrupts | sort -rn | head -12 | cut -c1-120
 }
 
+# the Wayland session of the session user, from niri's environment (for probes started over SSH)
+session_env() {
+	npid=$(pgrep -u "$uid" -x niri | head -1)
+	[ -n "$npid" ] || return 1
+	e=$(tr '\0' '\n' < /proc/$npid/environ 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|PAN_I_WANT_A_BROKEN_VULKAN_DRIVER|GSK_RENDERER)=' | tr '\n' ' ')
+	# niri's own environment has no WAYLAND_DISPLAY (it sets it for its clients): take the
+	# socket name from a client, else the newest wayland-* socket of the runtime dir
+	case " $e" in *" WAYLAND_DISPLAY="*) ;; *)
+		rd=$(printf '%s' "$e" | sed -n 's/.*XDG_RUNTIME_DIR=\([^ ]*\).*/\1/p'); rd=${rd:-/run/user/$uid}
+		wd=$(for p in $(pgrep -u "$uid" -P "$npid"); do tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -m1 '^WAYLAND_DISPLAY='; done | head -1)
+		[ -n "$wd" ] || wd="WAYLAND_DISPLAY=$(ls -t "$rd"/wayland-[0-9]* 2>/dev/null | grep -v '\.lock$' | head -1 | xargs -r basename)"
+		e="$e $wd" ;;
+	esac
+	printf '%s' "$e"
+}
+
+# run a command as the session user inside the Wayland session; T2_PERFRUN_GSK overrides GSK_RENDERER
+in_session() {
+	env=$(session_env) || { echo "no niri session for uid $uid" >&2; return 1; }
+	[ -z "${T2_PERFRUN_GSK:-}" ] || env="$env GSK_RENDERER=$T2_PERFRUN_GSK"
+	# su gives the session user a PATH without /usr/local/bin (where the probe lives)
+	env="$env PATH=/usr/local/bin:/usr/bin:/bin"
+	if [ "$(id -u)" = 0 ] && [ "$uid" != 0 ]; then
+		su -s /bin/sh "$user" -c "env $env $*"
+	else
+		eval "env $env $*"
+	fi
+}
+
 dbus_count() {
 	# session bus traffic in 10 s (needs the session bus address of the session user)
 	bus=$(tr '\0' '\n' < /proc/$(pgrep -u "$uid" -x niri | head -1)/environ 2>/dev/null | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
@@ -77,38 +137,113 @@ dbus_count() {
 	DBUS_SESSION_BUS_ADDRESS=$bus timeout 10 dbus-monitor --session 2>/dev/null | grep -E '^(signal|method call)' | sed 's/.*sender=\([^ ]*\).*/\1/' | sort | uniq -c | sort -rn | head -10
 }
 
+digest_perfstat() {
+	# one-line digest: mean GPU MHz, share of samples at max, samples
+	awk -v n="$1" '{
+		for (i = 1; i <= NF; i++) if ($i == "gpu") { f = $(i+1); sub(/MHz/, "", f); g += f; if (f + 0 >= 1000) m++; c++ }
+	} END { if (c) printf "%s: gpu mean %.0f MHz, %.0f%% of samples >=1000 MHz, %d samples", n, g / c, 100 * m / c, c }' "$2"
+}
+
+# scenario with the user doing something (idle / camera / scroll): perfstat for $secs
 run() {
 	name=$1; shift
 	echo "### $name: $*"
 	[ -t 0 ] && [ "${T2_PERFRUN_NOPROMPT:-0}" != 1 ] && { printf 'Enter when ready...'; read -r _; }
 	snapshot > "$out/$name-before.txt"
+	fdinfo > "$out/$name.fdinfo"
 	[ -w $G/trans_stat ] && echo 0 > $G/trans_stat 2>/dev/null
 	t2-perfstat 2 $((secs / 2)) > "$out/$name.perfstat" 2>&1
+	fdinfo >> "$out/$name.fdinfo"
 	snapshot > "$out/$name-after.txt"
-	# one-line digest: mean GPU MHz, share of samples at max, hottest temps, idle share
-	awk -v n="$name" '{
-		for (i = 1; i <= NF; i++) if ($i == "gpu") { f = $(i+1); sub(/MHz/, "", f); g += f; if (f + 0 >= 1000) m++; c++ }
-	} END { if (c) printf "%s: gpu mean %.0f MHz, %.0f%% of samples >=1000 MHz, %d samples\n", n, g / c, 100 * m / c, c }' "$out/$name.perfstat"
+	{ digest_perfstat "$name" "$out/$name.perfstat"; echo; } | tee -a "$out/digest.txt"
+}
+
+# scenario driven by a program in the session: perfstat at 1 s in the background, the program in
+# the foreground, its summary (JSON / last status line) into <name>.json
+run_prog() {
+	name=$1; shift
+	echo "### $name: $*"
+	snapshot > "$out/$name-before.txt"
+	fdinfo > "$out/$name.fdinfo"
+	[ -w $G/trans_stat ] && echo 0 > $G/trans_stat 2>/dev/null
+	t2-perfstat 1 $((secs + 5)) > "$out/$name.perfstat" 2>&1 &
+	ps_pid=$!
+	in_session "$@" > "$out/$name.json" 2> "$out/$name.err"
+	kill $ps_pid 2>/dev/null; wait $ps_pid 2>/dev/null
+	fdinfo >> "$out/$name.fdinfo"
+	snapshot > "$out/$name-after.txt"
+	{ printf '%s: %s | ' "$name" "$(tail -c 400 "$out/$name.json" | tr '\n' ' ')"; digest_perfstat "$name" "$out/$name.perfstat"; echo; } | tee -a "$out/digest.txt"
+}
+
+# app launch latency: the probe quits after its first frame; N launches 3 s apart
+run_launch() {
+	name=launch
+	echo "### $name: GTK4 process start -> first frame, 5 launches"
+	snapshot > "$out/$name-before.txt"
+	: > "$out/$name.json"
+	i=0
+	while [ $i -lt 5 ]; do
+		in_session t2-frame-probe --launch >> "$out/$name.json" 2>> "$out/$name.err"
+		sleep 3; i=$((i + 1))
+	done
+	snapshot > "$out/$name-after.txt"
+	{ printf '%s: first_frame_ms ' "$name"; sed -n 's/.*"first_frame_ms": \([0-9.]*\).*/\1/p' "$out/$name.json" | tr '\n' ' '; echo; } | tee -a "$out/digest.txt"
+}
+
+# video: mpv software decode, GPU output; dropped/delayed frame counters from its status line
+run_video() {
+	name=video
+	clip=${T2_PERFRUN_VIDEO:-/tmp/t2-test-1440p60.mp4}
+	if [ ! -f "$clip" ]; then
+		echo "### $name: generating $clip (ffmpeg testsrc2 1440x1440 60 fps, ${secs}s)"
+		command -v ffmpeg >/dev/null 2>&1 || { echo "no ffmpeg and no T2_PERFRUN_VIDEO clip" >&2; return 1; }
+		ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1440x1440:rate=60" -t "$secs" -c:v libx264 -preset veryfast -pix_fmt yuv420p "$clip" 2>"$out/$name.ffmpeg" ||
+		ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1440x1440:rate=60" -t "$secs" -c:v mpeg4 -q:v 4 "$clip" 2>>"$out/$name.ffmpeg" || return 1
+	fi
+	echo "### $name: mpv --vo=gpu (Wayland/EGL on panfrost), software decode, $clip"
+	# the last status line carries: decoder-dropped, vo-delayed (late frames), mistimed, display fps estimate
+	run_prog "$name" mpv --no-config --really-quiet --vo=gpu --gpu-context=wayland --hwdec=no --no-audio --fs \
+		"--term-status-msg='frames=\${estimated-frame-count} drop=\${frame-drop-count} vo-delayed=\${vo-delayed-frame-count} mistimed=\${mistimed-frame-count} disp-fps=\${estimated-display-fps} vsync-jitter=\${vsync-jitter}'" \
+		--msg-level=statusline=status --length="$secs" "$clip"
+	# mpv prints the status line with \r: keep the last one
+	tr '\r' '\n' < "$out/$name.json" | grep frames= | tail -1 > "$out/$name.status"; cat "$out/$name.status" | tee -a "$out/digest.txt"
 }
 
 cat > "$out/README" <<EOF
-t2-perfrun $(date) secs=$secs kernel $(uname -r) cmdline: $(cat /proc/cmdline)
+t2-perfrun $(date) secs=$secs kernel $(uname -r) tag=${T2_PERFRUN_TAG:-} gsk=${T2_PERFRUN_GSK:-session}
+cmdline: $(cat /proc/cmdline)
+mesa: $(apk info -e -v mesa 2>/dev/null) niri: $(apk info -e -v niri 2>/dev/null) gtk: $(apk info -e -v gtk4.0 2>/dev/null)
+session env: $(session_env 2>/dev/null)
 scenarios: idle = screen on, home screen, hands off; camera = Snapshot preview 1080p30;
-scroll = scrolling the shell / home for the whole minute. Compare *.perfstat (t2-perfstat lines),
-*-before/after.txt (trans_stat, time_in_state, cpuidle, cooling cur_state), daemons.txt.
+scroll = scrolling the shell / home for the whole minute; anim = t2-frame-probe (translucent GTK4
+window, moving bar, ${secs}s); anim-opaque = the same with an opaque background; launch = 5x process
+start -> first frame; video = mpv software decode of a 1440p60 clip, GPU output.
+Compare *.perfstat (t2-perfstat lines), *-before/after.txt (trans_stat, time_in_state, cpuidle,
+cooling cur_state, dmesg display counters), *.fdinfo (GPU engine ns per process before/after),
+*.json (probe summary: fps, tick_p50/p95, long_ticks, present_jumps), daemons.txt, digest.txt.
 EOF
 daemons > "$out/daemons.txt"; dbus_count >> "$out/daemons.txt"
 case "${1:-all}" in
 	idle) run idle "screen on, home screen, do not touch for $secs s" ;;
 	camera) run camera "open Snapshot, preview running, for $secs s" ;;
 	scroll) run scroll "scroll the shell / home continuously for $secs s" ;;
+	anim) run_prog anim t2-frame-probe "$secs" --json "$out/anim-frames.json" ;;
+	anim-opaque) run_prog anim-opaque t2-frame-probe "$secs" --opaque --json "$out/anim-opaque-frames.json" ;;
+	launch) run_launch ;;
+	video) run_video ;;
+	smooth)
+		run_prog anim t2-frame-probe "$secs" --json "$out/anim-frames.json"
+		run_prog anim-opaque t2-frame-probe "$secs" --opaque --json "$out/anim-opaque-frames.json"
+		run_launch
+		run_video
+		;;
 	all)
 		run idle "screen on, home screen, do not touch for $secs s"
 		run camera "open Snapshot, preview running, for $secs s"
 		run scroll "scroll the shell / home continuously for $secs s"
 		;;
-	*) echo "usage: t2-perfrun [idle|camera|scroll|all]" >&2; exit 1 ;;
+	*) echo "usage: t2-perfrun [idle|camera|scroll|anim|anim-opaque|launch|video|smooth|all]" >&2; exit 1 ;;
 esac
 daemons >> "$out/daemons.txt"
-echo "results in $out"
+echo "results in $out"; cat "$out/digest.txt" 2>/dev/null
 exit 0

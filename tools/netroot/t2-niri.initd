@@ -13,6 +13,10 @@ description="Titan 2: niri session on the screen"
 # 1: session bus + PipeWire/WirePlumber + portals environment (/usr/local/bin/t2-niri-session in
 # dbus-run-session); 0: bare niri as before
 : ${T2_NIRI_SESSION:=1}
+# GTK 4 renderer for the session: auto (default: GTK decides = panvk while the session exports
+# PAN_I_WANT_A_BROKEN_VULKAN_DRIVER), gl (panfrost GLES, the fallback), vulkan (force panvk);
+# measured on the phone: panvk 58.7 fps / p95 16.9 ms vs gl 56.3 / 32.5
+: ${T2_GSK_RENDERER:=auto}
 
 pidfile=/run/t2-niri.pid
 

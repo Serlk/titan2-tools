@@ -8,11 +8,25 @@
 #                         domain is switched off through the GPUEB (panthor default 50 ms; the
 #                         downstream kbase platform uses 100 ms: fewer on/off IPI cycles per second of
 #                         UI, same idle power).
-#   polling_interval      simple_ondemand sampling period (default 50 ms); longer = calmer.
+#   polling_interval      simple_ondemand sampling period (panthor default 50 ms = 3 frames: an
+#                         animation that starts from an idle GPU renders its first 3 frames at
+#                         265 MHz before the governor can react). Measured on the phone: 20 ms
+#                         does not remove the once-a-second long frames, so the kernel default
+#                         stays; T2_GPU_POLL_MS=20 in /etc/conf.d/local to experiment, 0 = leave alone.
+#   min_freq              the GPU frequency floor. Measured on a GTK4 frame probe: at 265 MHz a
+#                         heavy frame once a second (a clock redraw) takes 30-50 ms (~1 missed
+#                         frame per second), at 462 MHz about half of them remain, at 664 MHz
+#                         4 long frames per 30 s (59.6 fps, p95 16.9 ms). The GPU is
+#                         runtime-suspended whenever it has no work, so the floor costs energy
+#                         only on active frames. T2_GPU_MIN_HZ=265000000 restores the full range,
+#                         0 leaves the file alone.
 # Leave a line out (or set T2_GPU_POLICY=0 in /etc/conf.d/local) to keep the kernel defaults.
 [ "${T2_GPU_POLICY:-1}" = 1 ] || exit 0
 G=/sys/class/devfreq/13000000.gpu
 P=/sys/devices/platform/soc@0/13000000.gpu/power
 [ -w "$P/autosuspend_delay_ms" ] && echo 100 > "$P/autosuspend_delay_ms"
-#[ -w "$G/polling_interval" ] && echo 100 > "$G/polling_interval"
+poll=${T2_GPU_POLL_MS:-50}
+[ "$poll" != 0 ] && [ -w "$G/polling_interval" ] && echo "$poll" > "$G/polling_interval"
+min=${T2_GPU_MIN_HZ:-664000000}
+[ "$min" != 0 ] && [ -w "$G/min_freq" ] && echo "$min" > "$G/min_freq"
 exit 0

@@ -13,9 +13,13 @@
 export XDG_CURRENT_DESKTOP=niri XDG_SESSION_DESKTOP=niri XDG_SESSION_TYPE=wayland
 # GTK 4 on Wayland prefers its Vulkan renderer when a Vulkan device initialises, and
 # PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 makes panvk ("not well-tested" on Mali-G615 v11) such a
-# device. GTK picks its renderer itself (Vulkan via panvk); this is not overridden by default.
-# T2_GSK_RENDERER=gl in /etc/conf.d/t2-niri forces the panfrost GL path (control measurement / fallback).
-[ -n "${T2_GSK_RENDERER:-}" ] && export GSK_RENDERER="$T2_GSK_RENDERER"
+# device. Measured on this phone (Mesa 26.3.0): panvk gives GTK the smoother frame (58.7 fps,
+# p95 16.9 ms) than GLES (56.3 fps, p95 32.5 ms), so the default T2_GSK_RENDERER=auto lets GTK
+# decide; T2_GSK_RENDERER=gl in /etc/conf.d/t2-niri pins the GLES fallback for the whole session.
+case "${T2_GSK_RENDERER:-}" in
+	""|auto) unset GSK_RENDERER ;;
+	*) export GSK_RENDERER="$T2_GSK_RENDERER" ;;
+esac
 # XDG user directories (Pictures, Videos, ...): GLib returns nothing for them without
 # ~/.config/user-dirs.dirs, and GNOME Snapshot then refuses to take a picture
 # ("Could not find XDG_PICTURES_DIR"). xdg-user-dirs-update creates the file and the directories.
