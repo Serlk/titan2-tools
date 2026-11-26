@@ -35,7 +35,7 @@ only **name** files; `t2-vendor-setup` copies them from the user's own phone par
 | `t2-hal.[ch]`, `bionic_exe.c`, `include/` | loading a HAL module through bionic_translation and the re-exec into the vendor profile; what a host executable must provide for the bionic linker (`_r_debug`, the bionic TLS slots); AOSP `hardware.h` (Apache-2.0) |
 | `titan2-vendor.cfg` | bionic_translation library overrides for the vendor profile |
 | `needed-closure.py` | prints the DT_NEEDED closure of a binary of the user's own firmware in the list format (helper for writing lists) |
-| `patches/bionic_translation/` | the vendor profile of bionic_translation: patches 0001–0005 ([README](patches/bionic_translation/README.md)) |
+| `patches/bionic_translation/` | the vendor profile of bionic_translation: patches 0001–0008 ([README](patches/bionic_translation/README.md)) |
 
 ## Drop-in interface
 
@@ -74,7 +74,7 @@ make dist                              # tarball for tools/aports/titan2-vendor-
 The Alpine package is `tools/aports/titan2-vendor-runtime` (`-dev` carries the t2-hal and
 bionic_exe sources and headers under `/usr/share/titan2-vendor-runtime/src`, which the
 Makefiles of titan2-fingerprint and titan2-gnss use as `VENDOR_RUNTIME`). It needs
-`bionic_translation` with the patches above (Alpine's package rebuilt with 0001–0005).
+`bionic_translation` with the patches above (Alpine's package rebuilt with 0001–0008, pkgrel 108).
 
 ## Related repositories
 

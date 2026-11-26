@@ -1,0 +1,102 @@
+From 0b2941487fef24970cbb1d5bf617e8ac06fe60b0 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:24:03 +0300
+Subject: [PATCH] pthread: make the lazy init of statically initialized objects
+ thread-safe
+
+bionic code may use a condition variable, mutex, rwlock or semaphore
+that was only statically initialized (or zeroed). The wrapper maps the
+host object on first use, but without any locking: two threads reaching
+the first use at the same time each map their own host object, so a
+waiter sleeps on one condition variable while the waker signals
+another (a lost wakeup), or two threads "hold" the same mutex. The
+default initializers also stored the pointer before setting up the
+object, so a racing thread could use a half-initialized mutex.
+
+Serialize the lazy path under one process-wide lock with a re-check,
+and publish the fully set up object with a release store.
+---
+ pthread_wrapper/libpthread.c | 39 +++++++++++++++++++++++++++---------
+ 1 file changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/pthread_wrapper/libpthread.c b/pthread_wrapper/libpthread.c
+index 94f7ef5..9a82669 100644
+--- a/pthread_wrapper/libpthread.c
++++ b/pthread_wrapper/libpthread.c
+@@ -137,7 +137,24 @@ struct bionic_pthread_cleanup_t {
+ #define IS_MAPPED(x) is_mapped(x->glibc, sizeof(*x))
+ 
+ // For handling static initialization.
+-#define INIT_IF_NOT_MAPPED(x, init) do { if (!IS_MAPPED(x)) init(x); } while(0)
++/*
++ * Statically initialized (or zeroed) objects get their host object on first use. Two threads
++ * can reach that first use at the same time (a HAL's worker and event threads on a shared
++ * PTHREAD_COND_INITIALIZER/PTHREAD_MUTEX_INITIALIZER): without a lock each maps its own host
++ * object, the waiter then sleeps on one condition variable while the waker signals another (a
++ * lost wakeup), or both "hold" a mutex. The lazy path is serialized and re-checked under one
++ * process-wide lock, and the init functions publish a fully set up object with a release store.
++ */
++static pthread_mutex_t lazy_init_lock = PTHREAD_MUTEX_INITIALIZER;
++#define INIT_IF_NOT_MAPPED(x, init) do { \
++		if (!IS_MAPPED(x)) { \
++			pthread_mutex_lock(&lazy_init_lock); \
++			if (!IS_MAPPED(x)) \
++				init(x); \
++			pthread_mutex_unlock(&lazy_init_lock); \
++		} \
++	} while(0)
++#define PUBLISH(x, obj) __atomic_store_n(&(x)->glibc, (obj), __ATOMIC_RELEASE)
+ 
+ static bool is_mapped(void *mem, const size_t sz)
+ {
+@@ -207,8 +224,9 @@ static void default_sem_init(bionic_sem_t *sem)
+ {
+ 	// Apparently some android apps (hearthstone) do not call sem_init()
+ 	assert(sem);
+-	sem->glibc = mmap(NULL, sizeof(*sem->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+-	memset(sem->glibc, 0, sizeof(*sem->glibc));
++	sem_t *obj = mmap(NULL, sizeof(*sem->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++	memset(obj, 0, sizeof(*obj));
++	PUBLISH(sem, obj);
+ }
+ 
+ int bionic_sem_init(bionic_sem_t *sem, int pshared, unsigned int value)
+@@ -271,8 +289,9 @@ static void default_rwlock_init(bionic_rwlock_t *rwlock)
+ {
+ 	// Apparently some android apps/libs (Qt5) do not call pthread_rwlock_init()
+ 	assert(rwlock);
+-	rwlock->glibc = mmap(NULL, sizeof(*rwlock->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+-	memset(rwlock->glibc, 0, sizeof(*rwlock->glibc));
++	pthread_rwlock_t *obj = mmap(NULL, sizeof(*rwlock->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++	memset(obj, 0, sizeof(*obj));
++	PUBLISH(rwlock, obj);
+ }
+ 
+ int bionic_pthread_rwlock_init(bionic_rwlock_t *restrict rwlock, const bionic_rwlockattr_t *restrict attr)
+@@ -451,8 +470,9 @@ static void default_pthread_mutex_init(bionic_mutex_t *mutex)
+ 		if (memcmp(&bionic_mutex_init_map[i].bionic, mutex, sizeof(*mutex)))
+ 			continue;
+ 
+-		mutex->glibc = mmap(NULL, sizeof(*mutex->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+-		memcpy(mutex->glibc, &bionic_mutex_init_map[i].glibc, sizeof(bionic_mutex_init_map[i].glibc));
++		pthread_mutex_t *obj = mmap(NULL, sizeof(*mutex->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++		memcpy(obj, &bionic_mutex_init_map[i].glibc, sizeof(bionic_mutex_init_map[i].glibc));
++		PUBLISH(mutex, obj);
+ 		return;
+ 	}
+ 
+@@ -542,8 +562,9 @@ int bionic_pthread_condattr_setclock(bionic_condattr_t *attr, clockid_t clock_id
+ static void default_pthread_cond_init(bionic_cond_t *cond)
+ {
+ 	assert(cond);
+-	cond->glibc = mmap(NULL, sizeof(*cond->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+-	memset(cond->glibc, 0, sizeof(*cond->glibc));
++	pthread_cond_t *obj = mmap(NULL, sizeof(*cond->glibc), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++	memset(obj, 0, sizeof(*obj));
++	PUBLISH(cond, obj);
+ }
+ 
+ int bionic_pthread_cond_destroy(bionic_cond_t *cond)
+-- 
+2.56.0
+

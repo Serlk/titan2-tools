@@ -1,0 +1,49 @@
+From a83b68dce58fe6fab2abefa6a4984d4598d85168 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:37:05 +0300
+Subject: [PATCH] pthread: publish lazily mapped objects without a
+ store-release
+
+The lazy init publishes the pointer to the host object with
+__atomic_store_n(..., __ATOMIC_RELEASE). bionic's mutex, condition
+variable, rwlock and semaphore types are arrays of 32-bit words, so
+the slot the pointer goes into can be 4 but not 8 bytes aligned. On
+AArch64 a store-release to such an address takes an alignment fault
+unless the core has FEAT_LSE2: the first use of a statically
+initialized object at such an address kills the process with SIGBUS.
+
+Keep the ordering with a full barrier after the object is set up, and
+write the pointer with an ordinary store, which may be unaligned.
+
+Found by test/pthread-lazy-test.c part 3 under qemu-aarch64 with
+QEMU_CPU=cortex-a76.
+---
+ pthread_wrapper/libpthread.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/pthread_wrapper/libpthread.c b/pthread_wrapper/libpthread.c
+index d404ece..abdf111 100644
+--- a/pthread_wrapper/libpthread.c
++++ b/pthread_wrapper/libpthread.c
+@@ -154,7 +154,17 @@ static pthread_mutex_t lazy_init_lock = PTHREAD_MUTEX_INITIALIZER;
+ 			pthread_mutex_unlock(&lazy_init_lock); \
+ 		} \
+ 	} while(0)
+-#define PUBLISH(x, obj) __atomic_store_n(&(x)->glibc, (obj), __ATOMIC_RELEASE)
++/*
++ * bionic's objects are only int-aligned, so the pointer slot can sit at an address that is 4
++ * but not 8 bytes aligned. A store-release instruction faults there on AArch64 cores without
++ * FEAT_LSE2 (SIGBUS); an ordinary store does not. Order the object's set-up before the pointer
++ * with a full barrier and store the pointer with a plain, possibly unaligned, access.
++ */
++#define PUBLISH(x, obj) do { \
++		void *obj_ = (obj); \
++		__atomic_thread_fence(__ATOMIC_SEQ_CST); \
++		memcpy(&(x)->glibc, &obj_, sizeof(obj_)); \
++	} while(0)
+ 
+ static bool is_mapped(void *mem, const size_t sz)
+ {
+-- 
+2.56.1
+

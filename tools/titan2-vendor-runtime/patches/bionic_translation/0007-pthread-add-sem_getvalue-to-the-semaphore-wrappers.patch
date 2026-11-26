@@ -1,0 +1,65 @@
+From 13c75454020e9168fdeab42bef10e1e51892a506 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:07:51 +0300
+Subject: [PATCH] pthread: add sem_getvalue to the semaphore wrappers
+
+sem_init, sem_post, sem_wait, sem_trywait and sem_timedwait of a bionic
+library are bound to wrappers that keep a pointer to a host semaphore
+in the bionic sem_t. sem_getvalue had no wrapper, so the loader bound
+it to the host libc and handed that the bionic object itself. The word
+read there is part of the pointer, not a count: on AArch64 musl an
+empty semaphore reads as the low 31 bits of the pointer, and the call
+still returns success.
+
+A caller that coalesces notifications by posting only while the count
+is below one then never posts, and the thread waiting on the semaphore
+is not woken.
+
+Read the count from the host semaphore the other wrappers use, with
+the same lazy mapping of a statically initialized object, and expect
+the bionic semaphore.sem_getvalue test to pass.
+---
+ pthread_wrapper/libpthread.c      | 14 ++++++++++++++
+ tests/expected_to_pass/common.txt |  1 +
+ 2 files changed, 15 insertions(+)
+
+diff --git a/pthread_wrapper/libpthread.c b/pthread_wrapper/libpthread.c
+index 9a82669..d404ece 100644
+--- a/pthread_wrapper/libpthread.c
++++ b/pthread_wrapper/libpthread.c
+@@ -267,6 +267,20 @@ int bionic_sem_timedwait(bionic_sem_t *sem, const struct timespec *abs_timeout)
+ 	return sem_timedwait(sem->glibc, abs_timeout);
+ }
+ 
++/*
++ * Without this entry point the loader binds a bionic library's sem_getvalue to the host libc,
++ * which is then handed the bionic object: the word it reads there is half of the pointer to the
++ * host semaphore the other wrappers work on, not a count. A caller that posts only while the
++ * count is below one (coalescing notifications for a worker thread) sees a "pending" count on
++ * an empty semaphore and never posts.
++ */
++int bionic_sem_getvalue(bionic_sem_t *sem, int *sval)
++{
++	assert(sem && sval);
++	INIT_IF_NOT_MAPPED(sem, default_sem_init);
++	return sem_getvalue(sem->glibc, sval);
++}
++
+ /* ---------------------------------------------------------------------------------------------- *
+  * ---------------------------------------------------------------------------------------------- *
+  * ---------------------------------------------------------------------------------------------- */
+diff --git a/tests/expected_to_pass/common.txt b/tests/expected_to_pass/common.txt
+index f6d9d72..57a2cd9 100644
+--- a/tests/expected_to_pass/common.txt
++++ b/tests/expected_to_pass/common.txt
+@@ -537,6 +537,7 @@ search.lfind_lsearch
+ search.tdelete
+ search.tdestroy_null
+ search.tfind_tsearch_twalk_tdestroy
++semaphore.sem_getvalue
+ semaphore.sem_trywait
+ setjmp.setjmp_fp_registers
+ setjmp._setjmp_smoke
+-- 
+2.56.1
+
