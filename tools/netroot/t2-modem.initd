@@ -8,6 +8,13 @@
 # servers. Installed by scripts/netroot-serve.sh build (tools/netroot/install.d/t2-modem.sh), NOT
 # added to a runlevel: rc-update add t2-modem default. Needs mtk_ccci.power_ctrl=1
 # runtime_data=1 on the kernel command line (cmdline.extra). Settings: /etc/conf.d/t2-modem.
+#
+# Before t2-ccci-fsd starts, the NVRAM overlay is checked (t2-modem-nvcheck): files listed in
+# T2_MODEM_NVCHECK_FILES (default NVD_DATA/D2A0_007) whose copy in rw/ differs from ro/ are moved
+# to rw.quarantine/<date>/ (not deleted, ro/ untouched), with the CRC-32 of each record in the
+# log; the modem then reads the copy in ro/. A bad copy of exactly this file in rw/ once kept both
+# SIMs from registering on LTE. T2_MODEM_NVCHECK=no disables the check. Log:
+# $T2_MODEM_LOG/nvcheck.log and syslog (t2-modem-nvcheck).
 description="Titan 2 modem: NVRAM file server, RPC server, modem start"
 
 : ${T2_MODEM_ROOT:=/var/lib/titan2-modem}
@@ -65,6 +72,10 @@ start() {
 
 	# servers left over from a failed start hold the ports: one opener each
 	stop_servers
+	# the NVRAM overlay before the file server serves it (t2-modem-nvcheck)
+	if [ -x /usr/local/sbin/t2-modem-nvcheck ]; then
+		/usr/local/sbin/t2-modem-nvcheck | while read -r l; do einfo "$l"; done
+	fi
 	ebegin "Starting the modem file and RPC servers"
 	start-stop-daemon -S -b -m -p "$fsd_pid" -u "$T2_MODEM_USER" \
 		-1 "$T2_MODEM_LOG/fsd.log" -2 "$T2_MODEM_LOG/fsd.log" \

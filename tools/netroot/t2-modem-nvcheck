@@ -1,0 +1,138 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: pre-start check of the modem's NVRAM overlay.
+#
+# The modem's NVRAM is served by t2-ccci-fsd from $T2_MODEM_ROOT: ro/ is the copy of the
+# phone's partitions, rw/ holds what the modem wrote since (copy-up overlay). A record the
+# modem saved in a bad moment can latch across restarts: on 25.11.2026 one such file,
+# nvdata/md/NVRAM/NVD_DATA/D2A0_007, kept both SIMs from attaching on LTE until it was removed
+# from rw/, after which the modem read the ro/ copy again and attached at once.
+#
+# Before t2-ccci-fsd starts serving (t2-modem start runs this), for each file of
+# T2_MODEM_NVCHECK_FILES:
+#   - rw/ copy missing:            nothing to do (the modem reads ro/)
+#   - ro/ copy missing:            left in place, warning (no reference to compare with)
+#   - rw/ copy equal to ro/:       left in place
+#   - rw/ copy differs from ro/:   moved to rw.quarantine/<YYYYmmdd-HHMMSS>/<same path>, never
+#                                  deleted, ro/ never touched; logged with the CRC-32 of each
+#                                  record unit of both copies (nothing is parsed or decrypted)
+# The modem then reads the ro/ copy; if it needs the other state it writes it again.
+# A second run finds no rw/ copy and does nothing. Quarantine keeps the newest
+# T2_MODEM_QUARANTINE_KEEP dated directories (root, mode 0700).
+#
+# Entries of T2_MODEM_NVCHECK_FILES are separated by spaces:
+#   <path relative to rw/ and ro/>[:<first unit offset>:<unit size>:<unit count>]
+# Without the unit layout the CRC-32 of the whole file is logged.
+#
+#   t2-modem-nvcheck          the check (from t2-modem start_pre/start)
+# Settings: /etc/conf.d/t2-modem — T2_MODEM_NVCHECK=no disables it, T2_MODEM_NVCHECK_FILES,
+# T2_MODEM_QUARANTINE_KEEP (20), T2_MODEM_ROOT, T2_MODEM_LOG; T2_MODEM_NVCHECK_SYSLOG=no keeps
+# the lines out of syslog (tests).
+set -u
+[ -z "${T2_MODEM_NVCHECK_NOCONF:-}" ] && [ -r /etc/conf.d/t2-modem ] && . /etc/conf.d/t2-modem
+: ${T2_MODEM_ROOT:=/var/lib/titan2-modem}
+: ${T2_MODEM_LOG:=/var/log/t2-modem}
+: ${T2_MODEM_NVCHECK:=yes}
+: ${T2_MODEM_NVCHECK_FILES:=nvdata/md/NVRAM/NVD_DATA/D2A0_007:192:1120:2}
+: ${T2_MODEM_QUARANTINE_KEEP:=20}
+: ${T2_MODEM_NVCHECK_SYSLOG:=yes}
+
+rw=$T2_MODEM_ROOT/rw
+ro=$T2_MODEM_ROOT/ro
+quarantine=$T2_MODEM_ROOT/rw.quarantine
+
+# $1 level (info|warning), the rest the line
+log() {
+	local level=$1
+	shift
+	[ "$T2_MODEM_NVCHECK_SYSLOG" = yes ] &&
+		logger -t t2-modem-nvcheck -p "daemon.$level" "$*" 2>/dev/null
+	mkdir -p "$T2_MODEM_LOG" 2>/dev/null
+	echo "$(date '+%F %T') $*" >>"$T2_MODEM_LOG/nvcheck.log" 2>/dev/null
+	echo "t2-modem-nvcheck: $*"
+}
+
+# CRC-32 (IEEE, as zlib) of <file> bytes [offset, offset + size): gzip's trailer holds it
+crc32() {
+	local f=$1 off=$2 size=$3
+	tail -c +$((off + 1)) "$f" | head -c "$size" | gzip -c | tail -c 8 | head -c 4 |
+		od -An -tu1 | awk '{ printf "%02x%02x%02x%02x", $4, $3, $2, $1 }'
+}
+
+# "@0xc0=xxxxxxxx @0x520=xxxxxxxx" for the units of <file>, or "file=xxxxxxxx"
+units() {
+	local f=$1 off=$2 size=$3 count=$4 i=0 out=
+	if [ -z "$off" ]; then
+		echo "file=$(crc32 "$f" 0 "$(wc -c <"$f")")"
+		return
+	fi
+	while [ "$i" -lt "$count" ]; do
+		out="$out${out:+ }@$(printf '0x%x' $((off + i * size)))=$(crc32 "$f" $((off + i * size)) "$size")"
+		i=$((i + 1))
+	done
+	echo "$out"
+}
+
+# keep the newest T2_MODEM_QUARANTINE_KEEP dated directories
+prune() {
+	local n
+	[ -d "$quarantine" ] || return 0
+	n=$(ls -1 "$quarantine" | wc -l)
+	[ "$n" -gt "$T2_MODEM_QUARANTINE_KEEP" ] || return 0
+	ls -1 "$quarantine" | sort | head -n $((n - T2_MODEM_QUARANTINE_KEEP)) | while read -r d; do
+		rm -rf "${quarantine:?}/$d"
+		log info "quarantine: removed the oldest entry $d (keeping $T2_MODEM_QUARANTINE_KEEP)"
+	done
+}
+
+check() {
+	local entry path off size count stamp dest rwu rou moved=0
+	stamp=$(date +%Y%m%d-%H%M%S)
+	for entry in $T2_MODEM_NVCHECK_FILES; do
+		path=${entry%%:*}
+		off= size= count=
+		case "$entry" in
+		*:*:*:*)
+			off=$(echo "$entry" | cut -d: -f2)
+			size=$(echo "$entry" | cut -d: -f3)
+			count=$(echo "$entry" | cut -d: -f4)
+			;;
+		esac
+		[ -f "$rw/$path" ] || continue
+		if [ ! -f "$ro/$path" ]; then
+			log warning "$path: no ro/ copy to compare with, rw/ copy left in place ($(units "$rw/$path" "$off" "$size" "$count"))"
+			continue
+		fi
+		if cmp -s "$rw/$path" "$ro/$path"; then
+			log info "$path: same as ro/, left in place"
+			continue
+		fi
+		dest=$quarantine/$stamp/$path
+		mkdir -p "$quarantine" && chmod 0700 "$quarantine" &&
+			mkdir -p "$(dirname "$dest")" || {
+			log warning "$path: differs from ro/ but $quarantine/$stamp cannot be made: left in place"
+			continue
+		}
+		rwu=$(units "$rw/$path" "$off" "$size" "$count")
+		rou=$(units "$ro/$path" "$off" "$size" "$count")
+		if mv "$rw/$path" "$dest"; then
+			log warning "$path: differs from ro/ (rw/ $rwu; ro/ $rou): moved to rw.quarantine/$stamp/$path, the modem reads the ro/ copy"
+			moved=$((moved + 1))
+		else
+			log warning "$path: differs from ro/ (rw/ $rwu; ro/ $rou) but could not be moved: left in place"
+		fi
+	done
+	[ "$moved" -gt 0 ] && prune
+	return 0
+}
+
+if [ "$T2_MODEM_NVCHECK" != yes ]; then
+	log info "off (T2_MODEM_NVCHECK=$T2_MODEM_NVCHECK)"
+	exit 0
+fi
+if [ ! -d "$rw" ]; then
+	exit 0
+fi
+check

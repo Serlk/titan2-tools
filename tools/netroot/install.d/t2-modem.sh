@@ -7,3 +7,5 @@
 # never goes into the image.
 install -m 755 /work/tools/netroot/t2-modem.initd $R/etc/init.d/t2-modem
 [ -e $R/etc/conf.d/t2-modem ] || install -m 644 /work/tools/netroot/t2-modem.conf $R/etc/conf.d/t2-modem
+# the NVRAM overlay check before t2-ccci-fsd starts; the service runs it
+install -D -m 755 /work/tools/netroot/t2-modem-nvcheck $R/usr/local/sbin/t2-modem-nvcheck
