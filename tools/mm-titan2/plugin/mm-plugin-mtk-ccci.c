@@ -9,7 +9,12 @@
  *   wwan0at0        AT, the primary port (3GPP control, voice, SMS)
  *   wwan0mipc1      the MIPC data port (ID_MM_MTK_CCCI_MIPC_DATA): not AT,
  *                   grabbed with an unknown type and turned into MMPortMipc
- *   wwan0mipc0,2-9  other MIPC channels: ignored
+ *   wwan0mipc2      ignored, and in the dual-modem mode the anchor of a
+ *                   second device (ID_MM_PHYSDEV_UID mtk-ccci-sim2,
+ *                   ID_MM_MTK_CCCI_SIM_ANCHOR=2): never opened; its modem
+ *                   object is the SIM2 stack, with a virtual AT port over
+ *                   the slot-2 MIPC AT tunnel of wwan0mipc1 (DESIGN.md §11)
+ *   wwan0mipc0,3-9  other MIPC channels: ignored
  *   wwan0-N         the data links (net), created by the bearer at connect time
  *
  * This program is free software; you can redistribute it and/or modify
@@ -61,9 +66,17 @@ is_mipc_data_port (MMKernelDevice *port)
         return FALSE;
     if (mm_kernel_device_has_property (port, ID_MM_MTK_CCCI_MIPC_DATA))
         return mm_kernel_device_get_property_as_boolean (port, ID_MM_MTK_CCCI_MIPC_DATA);
-    /* without the udev rules: the factory software's channel is mipc1 */
+    /* without the udev rules: the data channel Android uses is mipc1 */
     name = mm_kernel_device_get_name (port);
     return g_str_has_suffix (name, "mipc1");
+}
+
+static gboolean
+is_sim2_anchor (MMKernelDevice *port)
+{
+    return g_strcmp0 (mm_kernel_device_get_subsystem (port), "wwan") == 0 &&
+           mm_kernel_device_has_property (port, ID_MM_MTK_CCCI_SIM_ANCHOR) &&
+           mm_kernel_device_get_property_as_int (port, ID_MM_MTK_CCCI_SIM_ANCHOR) == 2;
 }
 
 /*****************************************************************************/
@@ -146,7 +159,27 @@ create_modem (MMPlugin     *self,
               GList        *probes,
               GError      **error)
 {
+    GList *l;
+
     if (!mm_port_probe_list_has_at_port (probes)) {
+        /* the dual-modem mode's SIM2 device: only the anchor port */
+        for (l = probes; l; l = g_list_next (l)) {
+            MMKernelDevice *port = mm_port_probe_peek_port (MM_PORT_PROBE (l->data));
+
+            if (!is_sim2_anchor (port))
+                continue;
+            if (mm_kernel_device_has_property (port, ID_MM_MTK_CCCI_DUAL_MODEM) &&
+                !mm_kernel_device_get_property_as_boolean (port, ID_MM_MTK_CCCI_DUAL_MODEM)) {
+                g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                             "single-modem mode (" ID_MM_MTK_CCCI_DUAL_MODEM "=0): SIM2 is served by the SIM1 modem object");
+                return NULL;
+            }
+            mm_obj_dbg (self, "MediaTek CCCI integrated modem, SIM2 stack (anchor %s)...",
+                        mm_kernel_device_get_name (port));
+            return MM_BASE_MODEM (mm_broadband_modem_mtk_ccci_new_sim2 (uid, physdev, drivers,
+                                                                        mm_plugin_get_name (self),
+                                                                        port, error));
+        }
         g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
                      "Unsupported device: the AT port is required");
         return NULL;

@@ -37,6 +37,12 @@
 #define ID_MM_MTK_CCCI_RADIO_MASK "ID_MM_MTK_CCCI_RADIO_MASK" /* AT+EFUN=<mask>: 1 SIM1, 2 SIM2, 3 both (default 3) */
 #define ID_MM_MTK_CCCI_SIM_SLOT   "ID_MM_MTK_CCCI_SIM_SLOT"   /* protocol stack on the AT port and MIPC slot: 1 or 2 (default 1) */
 #define ID_MM_MTK_CCCI_MIPC_DATA  "ID_MM_MTK_CCCI_MIPC_DATA"  /* the MIPC port used for data calls */
+/* dual-modem mode (DESIGN.md §11): one modem object per SIM stack */
+#define ID_MM_MTK_CCCI_DUAL_MODEM "ID_MM_MTK_CCCI_DUAL_MODEM" /* on wwan0at0: 1 (default) two objects, 0 the single-object mode */
+#define ID_MM_MTK_CCCI_SIM_ANCHOR "ID_MM_MTK_CCCI_SIM_ANCHOR" /* "2" on wwan0mipc2: the SIM2 object's device (never opened) */
+#define ID_MM_MTK_CCCI_MIPC_PORT  "ID_MM_MTK_CCCI_MIPC_PORT"  /* on the anchor: the shared MIPC port (default <wwan>mipc1) */
+#define ID_MM_MTK_CCCI_SIM2_DATA  "ID_MM_MTK_CCCI_SIM2_DATA"  /* on the anchor: 1 allows bearers on SIM2 (default 0) */
+#define ID_MM_MTK_CCCI_DSDS_BUSY  "ID_MM_MTK_CCCI_DSDS_BUSY"  /* on wwan0at0: 1 (default) reject an incoming call while the other SIM has a call, 0 approve always */
 
 typedef struct _MMBroadbandModemMtkCcci MMBroadbandModemMtkCcci;
 typedef struct _MMBroadbandModemMtkCcciClass MMBroadbandModemMtkCcciClass;
@@ -60,6 +66,21 @@ MMBroadbandModemMtkCcci *mm_broadband_modem_mtk_ccci_new (const gchar  *device,
                                                           guint16       vendor_id,
                                                           guint16       product_id);
 
+/* the SIM2 modem object of the dual-modem mode: @anchor is the probed
+ * wwan0mipc2 (ID_MM_MTK_CCCI_SIM_ANCHOR=2); its AT port is created here
+ * (a virtual AT port over the slot-2 MIPC AT tunnel) */
+MMBroadbandModemMtkCcci *mm_broadband_modem_mtk_ccci_new_sim2 (const gchar     *device,
+                                                               const gchar     *physdev,
+                                                               const gchar    **drivers,
+                                                               const gchar     *plugin,
+                                                               MMKernelDevice  *anchor,
+                                                               GError         **error);
+
+/* TRUE in the dual-modem mode (each object serves one SIM stack) */
+gboolean mm_broadband_modem_mtk_ccci_is_dual (MMBroadbandModemMtkCcci *self);
+/* MIPC slot bits this object serves (0x03 in the single-object mode) */
+guint8   mm_broadband_modem_mtk_ccci_get_served_slots (MMBroadbandModemMtkCcci *self);
+
 /* the MIPC data port (NULL when the modem has none); not referenced */
 MMPortMipc *mm_broadband_modem_mtk_ccci_peek_port_mipc (MMBroadbandModemMtkCcci *self);
 
@@ -71,6 +92,9 @@ guint8 mm_broadband_modem_mtk_ccci_get_mipc_slot (MMBroadbandModemMtkCcci *self)
 const gchar *mm_broadband_modem_mtk_ccci_get_wwan_device (MMBroadbandModemMtkCcci *self);
 
 gboolean mm_broadband_modem_mtk_ccci_ims_owns_link (MMBroadbandModemMtkCcci *self, guint link_id);
+/* a data event on the LTE-loss diagnostics trace of @slot (0: this
+ * object's slots), followed by a serving-state snapshot */
+void mm_broadband_modem_mtk_ccci_trace_event (MMBroadbandModemMtkCcci *self, guint8 slot, const gchar *what);
 
 /* Synchronize the selected SIM's internet APN with the connection manager. */
 void mm_broadband_modem_mtk_ccci_prepare_data (MMBroadbandModemMtkCcci *self, const gchar *apn,

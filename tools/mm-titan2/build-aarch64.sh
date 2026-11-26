@@ -24,16 +24,18 @@
 #   AOSP clang r574158 in toolchains/clang-r574158 (or TC=<dir with clang, lld, llvm-ar>).
 #
 # Usage: tools/mm-titan2/build-aarch64.sh [MM_TREE]   (or MM_TREE=..., SR=..., TC=..., OUT=...)
-# Output: $OUT/dist/ (default out/mm-aarch64/dist/) (plugin .so, helper, udev rules, sha256sums)
+# Output: $OUT/dist/ (default out/mm-aarch64/dist/: plugin .so, helper, udev rules, sha256sums);
+# the cross build directory is MM_TREE/build-aarch64
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 mm=${1:-${MM_TREE:-$repo/src/ModemManager}}
-OUT=${OUT:-$repo/out/mm-aarch64}
-SR=${SR:-$OUT/sysroot}
+SR=${SR:-$repo/out/mm-aarch64/sysroot}
 TC=${TC:-$repo/toolchains/clang-r574158/bin}
-out=$OUT
+# OUT: where cross.ini, the helper and dist/ go (default out/mm-aarch64);
+# the sysroot stays where SR points
+out=${OUT:-$repo/out/mm-aarch64}
 dist=$out/dist
 
 command -v patchelf >/dev/null || { echo "patchelf is required to remove build-tree library paths" >&2; exit 1; }
@@ -44,6 +46,7 @@ gccdir=$(ls -d "$SR"/usr/lib/gcc/aarch64-alpine-linux-musl/* 2>/dev/null | head 
 
 "$here/apply.sh" "$mm" >/dev/null
 
+mkdir -p "$out"
 cross=$out/cross.ini
 cat > "$cross" <<EOF
 [binaries]

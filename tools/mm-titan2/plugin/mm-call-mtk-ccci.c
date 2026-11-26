@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
- * Per-SIM noninteractive AT call control via SYS_AT.
- * Written from a clean-room behavioural description of the protocol; no code of the factory firmware was used.
+ * Per-SIM noninteractive AT call control via SYS_AT. Written from
+ * a clean-room behavioural description of the protocol; no code of the phone's Android software was used.
  */
 #include <config.h>
 #include <string.h>
@@ -186,4 +186,59 @@ void mm_call_mtk_ccci_report (MMIfaceModemVoice *modem, MMPortMipc *port, guint8
         mm_call_list_add_call (list, call);
         g_object_unref (call);
     }
+}
+
+/* DSDS policy (mm-mtk-ccci-shared.c): does the slot have a call? */
+typedef struct { guint8 slot; guint n; } CountCalls;
+static void count_present (MMBaseCall *call, gpointer user_data)
+{
+    CountCalls *ctx = user_data;
+    switch (mm_base_call_get_state (call)) {
+    case MM_CALL_STATE_DIALING:
+    case MM_CALL_STATE_RINGING_OUT:
+    case MM_CALL_STATE_ACTIVE:
+    case MM_CALL_STATE_HELD:
+    case MM_CALL_STATE_RINGING_IN:
+    case MM_CALL_STATE_WAITING:
+        break;
+    case MM_CALL_STATE_UNKNOWN:      /* created, not started */
+    case MM_CALL_STATE_TERMINATED:
+    default:
+        return;
+    }
+    /* a call of another class has no slot: count it (the safe side) */
+    if (!G_TYPE_CHECK_INSTANCE_TYPE (call, mm_call_mtk_ccci_get_type ()) ||
+        call_slot ((MMCallMtkCcci *) call) == ctx->slot)
+        ctx->n++;
+}
+
+guint mm_call_mtk_ccci_count_present (MMIfaceModemVoice *modem, guint8 slot)
+{
+    g_autoptr(MMCallList) list = NULL;
+    CountCalls ctx = { slot, 0 };
+    g_object_get (modem, MM_IFACE_MODEM_VOICE_CALL_LIST, &list, NULL);
+    if (list)
+        mm_call_list_foreach (list, count_present, &ctx);
+    return ctx.n;
+}
+
+gboolean mm_call_mtk_ccci_report_rejected (MMIfaceModemVoice *modem, MMPortMipc *port, guint8 slot, const gchar *number)
+{
+    g_autoptr(MMCallList) list = NULL;
+    MMBaseCall *call;
+    g_object_get (modem, MM_IFACE_MODEM_VOICE_CALL_LIST, &list, NULL);
+    if (!list)
+        return FALSE;
+    /* Index 0 and terminated before it is listed: the +CLCC reconciliation,
+     * the call reports (index lookups) and the generic matching all skip
+     * terminated calls; no state change follows, so no in-call setup (no
+     * speech path) and no incoming timeout. The client removes it with
+     * DeleteCall like any ended call. */
+    call = mm_call_mtk_ccci_new (MM_BASE_MODEM (modem), port, slot, MM_CALL_DIRECTION_INCOMING,
+                                 number ? number : "", 0);
+    mm_base_call_change_state (call, MM_CALL_STATE_TERMINATED, MM_CALL_STATE_REASON_REFUSED_OR_BUSY);
+    mm_base_call_export (call);
+    mm_call_list_add_call (list, call);
+    g_object_unref (call);
+    return TRUE;
 }

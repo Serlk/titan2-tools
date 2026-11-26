@@ -106,7 +106,9 @@ gchar *mm_port_mipc_at_command_finish (MMPortMipc *self, GAsyncResult *res, GErr
 
 /* Session start: INTERNAL_TEST_REQ until answered, INTERNAL_OPEN_REQ,
  * then REGISTER_IND on @slot or REGISTER_CMD on slot 0xff for each id.
- * The port must be open. OPEN and all registrations must succeed. */
+ * The port must be open. OPEN and all registrations must succeed. A call
+ * while a session start is in flight joins it (one TEST/OPEN on the wire)
+ * and completes with its result. */
 void     mm_port_mipc_open_session        (MMPortMipc          *self,
                                            guint8               slot,
                                            const guint16       *indications,
@@ -118,6 +120,9 @@ void     mm_port_mipc_open_session        (MMPortMipc          *self,
 gboolean mm_port_mipc_open_session_finish (MMPortMipc          *self,
                                            GAsyncResult        *res,
                                            GError             **error);
+
+/* TRUE while a session start is in flight (a new caller joins it) */
+gboolean mm_port_mipc_session_starting (MMPortMipc *self);
 
 /* TRUE between a successful session start and the port being closed */
 gboolean mm_port_mipc_get_session_ready (MMPortMipc *self);

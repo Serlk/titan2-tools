@@ -90,6 +90,7 @@ static void mm_broadband_modem_mtk_ccci_init (MMBroadbandModemMtkCcci *self) { }
 static void mm_broadband_modem_mtk_ccci_class_init (MMBroadbandModemMtkCcciClass *klass) { }
 MMPortMipc *mm_broadband_modem_mtk_ccci_peek_port_mipc (MMBroadbandModemMtkCcci *self) { return current->port; }
 guint8 mm_broadband_modem_mtk_ccci_get_mipc_slot (MMBroadbandModemMtkCcci *self) { return MM_MIPC_SLOT_SIM2; }
+void mm_broadband_modem_mtk_ccci_trace_event (MMBroadbandModemMtkCcci *self, guint8 slot, const gchar *what) { }
 const gchar *mm_broadband_modem_mtk_ccci_get_wwan_device (MMBroadbandModemMtkCcci *self) { return "wwan-test"; }
 void mm_broadband_modem_mtk_ccci_prepare_data (MMBroadbandModemMtkCcci *self, const gchar *apn,
                                              GAsyncReadyCallback callback, gpointer user_data)

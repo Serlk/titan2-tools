@@ -1,7 +1,7 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * MIPC framing and TLV coding. Written from a clean-room behavioural description of the protocol; no code of the factory firmware was used.
+ * MIPC framing and TLV coding. Written from a clean-room behavioural description of the protocol; no code of the phone's Android software was used.
  * Ported to GLib from tools/modemd/src/mipc.c.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -291,6 +291,31 @@ mm_mipc_msg_id_get_string (guint16 msg_id)
     case MM_MIPC_SMS_NEW_SMS_IND:             return "SMS_NEW_SMS_IND";
     case MM_MIPC_SMS_STORE_STATUS_IND:        return "SMS_STORE_STATUS_IND";
     case MM_MIPC_SMS_NEW_STATUS_REPORT_IND:   return "SMS_NEW_STATUS_REPORT_IND";
+    case MM_MIPC_APN_ADD_PROFILE_LIST_REQ:    return "APN_ADD_PROFILE_LIST_REQ";
+    case MM_MIPC_APN_ADD_PROFILE_LIST_CNF:    return "APN_ADD_PROFILE_LIST_CNF";
+    case MM_MIPC_APN_SET_IA_REQ:              return "APN_SET_IA_REQ";
+    case MM_MIPC_DATA_SET_DATA_ALLOW_REQ:     return "DATA_SET_DATA_ALLOW_REQ";
+    case MM_MIPC_DATA_SET_DATA_ALLOW_CNF:     return "DATA_SET_DATA_ALLOW_CNF";
+    case MM_MIPC_CALL_DATA_PREFER_SET_REQ:    return "CALL_DATA_PREFER_SET_REQ";
+    case MM_MIPC_CALL_DATA_PREFER_SET_CNF:    return "CALL_DATA_PREFER_SET_CNF";
+    case MM_MIPC_NW_SET_RADIO_CAPABILITY_REQ: return "NW_SET_RADIO_CAPABILITY_REQ";
+    case MM_MIPC_NW_SET_RADIO_CAPABILITY_CNF: return "NW_SET_RADIO_CAPABILITY_CNF";
+    case MM_MIPC_SYS_MULTI_SIM_CONFIG_REQ:    return "SYS_MULTI_SIM_CONFIG_REQ";
+    case MM_MIPC_SYS_MULTI_SIM_CONFIG_CNF:    return "SYS_MULTI_SIM_CONFIG_CNF";
+    case MM_MIPC_SYS_SET_DSBP_REQ:            return "SYS_SET_DSBP_REQ";
+    case MM_MIPC_SYS_SET_DSBP_CNF:            return "SYS_SET_DSBP_CNF";
+    case MM_MIPC_NW_SET_RADIO_STATE_REQ:      return "NW_SET_RADIO_STATE_REQ";
+    case MM_MIPC_NW_SET_RADIO_STATE_CNF:      return "NW_SET_RADIO_STATE_CNF";
+    case MM_MIPC_NW_GET_PS_REQ:               return "NW_GET_PS_REQ";
+    case MM_MIPC_NW_GET_PS_CNF:               return "NW_GET_PS_CNF";
+    case MM_MIPC_NW_PS_IND:                   return "NW_PS_IND";
+    case MM_MIPC_NW_RADIO_IND:                return "NW_RADIO_IND";
+    case MM_MIPC_NW_IA_IND:                   return "NW_IA_IND";
+    case MM_MIPC_NW_CS_IND:                   return "NW_CS_IND";
+    case MM_MIPC_NW_CSCON_IND:                return "NW_CSCON_IND";
+    case MM_MIPC_NW_PHYSICAL_CHANNEL_CONFIGS_IND: return "NW_PHYSICAL_CHANNEL_CONFIGS_IND";
+    case MM_MIPC_NW_BARRING_INFO_IND:         return "NW_BARRING_INFO_IND";
+    case MM_MIPC_APN_SET_IA_CNF:              return "APN_SET_IA_CNF";
     case MM_MIPC_NW_SET_RAT_REQ:              return "NW_SET_RAT_REQ";
     case MM_MIPC_NW_SET_RAT_CNF:              return "NW_SET_RAT_CNF";
     case MM_MIPC_NW_CURRENT_RAT_IND:          return "NW_CURRENT_RAT_IND";
@@ -315,7 +340,15 @@ mm_mipc_request_is_valid (guint16 id)
     case MM_MIPC_DATA_DEACT_CALL_REQ:
     case MM_MIPC_IMS_SET_CONFIG_REQ:
     case MM_MIPC_APN_ADD_PROFILE_LIST_REQ:
+    case MM_MIPC_APN_SET_IA_REQ:
     case MM_MIPC_NW_SET_RAT_REQ:
+    case MM_MIPC_DATA_SET_DATA_ALLOW_REQ:
+    case MM_MIPC_CALL_DATA_PREFER_SET_REQ:
+    case MM_MIPC_NW_SET_RADIO_CAPABILITY_REQ:
+    case MM_MIPC_SYS_MULTI_SIM_CONFIG_REQ:
+    case MM_MIPC_SYS_SET_DSBP_REQ:
+    case MM_MIPC_NW_SET_RADIO_STATE_REQ:
+    case MM_MIPC_NW_GET_PS_REQ:
         return TRUE;
     default:
         return FALSE;
@@ -387,14 +420,123 @@ mm_mipc_build_apn_profiles (const gchar *internet, const gchar *ims, const gchar
         memcpy (record + MM_MIPC_APN_REC_APN_OFF, names[i], strlen (names[i]));
         mm_mipc_put (record + MM_MIPC_APN_REC_BEARER_OFF, 4, MM_MIPC_APN_REC_BEARER_ALL);
         mm_mipc_put (record + MM_MIPC_APN_REC_TYPE_OFF, 4, types[i]);
-        record[MM_MIPC_APN_REC_PDP_OFF] = i ? MM_MIPC_PDP_IPV4V6 : MM_MIPC_PDP_IP;
+        record[MM_MIPC_APN_REC_PDP_OFF] = i ? MM_MIPC_PDP_IPV4V6 : MM_MIPC_APN_INTERNET_PDP;
         record[MM_MIPC_APN_REC_ROAM_PDP_OFF] = record[MM_MIPC_APN_REC_PDP_OFF];
         /* Captured values; coding of authentication and enabled is unverified. */
-        record[MM_MIPC_APN_REC_AUTH_OFF] = i ? 0 : 1;
+        record[MM_MIPC_APN_REC_AUTH_OFF] = i ? 0 : MM_MIPC_APN_INTERNET_AUTH;
         mm_mipc_put (record + MM_MIPC_APN_REC_ENABLED_OFF, 4, 1);
         mm_mipc_tlv_add (tlvs, (guint16) (0x10000u - count + index++), record, sizeof (record));
     }
     return tlvs;
+}
+
+GByteArray *
+mm_mipc_build_set_ia (const gchar *apn, guint8 pdp, guint8 roaming_pdp, guint8 auth,
+                      const gchar *user, const gchar *password)
+{
+    GByteArray *b;
+
+    if (!apn || !apn[0] || strlen (apn) >= MM_MIPC_APN_REC_APN_MAX)
+        return NULL;
+    b = g_byte_array_new ();
+    if (!mm_mipc_tlv_add_str (b, MM_MIPC_T_IA_APN, apn) ||
+        !mm_mipc_tlv_add_u8 (b, MM_MIPC_T_IA_PDP, pdp) ||
+        !mm_mipc_tlv_add_u8 (b, MM_MIPC_T_IA_ROAM_PDP, roaming_pdp) ||
+        !mm_mipc_tlv_add_u8 (b, MM_MIPC_T_IA_AUTH, auth) ||
+        !mm_mipc_tlv_add_str (b, MM_MIPC_T_IA_USER, user ? user : "") ||
+        !mm_mipc_tlv_add_str (b, MM_MIPC_T_IA_PASSWORD, password ? password : "")) {
+        g_byte_array_unref (b);
+        return NULL;
+    }
+    return b;
+}
+
+GByteArray *
+mm_mipc_build_data_prefer (void)
+{
+    GByteArray *b = g_byte_array_new ();
+
+    mm_mipc_tlv_add_u8 (b, 0x0100, 1);
+    mm_mipc_tlv_add_u8 (b, 0x0101, 1);
+    return b;
+}
+
+GByteArray *
+mm_mipc_build_radio_capability (void)
+{
+    GByteArray *b = g_byte_array_new ();
+
+    mm_mipc_tlv_add_u32 (b, 0x0100, MM_MIPC_RADIO_CAPABILITY_ALL);
+    mm_mipc_tlv_add_u8 (b, 0x0101, 1);
+    return b;
+}
+
+GByteArray *
+mm_mipc_build_multi_sim_config (void)
+{
+    GByteArray *b = g_byte_array_new ();
+
+    mm_mipc_tlv_add_u8 (b, 0x0101, 2);
+    return b;
+}
+
+GByteArray *
+mm_mipc_build_dsbp (void)
+{
+    GByteArray *b = g_byte_array_new ();
+
+    mm_mipc_tlv_add_u8 (b, 0x0100, 3);
+    return b;
+}
+
+static gchar *tlv_dump (const guint8 *p, gsize len, gsize max_value, gboolean show_private);
+
+gchar *
+mm_mipc_tlv_dump (const guint8 *p, gsize len, gsize max_value)
+{
+    return tlv_dump (p, len, max_value, FALSE);
+}
+
+gchar *
+mm_mipc_tlv_dump_full (const guint8 *p, gsize len, gsize max_value)
+{
+    return tlv_dump (p, len, max_value, TRUE);
+}
+
+GByteArray *
+mm_mipc_build_radio_state (gboolean on)
+{
+    GByteArray *b = g_byte_array_new ();
+
+    mm_mipc_tlv_add_u8 (b, 0x0100, on ? 1 : 0);
+    return b;
+}
+
+static gchar *
+tlv_dump (const guint8 *p, gsize len, gsize max_value, gboolean show_private)
+{
+    GString  *s = g_string_new (NULL);
+    MMMipcTlv tlv;
+    gsize     off = 0, i;
+    gint      r;
+
+    while ((r = mm_mipc_tlv_next (p, len, &off, &tlv)) == 1) {
+        g_string_append_printf (s, "%s%04x/%" G_GSIZE_FORMAT, s->len ? " " : "", tlv.raw_id, tlv.len);
+        if ((tlv.raw_id & 0x8000) && !show_private) {
+            g_string_append (s, " (masked)");
+            continue;
+        }
+        if (!tlv.len)
+            continue;
+        g_string_append_c (s, '=');
+        for (i = 0; i < tlv.len && i < max_value; i++)
+            g_string_append_printf (s, "%02x", tlv.val[i]);
+        if (tlv.len > max_value)
+            g_string_append (s, "...");
+    }
+    if (r < 0)
+        g_string_append (s, s->len ? " (malformed)" : "(malformed)");
+    return g_string_free (s, FALSE);
 }
 
 GByteArray *

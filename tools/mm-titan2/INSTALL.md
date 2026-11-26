@@ -15,6 +15,25 @@ ModemManager alone sends EFUN after the IMS setup. Do not run t2-modemd alongsid
 Install `60-titan2-wwan.conf` from the build into `/etc/sysctl.d/` and apply it before checking
 simultaneous Wi-Fi/WWAN connectivity. Keep SSH on USB/Wi-Fi while testing.
 
+**Both SIMs as two modems (default).** The plugin shows each SIM as its own ModemManager modem
+(DESIGN.md §11): SIM1 as before, SIM2 with `Device` `mtk-ccci-sim2`, its own signal, registration,
+calls and SMS; mobile data stays on SIM1. When installing over a single-modem build:
+
+1. Bind the NetworkManager profile to SIM1 before starting the new ModemManager, otherwise NM may
+   try an `ifname '*'` profile on the SIM2 modem (which refuses bearers):
+   `nmcli c modify mobile gsm.sim-id <ICCID of the SIM in slot 1>` (from `mmcli -m <n>` → `SIM`
+   path → `mmcli -i <sim> -K | grep iccid`) **and** bind it to the SIM1 modem's port:
+   `nmcli c modify mobile connection.interface-name wwan0at0`. Without the port binding NM may
+   activate the profile on both modems right after a service restart (the SIM2 SIM identifier is
+   not known to NM yet), and the failing SIM2 attempt takes the SIM1 activation down with it.
+2. `udevadm control --reload && udevadm trigger -s wwan` after installing the new rules file
+   (`wwan0mipc2` moves to its own device), then restart ModemManager.
+3. Back to one modem object without changing the plugin: `/etc/udev/rules.d/79-mm-mtk-ccci-single.rules`
+   with these two lines, then reload, trigger and restart ModemManager:
+
+       SUBSYSTEM=="wwan", DRIVERS=="mtk-ccci-md", ENV{ID_MM_MTK_CCCI_DUAL_MODEM}="0"
+       SUBSYSTEM=="wwan", DRIVERS=="mtk-ccci-md", KERNEL=="wwan*mipc2", ENV{ID_MM_PHYSDEV_UID}="mtk-ccci"
+
 The new configuration properties can be overridden in a later 78-mm/79-mm user udev rule:
 `ID_MM_MTK_CCCI_IMS=0` disables IMS for a data-only diagnostic, optional
 `ID_MM_MTK_CCCI_DATA_APN` supplies the operator's internet APN before attach, and
@@ -86,13 +105,25 @@ data port, the other MIPC ports as ignored, and carries the plugin's configurati
 | property (on `wwan0at0`) | default | meaning |
 |---|---|---|
 | `ID_MM_MTK_CCCI_RADIO_MASK` | 3 | `AT+EFUN=<mask>`: 1 SIM1 radio, 2 SIM2, 3 both |
-| `ID_MM_MTK_CCCI_SIM_SLOT` | 1 | protocol stack on the AT port (`AT+ESUO=4`/`5`) and MIPC slot bit; overridden by a slot chosen with `mmcli --set-primary-sim-slot` (stored in `/var/lib/ModemManager/mtk-ccci-sim-slot`) |
+| `ID_MM_MTK_CCCI_SIM_SLOT` | 1 | single-object mode only: protocol stack on the AT port (`AT+ESUO=4`/`5`) and MIPC slot bit; overridden by a slot chosen with `mmcli --set-primary-sim-slot` (stored in `/var/lib/ModemManager/mtk-ccci-sim-slot`) |
 | `ID_MM_MTK_CCCI_SPEECHD_SOCKET` | `/run/t2-speechd.sock` | the t2-speechd socket for the voice audio path; `""` disables the in-plugin trigger |
+| `ID_MM_MTK_CCCI_DUAL_MODEM` (all wwan ports) | 1 | 1: SIM1 and SIM2 as two modem objects; 0: the single object with switchable primary SIM |
+| `ID_MM_MTK_CCCI_DSDS_BUSY` | 1 | 1: an incoming call on one SIM while the other SIM has a call (dialing, ringing, active, held, waiting) is rejected at the modem's approval step (cause 21) and shown as an incoming call ended "refused-or-busy" on that SIM's modem; 0: every incoming call is approved. Not set in the rules file (default 1) |
+| LTE start-up switches (`ID_MM_MTK_CCCI_DATA_ALLOW`, `_DATA_SIM`, `_RADIO_CONFIG`, `_PREFER_SBP`, `_REG_CAUSE`, `_START_PROFILES`, the IMS step switches, `_RADIO_OFF`, `_NW_DIAG`, `_IA`) | see DESIGN.md §12 | the start-up requests before radio-on and the read-only diagnostics, one switch per group |
+
+| property (on `wwan0mipc2`, the SIM2 anchor) | default | meaning |
+|---|---|---|
+| `ID_MM_PHYSDEV_UID` | `mtk-ccci-sim2` | its own device, hence its own modem object |
+| `ID_MM_MTK_CCCI_SIM_ANCHOR` | 2 | the plugin builds the SIM2 object for this device; the port stays ignored and is never opened |
+| `ID_MM_MTK_CCCI_MIPC_PORT` | `<wwan>mipc1` | the shared MIPC port |
+| `ID_MM_MTK_CCCI_SIM2_DATA` | 0 | 1 allows bearers on SIM2 (untested) |
+| `ID_MM_MTK_CCCI_SPEECHD_SOCKET`, `ID_MM_MTK_CCCI_IMS`, `…_DATA_APN_SIM2`, `…_IMS_APN`, `…_SOS_APN`, `…_IA_SIM2` | as on wwan0at0 | read by the SIM2 object; the SIM1 object configures both stacks' IMS profiles from wwan0at0 |
 
 Check after a reload with the ports present:
 `udevadm info -q property /sys/class/wwan/wwan0at0 | grep ID_MM` (expect `ID_MM_MTK_CCCI=1`,
 `ID_MM_PORT_TYPE_AT_PRIMARY=1`, `ID_MM_CANDIDATE=1`) and the same for `wwan0mipc1`
-(`ID_MM_MTK_CCCI_MIPC_DATA=1`) and `wwan0mipc2` (`ID_MM_PORT_IGNORE=1`). If the ports were created
+(`ID_MM_MTK_CCCI_MIPC_DATA=1`) and `wwan0mipc2` (`ID_MM_PORT_IGNORE=1`, and in the dual-modem
+mode `ID_MM_PHYSDEV_UID=mtk-ccci-sim2`, `ID_MM_MTK_CCCI_SIM_ANCHOR=2`). If the ports were created
 before the rule was installed: `udevadm trigger -s wwan`.
 
 ### D-Bus activation
@@ -176,9 +207,12 @@ Incoming: the `+EAIC` indication is approved at once (`AT+EAIC=0,<id>,<seq>`), t
 SMS: `mmcli -m any --messaging-create-sms="text='hi',number='+49...'"` then
 `mmcli -m any -s 0 --send`; received messages: `mmcli -m any --messaging-list-sms`.
 
-Dual SIM: `mmcli -m any` shows two SIM slots, slot 1 primary; `mmcli -m any
---set-primary-sim-slot=2` stores the choice and reprobes the modem on the SIM2 stack
-(`AT+ESUO=5`); back with `=1`.
+Dual SIM, dual-modem mode: `mmcli -L` lists two modems; `mmcli -m <n>` shows `Device:
+mtk-ccci` (SIM1) or `mtk-ccci-sim2` (SIM2), each with its own SIM, signal, registration, calls
+(`mmcli -m <n> --voice-create-call=…`) and SMS. Use the modem index instead of `-m any` (which
+picks one of them). Single-object mode: `mmcli -m any` shows two SIM slots, slot 1 primary;
+`mmcli -m any --set-primary-sim-slot=2` stores the choice and reprobes the modem on the SIM2
+stack (`AT+ESUO=5`); back with `=1`.
 
 ## 5. Rolling back to t2-modemd
 

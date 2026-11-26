@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
  * Standard 3GPP SMS readiness probes, based on our phone observations and
- * ModemManager's existing CPMS parser. No vendor implementation is used.
+ * ModemManager's existing CPMS parser. No proprietary implementation is used.
  */
 #include <config.h>
 #include <mm-errors-types.h>

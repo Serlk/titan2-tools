@@ -30,19 +30,58 @@ SUBSYSTEM=="wwan", KERNEL=="wwan*at0", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
 #   ID_MM_MTK_CCCI_DATA_APN       optional internet APN before attach; else CGDCONT?
 #   ID_MM_MTK_CCCI_IMS_APN        default ims
 #   ID_MM_MTK_CCCI_SOS_APN        default sos
+#   ID_MM_MTK_CCCI_IA             initial-attach experiment: unset/0 = A (profile list
+#                                 only), 1 = B (also APN_SET_IA_REQ with the SIM's
+#                                 internet profile); ID_MM_MTK_CCCI_IA_SIM1/_SIM2
+#                                 override it per SIM (on wwan0at0; the SIM2 object
+#                                 reads its own from wwan0mipc2)
+#   LTE start-up contract, one switch per trial group:
+#   ID_MM_MTK_CCCI_DATA_ALLOW     group 1: DATA_SET_DATA_ALLOW on the data SIM's slot
+#                                 after every radio-on, without a bearer (default 1)
+#   ID_MM_MTK_CCCI_DATA_SIM       the data SIM for it, 1 or 2 (default 1)
+#   ID_MM_MTK_CCCI_RADIO_CONFIG   group 2: radio capability (both), multi-SIM config
+#                                 and DSBP (slot 1) before radio-on (default 0)
+#   ID_MM_MTK_CCCI_PREFER_SBP     group 3: call/data prefer (both) and the
+#                                 ESBP/EIAREG/ECCAUSE commands before radio-on (default 0)
+#   ID_MM_MTK_CCCI_REG_CAUSE      CREG/CGREG/CEREG level 3 (reject causes) where
+#                                 AT+CEREG=? offers it (default 0)
+#   start-up steps before radio-on, defaults unchanged:
+#   ID_MM_MTK_CCCI_START_PROFILES before-radio (default) | after-registration | off
+#   ID_MM_MTK_CCCI_IMS_MIPC_CONFIG, ID_MM_MTK_CCCI_CIREG, ID_MM_MTK_CCCI_EIMSPDN,
+#   ID_MM_MTK_CCCI_EIMSCFG, ID_MM_MTK_CCCI_EIMSRCS, ID_MM_MTK_CCCI_START_RAT
+#                                 1 (default) or 0 (that step not sent)
+#   ID_MM_MTK_CCCI_RADIO_OFF      cfun (default, AT+CFUN=4) | mipc (NW_SET_RADIO_STATE 0)
+#   ID_MM_MTK_CCCI_NW_DIAG        read-only network diagnostics, default 0
 # User overrides belong in a later 78-mm/79-mm rule, not in this package file.
 #   ID_MM_MTK_CCCI_RADIO_MASK     AT+EFUN=<mask>: 1 SIM1, 2 SIM2, 3 both (default 3)
-#   ID_MM_MTK_CCCI_SIM_SLOT       SIM protocol stack on the AT port and MIPC slot, 1 or 2 (default 1)
+#   ID_MM_MTK_CCCI_SIM_SLOT       single-object mode only: SIM protocol stack on the AT
+#                                 port and MIPC slot, 1 or 2 (default 1)
 #   ID_MM_MTK_CCCI_SPEECHD_SOCKET t2-speechd control socket for the voice audio path
 #                                 (default /run/t2-speechd.sock; "" disables the trigger)
 SUBSYSTEM=="wwan", KERNEL=="wwan*at0", ENV{ID_MM_MTK_CCCI_RADIO_MASK}="3"
 SUBSYSTEM=="wwan", KERNEL=="wwan*at0", ENV{ID_MM_MTK_CCCI_SIM_SLOT}="1"
 SUBSYSTEM=="wwan", KERNEL=="wwan*at0", ENV{ID_MM_MTK_CCCI_SPEECHD_SOCKET}="/run/t2-speechd.sock"
 
-# the MIPC channel the factory software activates data on; the other MIPC
+# the MIPC channel Android activates data on; the other MIPC
 # channels are not used by ModemManager
 SUBSYSTEM=="wwan", KERNEL=="wwan*mipc1", ENV{ID_MM_MTK_CCCI_MIPC_DATA}="1"
 SUBSYSTEM=="wwan", KERNEL=="wwan*mipc*", ENV{ID_MM_MTK_CCCI_MIPC_DATA}!="1", ENV{ID_MM_PORT_IGNORE}="1"
+
+# Both SIM stacks as two modem objects (dual-modem mode). wwan0mipc2 stays
+# ignored (never opened) and becomes the only port of a second device; the
+# plugin builds the SIM2 modem object for it, whose AT port is a virtual port
+# over the slot-2 MIPC AT tunnel of wwan0mipc1. Configuration of the SIM2
+# object is read from this port:
+#   ID_MM_MTK_CCCI_DUAL_MODEM     1 two modem objects (default), 0 the old
+#                                 single object with switchable PrimarySimSlot
+#                                 (also set it on wwan0at0; a later 79-mm rule
+#                                 for SUBSYSTEM=="wwan", DRIVERS=="mtk-ccci-md")
+#   ID_MM_MTK_CCCI_MIPC_PORT      the shared MIPC port (default <wwan>mipc1)
+#   ID_MM_MTK_CCCI_SIM2_DATA      1 allows mobile data on SIM2 (default 0)
+SUBSYSTEM=="wwan", ENV{ID_MM_MTK_CCCI_DUAL_MODEM}="1"
+SUBSYSTEM=="wwan", KERNEL=="wwan*mipc2", ENV{ID_MM_PHYSDEV_UID}="mtk-ccci-sim2"
+SUBSYSTEM=="wwan", KERNEL=="wwan*mipc2", ENV{ID_MM_MTK_CCCI_SIM_ANCHOR}="2"
+SUBSYSTEM=="wwan", KERNEL=="wwan*mipc2", ENV{ID_MM_MTK_CCCI_SPEECHD_SOCKET}="/run/t2-speechd.sock"
 
 # the wwan ports are candidates (80-mm-candidate.rules does the same)
 SUBSYSTEM=="wwan", ENV{ID_MM_CANDIDATE}="1"

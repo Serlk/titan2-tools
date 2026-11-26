@@ -6,7 +6,7 @@
  * (mm-broadband-modem-mtk-ccci.c, in-call audio channel hooks); use one of
  * the two, not both.
  *
- * Rule (factory timing): speech on when the first call
+ * Rule (Android's timing): speech on when the first call
  * is dialing, ringing out, held or active (not for a ringing incoming call),
  * speech off when no call is in one of these states any more. t2-speechd's
  * line protocol: tools/speechd/README.md.

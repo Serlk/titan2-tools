@@ -47,16 +47,15 @@
 #include "mm-bind.h"
 #include "mm-log-object.h"
 
-/* the factory firmware's RIL waits the modem's default (300 s) for the activation confirm;
+/* Android's RIL waits the modem's default (300 s) for the activation confirm;
  * t2-modemd uses 30 s; MM's own connection timeout is 180 s */
 #define ACT_CALL_TIMEOUT_SECS    60
-/* the factory firmware's RIL allows 900 s for a deactivation; MM's disconnection timeout is 120 s */
+/* Android's RIL allows 900 s for a deactivation; MM's disconnection timeout is 120 s */
 #define DEACT_CALL_TIMEOUT_SECS  60
 #define WAIT_LINK_PORT_TIMEOUT_MS 5000
 #define CGCONTRDP_TIMEOUT_SECS   10
 #define CGDCONT_TIMEOUT_SECS     10
-/* the factory software sets 1500 when the modem gives no MTU
- * (observed on the phone: TLV 0x0123 = 0) */
+/* Android sets 1500 when the modem gives no MTU; observed on the phone: TLV 0x0123 = 0 */
 #define DEFAULT_MTU              1500
 
 G_DEFINE_TYPE (MMBearerMtkCcci, mm_bearer_mtk_ccci, MM_TYPE_BASE_BEARER)
@@ -222,6 +221,18 @@ eif_record (MMBearerMtkCcci *self,
     return info;
 }
 
+/* a data event on the modem's LTE-loss diagnostics trace */
+static void
+bearer_trace (MMBearerMtkCcci *self, const gchar *what)
+{
+    MMBaseModem *modem = NULL;
+
+    g_object_get (self, MM_BASE_BEARER_MODEM, &modem, NULL);
+    if (modem && MM_IS_BROADBAND_MODEM_MTK_CCCI (modem))
+        mm_broadband_modem_mtk_ccci_trace_event (MM_BROADBAND_MODEM_MTK_CCCI (modem), self->priv->slot, what);
+    g_clear_object (&modem);
+}
+
 static void
 mipc_indication_cb (MMPortMipc      *port,
                     guint            msg_id,
@@ -267,6 +278,7 @@ mipc_indication_cb (MMPortMipc      *port,
             if (self->priv->tid >= 0 && tid == self->priv->tid &&
                 mm_base_bearer_get_status (MM_BASE_BEARER (self)) == MM_BEARER_STATUS_CONNECTED) {
                 mm_obj_msg (self, "interface %d down indication: connection lost", tid);
+                bearer_trace (self, "data bearer lost (interface down indication)");
                 mm_base_bearer_report_connection_status (MM_BASE_BEARER (self),
                                                          MM_BEARER_CONNECTION_STATUS_DISCONNECTED);
             } else
@@ -295,6 +307,10 @@ mipc_indication_cb (MMPortMipc      *port,
             g_autoptr(GError) error = NULL;
 
             mm_obj_msg (self, "PDN %d deactivated by the modem (cause %u)", aid, cause);
+            {
+                g_autofree gchar *what = g_strdup_printf ("data bearer lost (PDN %d deactivated by the modem, cause %u)", aid, cause);
+                bearer_trace (self, what);
+            }
             error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
                                  "PDN deactivated by the modem, cause %u", cause);
             mm_base_bearer_report_connection_status_detailed (MM_BASE_BEARER (self),
@@ -578,7 +594,6 @@ act_call_ready (MMPortMipc   *mipc,
     p = cnf->payload->data;
     len = cnf->payload->len;
 
-
     if (mm_mipc_tlv_find_uint (p, len, MM_MIPC_T_CNF_AID, &v) && v <= 255) {
         ctx->aid = (gint) v;
         ctx->activated = TRUE;
@@ -651,6 +666,7 @@ act_call_ready (MMPortMipc   *mipc,
     self->priv->aid = ctx->aid;
     self->priv->tid = ctx->tid;
     self->priv->link_id = ctx->link_id;
+    bearer_trace (self, "data bearer connected (PDN activated)");
 
     ctx->step++;
     connect_context_step (task);
@@ -870,7 +886,7 @@ connect_context_step (GTask *task)
             ipv4_config = mm_bearer_ip_config_new ();
             mm_bearer_ip_config_set_method (ipv4_config, MM_BEARER_IP_METHOD_STATIC);
             mm_bearer_ip_config_set_address (ipv4_config, ctx->v4_addr);
-            /* point-to-point PDN: a host address; the factory software hands the
+            /* point-to-point PDN: a host address; Android hands the
              * connection manager the PDN's own address as gateway */
             mm_bearer_ip_config_set_prefix (ipv4_config, 32);
             mm_bearer_ip_config_set_gateway (ipv4_config, ctx->v4_addr);
@@ -1010,6 +1026,7 @@ deact_call_ready (MMPortMipc   *mipc,
         mm_obj_warn (self, "MIPC DATA_DEACT_CALL: result %u (removing the link anyway)", cnf->result);
     else
         mm_obj_msg (self, "PDN %d deactivated", self->priv->aid);
+    bearer_trace (self, "data bearer disconnected (PDN deactivation requested)");
     ctx->step++;
     disconnect_context_step (task);
 }

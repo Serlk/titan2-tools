@@ -32,8 +32,8 @@ static const guint8 hdr_ex[16] = { 0x84, 0x19, 0x54, 0x24, 0, 0, 0, 0, 0x01, 0x0
  * an array descriptor 0x812F with three u32 elements; the result */
 static const guint8 tlv_ex[] = {
     0x08, 0x01, 0x01, 0x00, 0x7F, 0, 0, 0,
-    0x01, 0x01, 0x12, 0x00, 'i', 'n', 't', 'e', 'r', 'n', 'e', 't', '.', 'c', 'a',
-    'r', 'r', 'i', 'e', 'r', '1', 0, 0, 0,
+    0x01, 0x01, 0x12, 0x00, 'i', 'n', 't', 'e', 'r', 'n', 'e', 't', '.', 't', 'e',
+    'l', 'e', '2', '.', 'r', 'u', 0, 0, 0,
     0x09, 0x01, 0x04, 0x00, 0xFF, 0xFF, 0xFD, 0x7F,
     0x2F, 0x81, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xFD, 0xFF, 0x03, 0x00,
     0xFD, 0xFF, 0x04, 0x00, 1, 0, 0, 0,
@@ -300,8 +300,8 @@ test_rat_mode (void)
     guint8                rat, prefer;
     guint                 curr, r, pr, i;
     guint32               v;
-    /* captured factory-firmware NW_SET_RAT_REQ payload (2026-10-27 23:55:30.519) */
-    static const guint8 factory[] = { 0x00, 0x01, 0x01, 0x00, 0x16, 0, 0, 0, 0x01, 0x01, 0x01, 0x00, 0x80, 0, 0, 0 };
+    /* NW_SET_RAT_REQ payload captured under Android (2026-10-27 23:55:30.519) */
+    static const guint8 captured[] = { 0x00, 0x01, 0x01, 0x00, 0x16, 0, 0, 0, 0x01, 0x01, 0x01, 0x00, 0x80, 0, 0, 0 };
 
     all = mm_mtk_ccci_rat_build_combinations (mask5);
     g_assert_cmpuint (all->len, ==, 9);
@@ -312,7 +312,8 @@ test_rat_mode (void)
     for (i = 0; i < no_nr->len; i++)
         g_assert_false (g_array_index (no_nr, MMModemModeCombination, i).allowed & MM_MODEM_MODE_5G);
 
-    /* defaults: NR first with 5G (and before probing), LTE first without */
+    /* the default is NR first with 5G, before probing and without 5G in the
+     * probing result (the probing can miss NR) */
     g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, MM_MODEM_MODE_ANY, MM_MODEM_MODE_NONE, &rat, &prefer));
     g_assert_cmpuint (rat, ==, 22);
     g_assert_cmpuint (prefer, ==, 128);
@@ -320,8 +321,8 @@ test_rat_mode (void)
     g_assert_cmpuint (rat, ==, 22);
     g_assert_true (mm_mtk_ccci_rat_from_modes (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G,
                                                MM_MODEM_MODE_ANY, MM_MODEM_MODE_NONE, &rat, &prefer));
-    g_assert_cmpuint (rat, ==, 6);
-    g_assert_cmpuint (prefer, ==, 3);
+    g_assert_cmpuint (rat, ==, 22);
+    g_assert_cmpuint (prefer, ==, 128);
     g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, MM_MODEM_MODE_2G | MM_MODEM_MODE_3G, MM_MODEM_MODE_3G, &rat, &prefer));
     g_assert_cmpuint (rat, ==, 2);
     g_assert_cmpuint (prefer, ==, 2);
@@ -353,11 +354,367 @@ test_rat_mode (void)
     g_assert_false (mm_mtk_ccci_parse_erat (NULL, &curr, &r, &pr));
 
     req = mm_mipc_build_set_rat (22, 128);
-    g_assert_cmpmem (req->data, req->len, factory, sizeof (factory));
+    g_assert_cmpmem (req->data, req->len, captured, sizeof (captured));
     g_assert_true (mm_mipc_tlv_find_uint (req->data, req->len, MM_MIPC_T_SET_RAT_PREFER, &v));
     g_assert_cmpuint (v, ==, 128);
     g_assert_true (mm_mipc_request_is_valid (MM_MIPC_NW_SET_RAT_REQ));
     g_assert_cmpstr (mm_mipc_msg_id_get_string (MM_MIPC_NW_CURRENT_RAT_IND), ==, "NW_CURRENT_RAT_IND");
+}
+
+/* the documented pairs, both directions, the latter
+ * from the pair alone (a new modem object has no cache of what it set) */
+static void
+test_rat_mode_pairs (void)
+{
+    g_autoptr(GByteArray) req = NULL;
+    MMModemMode           a, p;
+    MMModemMode           mask5 = MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G | MM_MODEM_MODE_5G;
+    MMModemMode           mask4 = MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G;
+    guint8                rat, prefer;
+    static const guint8   lte_first[] = { 0x00, 0x01, 0x01, 0x00, 0x06, 0, 0, 0, 0x01, 0x01, 0x01, 0x00, 0x04, 0, 0, 0 };
+
+    /* LTE first: 2G/3G/4G with 4G preferred <-> 6/4 */
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, mask4, MM_MODEM_MODE_4G, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 6);
+    g_assert_cmpuint (prefer, ==, 4);
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask4, mask4, MM_MODEM_MODE_4G, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 6);
+    g_assert_cmpuint (prefer, ==, 4);
+    g_assert_true (mm_mtk_ccci_rat_to_modes (6, 4, &a, &p));
+    g_assert_cmpuint (a, ==, mask4);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_4G);
+    req = mm_mipc_build_set_rat (rat, prefer);
+    g_assert_cmpmem (req->data, req->len, lte_first, sizeof (lte_first));
+
+    /* 3 is the <rat> value of LTE only, not an LTE preference */
+    g_assert_true (mm_mtk_ccci_rat_to_modes (6, 3, &a, &p));
+    g_assert_cmpuint (a, ==, mask4);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_NONE);
+
+    /* the automatic mode stays 22/128 */
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, MM_MODEM_MODE_ANY, MM_MODEM_MODE_NONE, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 22);
+    g_assert_cmpuint (prefer, ==, 128);
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, mask5, MM_MODEM_MODE_5G, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 22);
+    g_assert_cmpuint (prefer, ==, 128);
+    g_assert_true (mm_mtk_ccci_rat_to_modes (22, 128, &a, &p));
+    g_assert_cmpuint (a, ==, mask5);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_5G);
+    /* 2G and 3G stay allowed in it */
+    g_assert_cmpuint (a & (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G), ==, MM_MODEM_MODE_2G | MM_MODEM_MODE_3G);
+
+    /* LTE only stays 3/0 */
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 3);
+    g_assert_cmpuint (prefer, ==, 0);
+    g_assert_true (mm_mtk_ccci_rat_to_modes (3, 0, &a, &p));
+    g_assert_cmpuint (a, ==, MM_MODEM_MODE_4G);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_NONE);
+}
+
+/* the one retry after a rejected start-up pair */
+static void
+test_rat_fallback (void)
+{
+    MMModemMode mask5 = MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G | MM_MODEM_MODE_5G;
+    MMModemMode mask4 = MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G;
+    MMModemMode a = MM_MODEM_MODE_NONE, p = MM_MODEM_MODE_NONE;
+    guint8      rat, prefer;
+
+    /* NR first rejected: LTE first, i.e. 6/4 */
+    g_assert_true (mm_mtk_ccci_rat_fallback (mask5, 22, 128, &a, &p));
+    g_assert_cmpuint (a, ==, mask4);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_4G);
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask5, a, p, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 6);
+    g_assert_cmpuint (prefer, ==, 4);
+    /* the same before the supported modes are known */
+    g_assert_true (mm_mtk_ccci_rat_fallback (MM_MODEM_MODE_NONE, 22, 128, &a, &p));
+    g_assert_cmpuint (a, ==, mask4);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_4G);
+
+    /* the probing without NR: the start-up pair is still NR first, its
+     * refusal gives LTE first; LTE first refused is not followed by itself */
+    g_assert_true (mm_mtk_ccci_rat_from_modes (mask4, MM_MODEM_MODE_ANY, MM_MODEM_MODE_NONE, &rat, &prefer));
+    g_assert_cmpuint (rat, ==, 22);
+    g_assert_cmpuint (prefer, ==, 128);
+    g_assert_true (mm_mtk_ccci_rat_fallback (mask4, rat, prefer, &a, &p));
+    g_assert_cmpuint (a, ==, mask4);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_4G);
+    g_assert_false (mm_mtk_ccci_rat_fallback (mask4, 6, 4, &a, &p));
+    /* the default itself */
+    mm_mtk_ccci_rat_default (&a, &p);
+    g_assert_cmpuint (a, ==, mask5);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_5G);
+    /* some other pair rejected without NR: LTE first */
+    g_assert_true (mm_mtk_ccci_rat_fallback (mask4, 3, 0, &a, &p));
+    g_assert_cmpuint (a, ==, mask4);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_4G);
+    /* LTE first rejected with NR: NR first */
+    g_assert_true (mm_mtk_ccci_rat_fallback (mask5, 6, 4, &a, &p));
+    g_assert_cmpuint (a, ==, mask5);
+    g_assert_cmpuint (p, ==, MM_MODEM_MODE_5G);
+    /* a 3G-only modem has neither pair */
+    g_assert_false (mm_mtk_ccci_rat_fallback (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G, 2, 2, &a, &p));
+}
+
+/* registration lines for the diagnostics: URC and read response kept apart,
+ * the reject cause marked absent when the modem does not give it */
+static void
+test_reg_parse (void)
+{
+    MMMtkCcciReg      reg;
+    g_autofree gchar *d1 = NULL, *d2 = NULL, *d3 = NULL, *d4 = NULL, *d5 = NULL, *line = NULL;
+
+    /* URC, reporting level 2 */
+    g_assert_true (mm_mtk_ccci_reg_parse ("+CEREG: 1,\"1A2B\",\"01234567\",7", FALSE, &reg));
+    g_assert_cmpstr (reg.domain, ==, "EPS");
+    g_assert_cmpint (reg.n, ==, -1);
+    g_assert_cmpint (reg.stat, ==, 1);
+    g_assert_cmpint (reg.act, ==, 7);
+    g_assert_cmpint (reg.cause_type, ==, -1);
+    g_assert_cmpint (reg.reject_cause, ==, -1);
+    d1 = mm_mtk_ccci_reg_describe (&reg);
+    g_assert_cmpstr (d1, ==, "EPS stat 1 (home) AcT 7, reject cause not reported");
+
+    /* the same text as a read response: the first field is <n> */
+    g_assert_true (mm_mtk_ccci_reg_parse ("+CEREG: 2,1,\"1A2B\",\"01234567\",7", TRUE, &reg));
+    g_assert_cmpint (reg.n, ==, 2);
+    g_assert_cmpint (reg.stat, ==, 1);
+    g_assert_cmpint (reg.act, ==, 7);
+
+    /* +CGREG with <rac>, then the reject cause (level 3) */
+    g_assert_true (mm_mtk_ccci_reg_parse ("+CGREG: 3,\"1A2B\",\"0123\",6,\"01\",0,15", FALSE, &reg));
+    g_assert_cmpstr (reg.domain, ==, "PS");
+    g_assert_cmpint (reg.stat, ==, 3);
+    g_assert_cmpint (reg.act, ==, 6);
+    g_assert_cmpint (reg.cause_type, ==, 0);
+    g_assert_cmpint (reg.reject_cause, ==, 15);
+    d2 = mm_mtk_ccci_reg_describe (&reg);
+    g_assert_cmpstr (d2, ==, "PS stat 3 (denied) AcT 6, reject cause type 0 code 15");
+
+    /* +CREG read response, level 3 with a cause */
+    g_assert_true (mm_mtk_ccci_reg_parse ("+CREG: 3,0,\"1A2B\",\"0123\",7,0,111", TRUE, &reg));
+    g_assert_cmpstr (reg.domain, ==, "CS");
+    g_assert_cmpint (reg.stat, ==, 0);
+    g_assert_cmpint (reg.cause_type, ==, 0);
+    g_assert_cmpint (reg.reject_cause, ==, 111);
+
+    /* level 0/1: no location, no AcT */
+    g_assert_true (mm_mtk_ccci_reg_parse ("+CREG: 0,2", TRUE, &reg));
+    g_assert_cmpint (reg.stat, ==, 2);
+    g_assert_cmpint (reg.act, ==, -1);
+    d3 = mm_mtk_ccci_reg_describe (&reg);
+    g_assert_cmpstr (d3, ==, "CS stat 2 (searching) AcT not reported, reject cause not reported (n 0)");
+
+    g_assert_false (mm_mtk_ccci_reg_parse ("+COPS: 0,2,\"00102\",7", TRUE, &reg));
+    g_assert_false (mm_mtk_ccci_reg_parse ("+CEREG: ", FALSE, &reg));
+    g_assert_false (mm_mtk_ccci_reg_parse (NULL, FALSE, &reg));
+
+    /* a whole reply */
+    d4 = mm_mtk_ccci_reg_describe_text ("\r\n+CGREG: 2,1,\"1A2B\",\"0123\",6,\"01\"\r\n\r\nOK\r\n", TRUE);
+    g_assert_cmpstr (d4, ==, "PS stat 1 (home) AcT 6, reject cause not reported (n 2)");
+    d5 = mm_mtk_ccci_reg_describe_text ("+COPS: 0,2,\"00102\",7\r\nOK", TRUE);
+    g_assert_null (d5);
+
+    line = mm_mtk_ccci_at_one_line ("\r\n+COPS: 0,2,\"00102\",7\r\n\r\nOK\r\n");
+    g_assert_cmpstr (line, ==, "+COPS: 0,2,\"00102\",7 | OK");
+}
+
+/* APN_SET_IA_REQ 0x0101 */
+static void
+test_set_ia (void)
+{
+    g_autoptr(GByteArray) req = mm_mipc_build_set_ia ("internet.example", 1, 1, 1, NULL, NULL);
+    g_autofree gchar     *apn = NULL, *user = NULL, *password = NULL;
+    guint32               v;
+
+    g_assert_nonnull (req);
+    apn = mm_mipc_tlv_find_str (req->data, req->len, MM_MIPC_T_IA_APN);
+    g_assert_cmpstr (apn, ==, "internet.example");
+    g_assert_true (mm_mipc_tlv_find_uint (req->data, req->len, MM_MIPC_T_IA_PDP, &v));
+    g_assert_cmpuint (v, ==, 1);
+    g_assert_true (mm_mipc_tlv_find_uint (req->data, req->len, MM_MIPC_T_IA_ROAM_PDP, &v));
+    g_assert_cmpuint (v, ==, 1);
+    g_assert_true (mm_mipc_tlv_find_uint (req->data, req->len, MM_MIPC_T_IA_AUTH, &v));
+    g_assert_cmpuint (v, ==, 1);
+    /* user and password as (empty) strings: 0x8105, 0x8106 */
+    user = mm_mipc_tlv_find_str (req->data, req->len, MM_MIPC_T_IA_USER);
+    password = mm_mipc_tlv_find_str (req->data, req->len, MM_MIPC_T_IA_PASSWORD);
+    g_assert_cmpstr (user, ==, "");
+    g_assert_cmpstr (password, ==, "");
+    /* APN 17+1, three u8, two empty strings: 24 + 3 * 8 + 2 * 8 bytes */
+    g_assert_cmpuint (req->len, ==, 64);
+    g_assert_true (mm_mipc_request_is_valid (MM_MIPC_APN_SET_IA_REQ));
+    g_assert_cmpstr (mm_mipc_msg_id_get_string (MM_MIPC_APN_SET_IA_CNF), ==, "APN_SET_IA_CNF");
+    g_assert_null (mm_mipc_build_set_ia (NULL, 1, 1, 1, NULL, NULL));
+    g_assert_null (mm_mipc_build_set_ia ("", 1, 1, 1, NULL, NULL));
+}
+
+/* registration lines as the generic code applies them */
+static void
+test_reg_update_parse (void)
+{
+    MMMtkCcciRegUpdate      u;
+    MMModemAccessTechnology act;
+
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CEREG: 1,\"1A2B\",\"01234516\",7", FALSE, &u));
+    g_assert_true (u.cereg);
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_HOME);
+    g_assert_cmpuint (u.act, ==, MM_MODEM_ACCESS_TECHNOLOGY_LTE);
+    g_assert_cmpuint (u.tac, ==, 0x1A2B);
+    g_assert_cmpuint (u.lac, ==, 0);
+    g_assert_cmpuint (u.ci, ==, 0x01234516);
+
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CGREG: 1,\"1A2B\",\"0123\",6", FALSE, &u));
+    g_assert_true (u.cgreg);
+    g_assert_cmpuint (u.act, ==, MM_MODEM_ACCESS_TECHNOLOGY_HSPA);
+    g_assert_cmpuint (u.lac, ==, 0x1A2B);
+
+    /* +CREG with LTE AcT carries the TAC */
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CREG: 1,\"1A2B\",\"01234516\",7", FALSE, &u));
+    g_assert_false (u.cgreg || u.cereg || u.c5greg);
+    g_assert_cmpuint (u.tac, ==, 0x1A2B);
+
+    /* denied, searching */
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CEREG: 3,\"4598\",\"02D45403\",7", FALSE, &u));
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_DENIED);
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CEREG: 2", FALSE, &u));
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_SEARCHING);
+
+    /* read responses (<n> first), with and without location */
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CEREG: 2,1,\"1A2B\",\"01234567\",7", TRUE, &u));
+    g_assert_true (u.cereg);
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_HOME);
+    g_assert_cmpuint (u.act, ==, MM_MODEM_ACCESS_TECHNOLOGY_LTE);
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CREG: 0,1", TRUE, &u));
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_HOME);
+    g_assert_cmpuint (u.act, ==, MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN);
+
+    g_assert_false (mm_mtk_ccci_reg_update_parse ("+COPS: 0,0,\"t2 rus\",7", FALSE, &u));
+    g_assert_false (mm_mtk_ccci_reg_update_parse (NULL, FALSE, &u));
+
+    g_assert_true (mm_mtk_ccci_cops_act ("+COPS: 0,0,\"t2 rus\",7\r\nOK", &act));
+    g_assert_cmpuint (act, ==, MM_MODEM_ACCESS_TECHNOLOGY_LTE);
+    g_assert_true (mm_mtk_ccci_cops_act ("\r\n+COPS: 0,2,\"00101\",6\r\n\r\nOK\r\n", &act));
+    g_assert_cmpuint (act, ==, MM_MODEM_ACCESS_TECHNOLOGY_HSPA);
+    g_assert_false (mm_mtk_ccci_cops_act ("+COPS: 0\r\nOK", &act));
+    g_assert_false (mm_mtk_ccci_cops_act ("OK", &act));
+}
+
+/* the LTE start-up payloads, the raw dump, n = 3 reporting */
+static void
+test_lte_contract (void)
+{
+    g_autoptr(GByteArray) prefer = mm_mipc_build_data_prefer ();
+    g_autoptr(GByteArray) caps = mm_mipc_build_radio_capability ();
+    g_autoptr(GByteArray) msim = mm_mipc_build_multi_sim_config ();
+    g_autoptr(GByteArray) dsbp = mm_mipc_build_dsbp ();
+    g_autoptr(GByteArray) cnf = g_byte_array_new ();
+    g_autofree gchar     *dump = NULL, *s1 = NULL, *s2 = NULL, *s3 = NULL, *s4 = NULL, *s5 = NULL;
+    MMMtkCcciRegUpdate    u;
+    MMMtkCcciReg          reg;
+    guint32               v;
+    static const guint8   caps_bytes[] = { 0x00, 0x01, 0x04, 0x00, 0x1f, 0, 0, 0, 0x01, 0x01, 0x01, 0x00, 0x01, 0, 0, 0 };
+
+    g_assert_true (mm_mipc_tlv_find_uint (prefer->data, prefer->len, 0x0100, &v) && v == 1);
+    g_assert_true (mm_mipc_tlv_find_uint (prefer->data, prefer->len, 0x0101, &v) && v == 1);
+    g_assert_cmpmem (caps->data, caps->len, caps_bytes, sizeof (caps_bytes));
+    g_assert_true (mm_mipc_tlv_find_uint (msim->data, msim->len, 0x0101, &v) && v == 2);
+    g_assert_cmpuint (msim->len, ==, 8);
+    g_assert_true (mm_mipc_tlv_find_uint (dsbp->data, dsbp->len, 0x0100, &v) && v == 3);
+    g_assert_cmpuint (dsbp->len, ==, 8);
+    g_assert_true (mm_mipc_request_is_valid (MM_MIPC_DATA_SET_DATA_ALLOW_REQ));
+    g_assert_true (mm_mipc_request_is_valid (MM_MIPC_SYS_SET_DSBP_REQ));
+    g_assert_cmpuint (MM_MIPC_CNF_OF (MM_MIPC_DATA_SET_DATA_ALLOW_REQ), ==, MM_MIPC_DATA_SET_DATA_ALLOW_CNF);
+    g_assert_cmpstr (mm_mipc_msg_id_get_string (MM_MIPC_SYS_MULTI_SIM_CONFIG_CNF), ==, "SYS_MULTI_SIM_CONFIG_CNF");
+
+    /* the raw dump: values of public ids, private ones masked */
+    mm_mipc_tlv_add_u32 (cnf, MM_MIPC_T_RESULT, 1);
+    mm_mipc_tlv_add_u8 (cnf, 0x0101, 2);
+    mm_mipc_tlv_add_str (cnf, 0x8102, "secret");
+    dump = mm_mipc_tlv_dump (cnf->data, cnf->len, 16);
+    g_assert_cmpstr (dump, ==, "0000/4=01000000 0101/1=02 8102/7 (masked)");
+
+    /* test responses */
+    g_assert_true (mm_mtk_ccci_test_range_has ("+CEREG: (0-5)\r\nOK", "+CEREG:", 3));
+    g_assert_true (mm_mtk_ccci_test_range_has ("+CEREG: (0,1,2,3,4,5)", "+CEREG:", 3));
+    g_assert_false (mm_mtk_ccci_test_range_has ("+CEREG: (0-2)", "+CEREG:", 3));
+    g_assert_true (mm_mtk_ccci_test_range_has ("+CEREG: (0-2,3)", "+CEREG:", 3));
+    g_assert_false (mm_mtk_ccci_test_range_has ("ERROR", "+CEREG:", 3));
+
+    /* n = 3 lines: the n = 2 form for the generic parsers, the cause decoded */
+    s1 = mm_mtk_ccci_reg_strip_cause ("+CEREG: 3,\"1262\",\"0A1B2C3D\",7,0,15", FALSE);
+    g_assert_cmpstr (s1, ==, "+CEREG: 3,\"1262\",\"0A1B2C3D\",7");
+    s2 = mm_mtk_ccci_reg_strip_cause ("+CGREG: 3,3,\"1A2B\",\"0123\",6,\"01\",0,111", TRUE);
+    g_assert_cmpstr (s2, ==, "+CGREG: 3,3,\"1A2B\",\"0123\",6,\"01\"");
+    s3 = mm_mtk_ccci_reg_strip_cause ("+CEREG: 1,\"1A2B\",\"01234516\",7", FALSE);
+    g_assert_cmpstr (s3, ==, "+CEREG: 1,\"1A2B\",\"01234516\",7");
+    s4 = mm_mtk_ccci_reg_strip_cause ("+CEREG: 3,0,,,,0,15", TRUE);
+    g_assert_cmpstr (s4, ==, "+CEREG: 3,0");
+    s5 = mm_mtk_ccci_reg_strip_cause ("+COPS: 0", FALSE);
+    g_assert_null (s5);
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CEREG: 3,\"1262\",\"0A1B2C3D\",7,0,15", FALSE, &u));
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_DENIED);
+    g_assert_cmpuint (u.act, ==, MM_MODEM_ACCESS_TECHNOLOGY_LTE);
+    g_assert_cmpuint (u.tac, ==, 0x1262);
+    g_assert_true (mm_mtk_ccci_reg_update_parse ("+CEREG: 3,1,\"1A2B\",\"01234516\",7,,", TRUE, &u));
+    g_assert_cmpuint (u.state, ==, MM_MODEM_3GPP_REGISTRATION_STATE_HOME);
+    g_assert_true (mm_mtk_ccci_reg_parse ("+CEREG: 3,\"1262\",\"0A1B2C3D\",7,0,15", FALSE, &reg));
+    g_assert_cmpint (reg.cause_type, ==, 0);
+    g_assert_cmpint (reg.reject_cause, ==, 15);
+}
+
+/* the registration block, CSCON, the radio state */
+static void
+test_nw_diag_decoders (void)
+{
+    guint8                block[32] = { 0 };
+    MMMtkCcciNwBlock      b;
+    g_autofree gchar     *d = NULL, *c1 = NULL, *c2 = NULL, *c3 = NULL, *full = NULL, *masked = NULL;
+    g_autoptr(GByteArray) off = mm_mipc_build_radio_state (FALSE);
+    g_autoptr(GByteArray) tlvs = g_byte_array_new ();
+    static const guint8   connected[] = { 0x01, 0x07, 0x04, 0x00 };
+    static const guint8   idle[] = { 0x00, 0xff, 0x04, 0x00 };
+    guint32               v;
+
+    block[0] = 1;
+    memcpy (block + 1, "00101", 5);
+    mm_mipc_put (block + 8, 4, 0x01234534);
+    mm_mipc_put (block + 12, 4, 100);
+    mm_mipc_put (block + 16, 4, 123);
+    mm_mipc_put (block + 20, 4, 0x1A2B);
+    g_assert_true (mm_mtk_ccci_nw_block_parse (block, sizeof (block), &b));
+    g_assert_cmpuint (b.stat, ==, 1);
+    g_assert_cmpstr (b.plmn, ==, "00101");
+    g_assert_cmpuint (b.cell, ==, 0x01234534);
+    g_assert_cmpuint (b.earfcn, ==, 100);
+    g_assert_cmpuint (b.pci, ==, 123);
+    g_assert_cmpuint (b.tac, ==, 0x1A2B);
+    d = mm_mtk_ccci_nw_block_describe (&b);
+    g_assert_cmpstr (d, ==, "stat 1, PLMN '00101', cell 0x01234534, TAC 0x1A2B, EARFCN 100 (inferred offset), PCI 123 (inferred offset)");
+    g_assert_false (mm_mtk_ccci_nw_block_parse (block, 23, &b));
+
+    c1 = mm_mtk_ccci_cscon_describe (connected, 4);
+    g_assert_true (g_str_has_prefix (c1, "01 07 04 00 (byte 0 = 1: connected"));
+    c2 = mm_mtk_ccci_cscon_describe (idle, 4);
+    g_assert_true (g_str_has_prefix (c2, "00 ff 04 00 (byte 0 = 0: idle"));
+    c3 = mm_mtk_ccci_cscon_describe (NULL, 0);
+    g_assert_cmpstr (c3, ==, "(absent)");
+
+    g_assert_true (mm_mipc_tlv_find_uint (off->data, off->len, 0x0100, &v) && v == 0);
+    g_assert_cmpuint (off->len, ==, 8);
+    g_assert_true (mm_mipc_request_is_valid (MM_MIPC_NW_SET_RADIO_STATE_REQ));
+    g_assert_true (mm_mipc_request_is_valid (MM_MIPC_NW_GET_PS_REQ));
+    g_assert_cmpstr (mm_mipc_msg_id_get_string (MM_MIPC_NW_CSCON_IND), ==, "NW_CSCON_IND");
+
+    /* the diagnostics dump shows private values, the normal one masks them */
+    mm_mipc_tlv_add (tlvs, 0x8106, block, 4);
+    full = mm_mipc_tlv_dump_full (tlvs->data, tlvs->len, 16);
+    g_assert_cmpstr (full, ==, "8106/4=01323530");
+    masked = mm_mipc_tlv_dump (tlvs->data, tlvs->len, 16);
+    g_assert_cmpstr (masked, ==, "8106/4 (masked)");
 }
 
 int
@@ -376,6 +733,13 @@ main (int argc, char **argv)
     g_test_add_func ("/MM/mtk-ccci/ims-builders", test_ims_builders);
     g_test_add_func ("/MM/mtk-ccci/clcc-normalize",   test_clcc_normalize);
     g_test_add_func ("/MM/mtk-ccci/rat-mode",         test_rat_mode);
+    g_test_add_func ("/MM/mtk-ccci/rat-mode-pairs",   test_rat_mode_pairs);
+    g_test_add_func ("/MM/mtk-ccci/rat-fallback",     test_rat_fallback);
+    g_test_add_func ("/MM/mtk-ccci/reg-parse",        test_reg_parse);
+    g_test_add_func ("/MM/mtk-ccci/set-ia",           test_set_ia);
+    g_test_add_func ("/MM/mtk-ccci/reg-update-parse", test_reg_update_parse);
+    g_test_add_func ("/MM/mtk-ccci/lte-contract",     test_lte_contract);
+    g_test_add_func ("/MM/mtk-ccci/nw-diag-decoders", test_nw_diag_decoders);
 
     return g_test_run ();
 }

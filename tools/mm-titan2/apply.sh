@@ -85,6 +85,8 @@ if plugins_options['mtk-ccci']
     'mtk-ccci/mm-mtk-ccci-sms-poll.c',
     'mtk-ccci/mm-call-mtk-ccci.c',
     'mtk-ccci/mm-sim-mtk-ccci.c',
+    'mtk-ccci/mm-mtk-ccci-shared.c',
+    'mtk-ccci/mm-mtk-ccci-at-bridge.c',
   )
 
   plugins += {'plugin-mtk-ccci': {
@@ -100,7 +102,7 @@ if plugins_options['mtk-ccci']
     # MMPortMipc against a fake modem on a pty (links the daemon's port library)
     test_port_mipc = executable(
       'test-plugin-mtk-ccci-port-mipc',
-      sources: files('mtk-ccci/tests/test-port-mipc.c', 'mtk-ccci/mm-port-mipc.c', 'mtk-ccci/mm-mipc-proto.c', 'mtk-ccci/mm-mtk-ccci-ims.c'),
+      sources: files('mtk-ccci/tests/test-port-mipc.c', 'mtk-ccci/mm-port-mipc.c', 'mtk-ccci/mm-mipc-proto.c', 'mtk-ccci/mm-mtk-ccci-ims.c', 'mtk-ccci/mm-modem-helpers-mtk-ccci.c'),
       include_directories: plugins_incs + [include_directories('mtk-ccci')],
       dependencies: [libport_dep, libmm_glib_dep, util_dep],
       c_args: common_c_args,
@@ -138,6 +140,25 @@ if plugins_options['mtk-ccci']
       c_args: common_c_args,
     )
     test('test-plugin-mtk-ccci-bearer-mipc', test_bearer_mipc)
+    # dual-modem mode: shared context, radio coordinator, AT bridge
+    test_dual_modem = executable(
+      'test-plugin-mtk-ccci-dual-modem',
+      sources: files('mtk-ccci/tests/test-dual-modem.c', 'mtk-ccci/mm-mtk-ccci-shared.c', 'mtk-ccci/mm-mtk-ccci-at-bridge.c', 'mtk-ccci/mm-mtk-ccci-ims.c', 'mtk-ccci/mm-port-mipc.c', 'mtk-ccci/mm-mipc-proto.c', 'mtk-ccci/mm-modem-helpers-mtk-ccci.c'),
+      include_directories: plugins_incs + [include_directories('mtk-ccci')],
+      dependencies: [libport_dep, libmm_glib_dep, util_dep],
+      c_args: common_c_args,
+    )
+    test('test-plugin-mtk-ccci-dual-modem', test_dual_modem)
+    # the modem object itself (its source compiled into the test): enabling
+    # through the shared IMS controllers, the DSDS approval end to end
+    test_modem = executable(
+      'test-plugin-mtk-ccci-modem',
+      sources: files('mtk-ccci/tests/test-modem.c', 'mtk-ccci/mm-bearer-mtk-ccci.c', 'mtk-ccci/mm-wwan-link.c', 'mtk-ccci/mm-mtk-ccci-ims.c', 'mtk-ccci/mm-mtk-ccci-sms-ready.c', 'mtk-ccci/mm-mtk-ccci-sms-poll.c', 'mtk-ccci/mm-call-mtk-ccci.c', 'mtk-ccci/mm-sim-mtk-ccci.c', 'mtk-ccci/mm-mtk-ccci-shared.c', 'mtk-ccci/mm-mtk-ccci-at-bridge.c', 'mtk-ccci/mm-port-mipc.c', 'mtk-ccci/mm-mipc-proto.c', 'mtk-ccci/mm-modem-helpers-mtk-ccci.c'),
+      include_directories: plugins_incs + [include_directories('mtk-ccci')],
+      dependencies: [libmmbase_dep, libsms_dep, util_dep],
+      c_args: common_c_args,
+    )
+    test('test-plugin-mtk-ccci-modem', test_modem)
   endif
 endif
 

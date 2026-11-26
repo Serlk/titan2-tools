@@ -46,3 +46,12 @@ should be observable wire facts (captures, logs), not code or pseudocode.
    The recorded phone process died with signal 6 before any create-SMS log, but its
    stderr was /dev/null and core limit zero. Capture stderr/stack on further testing
    before claiming this was the exact original abort or that all call/SMS crashes are fixed.
+10. **Dual-modem mode: radio and tunnel facts the plugin relies on.** Each is marked unverified in
+    DESIGN.md §9/§11: (a) `AT+EFUN=2` alone powers SIM2 without SIM1, `AT+EFUN=1` keeps SIM2 off;
+    (b) whether `AT+CFUN=4` on the SIM1 stack (wwan0at0, ESUO=4) also switches SIM2 off, i.e. CFUN
+    is global or per stack on this firmware; (c) `AT+CFUN?` on a slot's SYS_AT channel reports that
+    stack's radio; (d) radio commands accepted through SYS_AT slot 1; (e) an SMS submit through
+    SYS_AT as one string `AT+CMGS=<n>\r<pdu>\x1a` (Android's RIL uses the MIPC SMS group, which is
+    not described); (f) the modem's behaviour for an incoming call on one SIM while the other SIM
+    has an active call (DSDS: busy/reject or `+EAIC` with a ringing call); (g) whether `ATZ` on a
+    SYS_AT channel resets that channel's URC settings (the bridge never sends it).

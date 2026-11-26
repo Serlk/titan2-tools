@@ -4,8 +4,8 @@
  * MIPC: the MediaTek modem's binary request/confirm/indication protocol on
  * the WWAN "MIPC" ports (/dev/wwan0mipcN) of the MT6878 integrated modem.
  * Framing and TLV coding only; no I/O. Layout and ids from a clean-room
- * behavioural description of the protocol (no code of the factory firmware
- * was used); items not confirmed on the device are marked (unverified). Ported to GLib from tools/modemd/src/mipc.c
+ * behavioural description of the protocol (no code of the phone's Android
+ * software was used); items not confirmed on the device are marked (unverified). Ported to GLib from tools/modemd/src/mipc.c
  * (t2-modemd) of the same project.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -194,8 +194,24 @@ G_BEGIN_DECLS
 #define MM_MIPC_APN_REC_TYPE_MMS		0x04
 #define MM_MIPC_APN_REC_TYPE_EMERGENCY	0x100
 #define MM_MIPC_APN_MAX_PROFILES		4
+/* the internet record's PDP types and authentication type (captured
+ * values, also those of the observed initial-attach request) */
+#define MM_MIPC_APN_INTERNET_PDP		MM_MIPC_PDP_IP
+#define MM_MIPC_APN_INTERNET_AUTH		1
 
-/* IMS_SET_CONFIG_REQ / CNF (as the factory firmware's RIL sends it): key/value form
+/* APN_SET_IA_REQ / CNF: the initial-attach APN
+ * of the slot, a separate request after the profile list's CNF 0x0114.
+ * Fields as the protocol description lists them; observed: APN, 1, 1, 1 on both slots. */
+#define MM_MIPC_APN_SET_IA_REQ		0x0101
+#define MM_MIPC_APN_SET_IA_CNF		0x0102
+#define MM_MIPC_T_IA_APN		0x0101	/* string */
+#define MM_MIPC_T_IA_PDP		0x0102	/* u8 PDP type (1 IPv4, 3 IPv4v6) */
+#define MM_MIPC_T_IA_ROAM_PDP		0x0103	/* u8 roaming PDP type */
+#define MM_MIPC_T_IA_AUTH		0x0104	/* u8 authentication type (coding unverified) */
+#define MM_MIPC_T_IA_USER		0x8105	/* string */
+#define MM_MIPC_T_IA_PASSWORD		0x8106	/* string */
+
+/* IMS_SET_CONFIG_REQ / CNF (as Android's RIL sends it): key/value form
  * (0x0100 u32 1, 0x0101 key string with NUL, 0x0102 u8 value) and the
  * feature-switch form (0x0100 u32 0, 0x0102 6 bytes volte, vilte, vowifi,
  * viwifi, sms, eims = the AT+EIMSCFG flags) */
@@ -245,14 +261,13 @@ G_BEGIN_DECLS
 #define MM_MIPC_CALL_APPROVE_RSP 0x8902
 
 /* SMS group 0x06 (ids and names from the protocol description's id
- * tables). The factory firmware's RIL registers these indications for both slots at boot
- * and the modem accepts every registration with result 0 (CCCI trace
- * 2026-10-28, out/android-capture-dpmaif/ccci-boot-trace.txt, 0x0307/0x0308
- * pairs); 0x4601 arrives once per slot after SIM start-up. The payload of the
+ * tables). Android's RIL registers these indications for both slots at boot
+ * and the modem accepts every registration with result 0 (CCCI trace of an
+ * Android boot, 2026-10-28, 0x0307/0x0308 pairs); 0x4601 arrives once per slot after SIM start-up. The payload of the
  * new-message indications was never captured: the plugin only takes them as
  * "look at the storage now" and reads the message with +CMGL on the AT port.
  * The modem->AP commands SMS_NEW_SMS_CMD 0x8601 / SMS_NEW_STATUS_REPORT_CMD
- * 0x8603 (the factory firmware's RIL registers them too) need an answer whose format is
+ * 0x8603 (Android's RIL registers them too) need an answer whose format is
  * unknown, so they are NOT registered: an unanswered delivery could be lost. */
 #define MM_MIPC_SMS_CFG_IND                 0x4601
 #define MM_MIPC_SMS_NEW_SMS_IND             0x4602
@@ -260,10 +275,10 @@ G_BEGIN_DECLS
 #define MM_MIPC_SMS_NEW_STATUS_REPORT_IND   0x4606
 #define MM_MIPC_IS_SMS_IND(id)              (((id) & 0xFF00) == 0x4600)
 
-/* Network group 0x04: the RAT mode. The factory firmware's RIL
+/* Network group 0x04: the RAT mode. Android's RIL
  * sends NW_SET_RAT_REQ per slot at start-up with rat 22 and prefer_rat 128
- * (factory-firmware logcat "handleSetPreferredNetworkTypeRequest: rat = 22, prefer_rat =
- * 128", MIPC trace 2026-10-27, out/android-capture-calls); the CNF carries
+ * (Android logcat "handleSetPreferredNetworkTypeRequest: rat = 22, prefer_rat =
+ * 128", MIPC trace 2026-10-27); the CNF carries
  * only the result and the modem then sends NW_CURRENT_RAT_IND. */
 #define MM_MIPC_NW_SET_RAT_REQ              0x0427
 #define MM_MIPC_NW_SET_RAT_CNF              0x0428
@@ -273,6 +288,39 @@ G_BEGIN_DECLS
 #define MM_MIPC_T_CURRENT_RAT_UNKNOWN       0x0100 /* u32 0x0F seen (meaning unverified) */
 #define MM_MIPC_T_CURRENT_RAT_RAT           0x0101 /* u8, = the rat sent */
 #define MM_MIPC_T_CURRENT_RAT_PREFER        0x0102 /* u8, = the prefer_rat sent */
+
+/* The LTE start-up contract: ids and payloads as
+ * the protocol description gives them; every CNF is REQ id + 1 and carries the
+ * result TLV; the other CNF TLVs are not described (logged raw). */
+#define MM_MIPC_DATA_SET_DATA_ALLOW_REQ      0x020D /* no TLVs, on the data SIM's slot */
+#define MM_MIPC_DATA_SET_DATA_ALLOW_CNF      0x020E
+#define MM_MIPC_CALL_DATA_PREFER_SET_REQ     0x0957 /* 0x0100 u8 1, 0x0101 u8 1 */
+#define MM_MIPC_CALL_DATA_PREFER_SET_CNF     0x0958
+#define MM_MIPC_NW_SET_RADIO_CAPABILITY_REQ  0x0489 /* 0x0100 u32 0x1f, 0x0101 u8 1 */
+#define MM_MIPC_NW_SET_RADIO_CAPABILITY_CNF  0x048A
+#define MM_MIPC_SYS_MULTI_SIM_CONFIG_REQ     0x0059 /* header slot 1: 0x0101 u8 2; CNF result 0 or 1 */
+#define MM_MIPC_SYS_MULTI_SIM_CONFIG_CNF     0x005A
+#define MM_MIPC_SYS_SET_DSBP_REQ             0x0053 /* header slot 1: 0x0100 u8 3 */
+#define MM_MIPC_SYS_SET_DSBP_CNF             0x0054
+#define MM_MIPC_RADIO_CAPABILITY_ALL         0x1f   /* the value the protocol description gives (meaning not described) */
+
+/* the radio-state request (the alternative to
+ * AT+CFUN=4), the PS state poll and the network indications of the
+ * read-only diagnostics */
+#define MM_MIPC_NW_SET_RADIO_STATE_REQ       0x0403 /* 0x0100 u8 0 off, 1 on */
+#define MM_MIPC_NW_SET_RADIO_STATE_CNF       0x0404
+#define MM_MIPC_NW_GET_PS_REQ                0x040D /* request TLVs not described: none sent */
+#define MM_MIPC_NW_GET_PS_CNF                0x040E /* 0x8106: the registration block */
+#define MM_MIPC_NW_PS_IND                    0x4403 /* 0x0100 stat, 0x8108 the block */
+#define MM_MIPC_NW_RADIO_IND                 0x4404
+#define MM_MIPC_NW_IA_IND                    0x4405
+#define MM_MIPC_NW_CS_IND                    0x4408 /* 0x8102 the block */
+#define MM_MIPC_NW_CSCON_IND                 0x4409 /* 0x0100 4 bytes: RRC connection state */
+#define MM_MIPC_NW_PHYSICAL_CHANNEL_CONFIGS_IND 0x4419
+#define MM_MIPC_NW_BARRING_INFO_IND          0x441B
+#define MM_MIPC_T_GET_PS_BLOCK               0x0106 /* (0x8106) */
+#define MM_MIPC_T_PS_IND_BLOCK               0x0108 /* (0x8108) */
+#define MM_MIPC_T_CS_IND_BLOCK               0x0102 /* (0x8102) */
 
 /* --- the API --- */
 
@@ -334,8 +382,23 @@ gboolean mm_mipc_request_is_valid (guint16 id);
 const guint8 *mm_mipc_tlv_find_record (const guint8 *p, gsize len, guint16 id, gsize *vlen);
 GByteArray *mm_mipc_build_ims_config (gboolean key_form, const guint8 flags[6]);
 GByteArray *mm_mipc_build_apn_profiles (const gchar *internet, const gchar *ims, const gchar *sos);
+/* APN_SET_IA_REQ payload; @user/@password NULL give empty strings */
+GByteArray *mm_mipc_build_set_ia (const gchar *apn, guint8 pdp, guint8 roaming_pdp, guint8 auth,
+                                  const gchar *user, const gchar *password);
 /* NW_SET_RAT_REQ payload: TLV 0x0100 u8 rat, 0x0101 u8 prefer_rat */
 GByteArray *mm_mipc_build_set_rat (guint8 rat, guint8 prefer);
+
+/* the LTE start-up requests' payloads */
+GByteArray *mm_mipc_build_data_prefer (void);
+GByteArray *mm_mipc_build_radio_capability (void);
+GByteArray *mm_mipc_build_multi_sim_config (void);
+GByteArray *mm_mipc_build_dsbp (void);
+/* every TLV as "id/len=hex" (values of private ids, bit 15, as "(masked)";
+ * at most @max_value bytes of each value), for confirms not described */
+gchar      *mm_mipc_tlv_dump (const guint8 *p, gsize len, gsize max_value);
+/* the same with the values of private ids too (the diagnostics only) */
+gchar      *mm_mipc_tlv_dump_full (const guint8 *p, gsize len, gsize max_value);
+GByteArray *mm_mipc_build_radio_state (gboolean on);
 
 /* names of the ids this plugin knows, for logs ("0x1234" otherwise) */
 const gchar *mm_mipc_msg_id_get_string (guint16 msg_id);

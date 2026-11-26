@@ -177,6 +177,109 @@ static void test_dual_calls (void)
     cleanup (&t, port);
 }
 
+static void call_added (MMCallList *list, const gchar *path, guint *n)
+{
+    (*n)++;
+}
+
+static void count_state_changes (MMBaseCall *call, gint old_state, gint new_state, guint reason, guint *n)
+{
+    (*n)++;
+}
+
+static void find_rejected (MMBaseCall *call, MMBaseCall **out)
+{
+    if (!*out && mm_base_call_get_direction (call) == MM_CALL_DIRECTION_INCOMING &&
+        mm_base_call_get_state (call) == MM_CALL_STATE_TERMINATED)
+        *out = call;
+}
+
+/* DSDS: the calls a slot has, and the rejected incoming call shown on the
+ * modem object of its SIM as a call that is terminated from the start */
+static void test_rejected_call (void)
+{
+    Test t = { 0 };
+    g_autoptr(MMPortMipc) port = NULL;
+    g_autoptr(MMFakeModem) modem = NULL;
+    g_autoptr(MMFakeModem) bare = NULL;
+    g_autoptr(MMCallList) list = mm_call_list_new ();
+    gchar number[] = "+1234567";
+    MMCallInfo info = { 1, MM_CALL_DIRECTION_OUTGOING, MM_CALL_STATE_DIALING, number };
+    MMBaseCall *rejected = NULL, *call;
+    guint added = 0, changes = 0;
+
+    port = setup (&t);
+    modem = mm_fake_modem_new (NULL);
+    g_object_set (modem, MM_IFACE_MODEM_VOICE_CALL_LIST, list, NULL);
+    g_signal_connect (list, MM_CALL_ADDED, G_CALLBACK (call_added), &added);
+
+    /* an outgoing call created but not started is no call yet */
+    call = mm_call_mtk_ccci_new (MM_BASE_MODEM (modem), port, 1, MM_CALL_DIRECTION_OUTGOING, "+111", 0);
+    mm_call_list_add_call (list, call);
+    g_object_unref (call);
+    g_assert_cmpuint (mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (modem), 1), ==, 0);
+
+    /* SIM2 dialing, then active: SIM2 has a call, SIM1 none */
+    info.index = 101;
+    call = mm_call_mtk_ccci_new (MM_BASE_MODEM (modem), port, 2, MM_CALL_DIRECTION_OUTGOING, number, 0);
+    mm_base_call_change_state (call, MM_CALL_STATE_DIALING, MM_CALL_STATE_REASON_OUTGOING_STARTED);
+    mm_call_list_add_call (list, call);
+    g_object_unref (call);
+    g_assert_cmpuint (mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (modem), 2), ==, 1);
+    info.state = MM_CALL_STATE_ACTIVE;
+    mm_call_mtk_ccci_report (MM_IFACE_MODEM_VOICE (modem), port, 2, &info);
+    g_assert_cmpuint (mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (modem), 2), ==, 1);
+    g_assert_cmpuint (mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (modem), 1), ==, 0);
+    added = 0;
+
+    /* SIM1's incoming call rejected: one new call, incoming, terminated with
+     * REFUSED_OR_BUSY, no index, the number of the request */
+    g_assert_true (mm_call_mtk_ccci_report_rejected (MM_IFACE_MODEM_VOICE (modem), port, 1, "+7999"));
+    g_assert_cmpuint (added, ==, 1);
+    g_assert_cmpuint (mm_call_list_get_count (list), ==, 3);
+    mm_call_list_foreach (list, (MMCallListForeachFunc) find_rejected, &rejected);
+    g_assert_nonnull (rejected);
+    g_assert_cmpuint (mm_base_call_get_state (rejected), ==, MM_CALL_STATE_TERMINATED);
+    g_assert_cmpuint (mm_gdbus_call_get_state_reason (MM_GDBUS_CALL (rejected)), ==, MM_CALL_STATE_REASON_REFUSED_OR_BUSY);
+    g_assert_cmpuint (mm_gdbus_call_get_direction (MM_GDBUS_CALL (rejected)), ==, MM_CALL_DIRECTION_INCOMING);
+    g_assert_cmpstr (mm_base_call_get_number (rejected), ==, "+7999");
+    g_assert_cmpuint (mm_base_call_get_index (rejected), ==, 0);
+    g_assert_nonnull (mm_base_call_get_path (rejected));
+    g_signal_connect (rejected, "state-changed", G_CALLBACK (count_state_changes), &changes);
+    /* it is not a call of SIM1 */
+    g_assert_cmpuint (mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (modem), 1), ==, 0);
+
+    /* the call reports do not touch it: a terminated report of the modem's
+     * id is ignored, a new ringing SIM1 call is a new object */
+    info.index = 1; info.direction = MM_CALL_DIRECTION_INCOMING; info.state = MM_CALL_STATE_TERMINATED;
+    mm_call_mtk_ccci_report (MM_IFACE_MODEM_VOICE (modem), port, 1, &info);
+    g_assert_cmpuint (mm_call_list_get_count (list), ==, 3);
+    info.state = MM_CALL_STATE_RINGING_IN;
+    mm_call_mtk_ccci_report (MM_IFACE_MODEM_VOICE (modem), port, 1, &info);
+    g_assert_cmpuint (mm_call_list_get_count (list), ==, 4);
+    g_assert_true (mm_call_list_get_call_by_index (list, 1) != rejected);
+    /* the generic +CLCC reconciliation skips terminated calls */
+    {
+        GList *clcc = NULL;
+        MMCallInfo active = { 101, MM_CALL_DIRECTION_OUTGOING, MM_CALL_STATE_ACTIVE, NULL };
+        clcc = g_list_append (clcc, &active);
+        mm_iface_modem_voice_report_all_calls (MM_IFACE_MODEM_VOICE (modem), clcc);
+        g_list_free (clcc);
+    }
+    g_assert_cmpuint (mm_base_call_get_state (rejected), ==, MM_CALL_STATE_TERMINATED);
+    g_assert_cmpuint (changes, ==, 0);
+    g_assert_cmpuint (mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (modem), 2), ==, 1);
+
+    /* no number TLV: empty number; no call list (voice not set up): not shown */
+    g_assert_true (mm_call_mtk_ccci_report_rejected (MM_IFACE_MODEM_VOICE (modem), port, 2, NULL));
+    bare = mm_fake_modem_new (NULL);
+    g_assert_false (mm_call_mtk_ccci_report_rejected (MM_IFACE_MODEM_VOICE (bare), port, 1, "+7999"));
+
+    g_object_set (modem, MM_IFACE_MODEM_VOICE_CALL_LIST, NULL, NULL);
+    g_clear_object (&list);
+    cleanup (&t, port);
+}
+
 static void sim_ready (MMBaseModem *modem, GAsyncResult *res, Test *t)
 {
     t->sim = mm_sim_mtk_ccci_new_finish (res, &t->error);
@@ -234,6 +337,7 @@ int main (int argc, char **argv)
     g_assert_no_error (error);
     g_test_add_func ("/MM/mtk-ccci/dual-calls", test_dual_calls);
     g_test_add_func ("/MM/mtk-ccci/secondary-sim", test_sim);
+    g_test_add_func ("/MM/mtk-ccci/dsds-rejected-call", test_rejected_call);
     result = g_test_run ();
     mm_log_shutdown ();
     return result;

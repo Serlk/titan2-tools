@@ -7,7 +7,7 @@
  * in PDU mode, the generic AT voice calls). This class adds the MediaTek
  * behaviour established on the phone with our own tools (t2-modemd,
  * tools/modemd/src/vendor.c) and a clean-room behavioural description of the
- * vendor AT/MIPC protocol (no code of the factory firmware was used):
+ * MediaTek AT/MIPC protocol (no code of the phone's Android software was used):
  *
  *  - radio power: AT+EFUN=<mask> (1 SIM1, 2 SIM2, 3 both) instead of AT+CFUN=1,
  *    AT+CFUN=4 for off (the modem's start-up state; AT+EFUN=0 is untried);
@@ -19,7 +19,7 @@
  *  - the MIPC data port (wwan0mipc1, MMPortMipc): session started when the
  *    modem is enabled, used by MMBearerMtkCcci for the PDN activation;
  *  - the voice audio path: t2-speechd is told call-start/call-stop from MM's
- *    in-call audio channel hooks (factory timing: at dial / answer and when the
+ *    in-call audio channel hooks (Android's timing: at dial / answer and when the
  *    last call is gone).
  *
  * This program is free software; you can redistribute it and/or modify
@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <gio/gunixsocketaddress.h>
@@ -64,6 +65,9 @@
 #include "mm-mtk-ccci-ims.h"
 #include "mm-mtk-ccci-sms-ready.h"
 #include "mm-mtk-ccci-sms-poll.h"
+#include "mm-mtk-ccci-shared.h"
+#include "mm-mtk-ccci-at-bridge.h"
+#include "mm-kernel-device-generic.h"
 
 static void iface_modem_init       (MMIfaceModemInterface      *iface);
 static void iface_modem_3gpp_init  (MMIfaceModem3gppInterface  *iface);
@@ -112,8 +116,14 @@ static const guint16 mipc_indications[] = {
 };
 
 struct _MMBroadbandModemMtkCcciPrivate {
-    MMPortMipc *mipc;          /* the data port, created by create_wwan_port() */
-    MMMtkCcciIms *ims[2];
+    MMPortMipc *mipc;          /* the shared MIPC port (SIM1: also grabbed as its data port) */
+    MMMtkCcciShared *shared;   /* session, IMS controllers, radio, speech (mm-mtk-ccci-shared.c) */
+    gboolean    sim2_role;     /* the SIM2 modem object of the dual-modem mode */
+    gboolean    dual;          /* dual-modem mode: this object serves one SIM stack */
+    guint8      served;        /* MIPC slot bits this object handles (legacy 0x03) */
+    MMMtkCcciAtBridge *bridge; /* SIM2: the AT port over SYS_AT slot 2 */
+    MMKernelDevice *config_kdev; /* SIM2: the anchor port (wwan0mipc2), the udev configuration */
+    gboolean    sim2_data;     /* SIM2: bearers allowed (ID_MM_MTK_CCCI_SIM2_DATA) */
     gboolean    ims_enabled;
     gboolean    mipc_opened;   /* we hold an open reference on it */
     gchar      *wwan_device;   /* "wwan0" */
@@ -133,6 +143,24 @@ struct _MMBroadbandModemMtkCcciPrivate {
     MMModemMode rat_allowed;
     MMModemMode rat_preferred;
     gboolean    rat_user_set;
+    gboolean    rat_session_confirmed; /* rat_value/prefer confirmed in this MIPC session */
+    gboolean    start_rat;     /* the start-up RAT setting (ID_MM_MTK_CCCI_START_RAT) */
+    gboolean    nw_diag;       /* the network diagnostics (ID_MM_MTK_CCCI_NW_DIAG) */
+    gboolean    plain_cereg_busy;
+    guint       reg_read_timer;  /* the registration read after enabling */
+    guint       reg_read_count;
+    gboolean    reg_read_done;   /* a registration result was read */
+
+    /* LTE loss diagnostics ("rat-trace" lines) */
+    guint8        trace_pending;      /* slot bits waiting for a snapshot */
+    guint8        trace_ceer;         /* slot bits whose next snapshot adds AT+CEER (a denial) */
+    GString      *trace_reason;       /* the events since the last snapshot */
+    guint         trace_timer;
+    gboolean      trace_busy;
+    gboolean      trace_sleep_known;
+    gint64        trace_sleep_offset; /* CLOCK_BOOTTIME - CLOCK_MONOTONIC, us */
+    MmGdbusModem *trace_skeleton;
+    MMModemAccessTechnology trace_act;
 
     /* vendor URCs */
     GRegex *ecpi_regex;
@@ -168,6 +196,599 @@ mm_broadband_modem_mtk_ccci_get_wwan_device (MMBroadbandModemMtkCcci *self)
     return self->priv->wwan_device ? self->priv->wwan_device : DEFAULT_WWAN_DEVICE;
 }
 
+gboolean
+mm_broadband_modem_mtk_ccci_is_dual (MMBroadbandModemMtkCcci *self)
+{
+    return self->priv->dual;
+}
+
+guint8
+mm_broadband_modem_mtk_ccci_get_served_slots (MMBroadbandModemMtkCcci *self)
+{
+    return self->priv->served;
+}
+
+static MMMtkCcciIms *
+ims_of (MMBroadbandModemMtkCcci *self, guint sim)
+{
+    return self->priv->shared ? mm_mtk_ccci_shared_peek_ims (self->priv->shared, (guint8) (1u << (sim - 1))) : NULL;
+}
+
+/*****************************************************************************/
+/* LTE loss diagnostics (localising the remaining loss of LTE). Every line
+ * reads
+ *   rat-trace SIM<n> mono <s> boot <s>: <what>
+ * with both clocks (mm_mtk_ccci_trace_stamp) and the SIM named by its MIPC
+ * slot, so the name survives a new D-Bus index after an MM restart. The
+ * slot's events are logged as they happen: registration URCs of the MIPC AT
+ * channel (as URCs, with the reject cause or "not reported"), RAT mode
+ * confirms/refusals and 0x441D, AccessTechnologies changes on D-Bus, radio
+ * on/low power, cold start and enabling, data bearer up/down/lost, call
+ * active/end, the first modem traffic after a suspend. Most of them are
+ * followed TRACE_DELAY_MS later by one snapshot of the slot's serving state:
+ * read responses of trace_commands on the slot-addressed MIPC AT channel,
+ * logged raw on one line (registration lines also decoded). Read-only
+ * queries; nothing is changed by them. */
+
+#define TRACE_DELAY_MS     500
+#define TRACE_SLEEP_MIN_US (2 * G_USEC_PER_SEC)
+/* per boot (tmpfs): how many times this plugin started on this boot, so
+ * that the rat-trace lines of an MM stop/start on the same boot line up */
+#ifndef TRACE_START_FILE
+# define TRACE_START_FILE "/run/mm-mtk-ccci-trace.starts"
+#endif
+
+/* per process and slot: the first EPS indication (URC) and read response
+ * since this ModemManager started */
+static guint8 trace_first_eps_urc;
+static guint8 trace_first_eps_read;
+
+/* once per process: the marker that ties this process's lines to the boot */
+static void
+trace_process_marker (gpointer log_object)
+{
+    static gboolean   done;
+    g_autofree gchar *boot_id = NULL;
+    g_autofree gchar *count_text = NULL;
+    g_autofree gchar *stamp = NULL;
+    g_autofree gchar *count_str = NULL;
+    guint64           count = 0;
+
+    if (done)
+        return;
+    done = TRUE;
+    stamp = mm_mtk_ccci_trace_stamp ();
+    if (g_file_get_contents ("/proc/sys/kernel/random/boot_id", &boot_id, NULL, NULL))
+        g_strstrip (boot_id);
+    if (g_file_get_contents (TRACE_START_FILE, &count_text, NULL, NULL))
+        count = g_ascii_strtoull (count_text, NULL, 10);
+    count++;
+    count_str = g_strdup_printf ("%" G_GUINT64_FORMAT "\n", count);
+    if (!g_file_set_contents (TRACE_START_FILE, count_str, -1, NULL))
+        count = 0;
+    if (count)
+        mm_obj_msg (log_object, "rat-trace process %s: ModemManager pid %d started, plugin start %" G_GUINT64_FORMAT
+                    " on boot %s", stamp, (gint) getpid (), count, boot_id ? boot_id : "unknown");
+    else
+        mm_obj_msg (log_object, "rat-trace process %s: ModemManager pid %d started, boot %s (start count unavailable: %s)",
+                    stamp, (gint) getpid (), boot_id ? boot_id : "unknown", TRACE_START_FILE);
+}
+
+static const gchar *trace_commands[] = {
+    "AT+COPS?", "AT+CREG?", "AT+CGREG?", "AT+CEREG?", "AT+CGATT?", "AT+CESQ", "AT+CIREG?",
+};
+
+static const gchar *
+trace_sim_name (guint8 slots)
+{
+    switch (slots & (MM_MIPC_SLOT_SIM1 | MM_MIPC_SLOT_SIM2)) {
+    case MM_MIPC_SLOT_SIM1: return "SIM1";
+    case MM_MIPC_SLOT_SIM2: return "SIM2";
+    default:                return "SIM1+SIM2";
+    }
+}
+
+/* the slots this object's events concern */
+static guint8
+trace_slots (MMBroadbandModemMtkCcci *self)
+{
+    return self->priv->served ? self->priv->served : mm_broadband_modem_mtk_ccci_get_mipc_slot (self);
+}
+
+/*****************************************************************************/
+/* Registration state from the MIPC AT channel (keep the modem's transition
+ * in the interface).
+ *
+ * The slot's registration URCs arrive on the slot-addressed MIPC AT channel
+ * (SYS_AT_IND). The SIM2 object's AT port is that channel (the bridge
+ * forwards them to the generic handlers); the SIM1 object's AT port is
+ * wwan0at0, where they do not come, so AccessTechnologies and the
+ * registration state stayed at the first values (hspa) while the modem was
+ * on LTE (2026-11-25). URCs that are not forwarded to this object's AT port
+ * are applied here exactly as the generic handler applies its own (generic
+ * expressions and parser, CS/PS/EPS/5GS state, AcT, LAC/TAC/cell id), and
+ * the read responses of each snapshot as well, so that a missed URC is
+ * corrected; the snapshot's +COPS? AcT refreshes AccessTechnologies when the
+ * property disagrees. Only for the stack this object's 3GPP interface is
+ * (its MIPC slot). The updates go through reg_update (tests replace it). */
+
+typedef struct {
+    void (*cs)       (MMIfaceModem3gpp *self, MMModem3gppRegistrationState state, gboolean deferred);
+    void (*ps)       (MMIfaceModem3gpp *self, MMModem3gppRegistrationState state, gboolean deferred);
+    void (*eps)      (MMIfaceModem3gpp *self, MMModem3gppRegistrationState state, gboolean deferred);
+    void (*nr5g)     (MMIfaceModem3gpp *self, MMModem3gppRegistrationState state, gboolean deferred);
+    void (*act)      (MMIfaceModem3gpp *self, MMModemAccessTechnology act);
+    void (*location) (MMIfaceModem3gpp *self, gulong lac, gulong tac, gulong ci);
+    MMModemAccessTechnology (*get_act) (MMBroadbandModemMtkCcci *self);
+} RegUpdateOps;
+
+static MMModemAccessTechnology
+reg_get_act (MMBroadbandModemMtkCcci *self)
+{
+    MmGdbusModem            *skeleton = NULL;
+    MMModemAccessTechnology  act = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
+
+    g_object_get (self, MM_IFACE_MODEM_DBUS_SKELETON, &skeleton, NULL);
+    if (skeleton) {
+        act = mm_gdbus_modem_get_access_technologies (skeleton);
+        g_object_unref (skeleton);
+    }
+    return act;
+}
+
+static const RegUpdateOps reg_update_default = {
+    mm_iface_modem_3gpp_update_cs_registration_state,
+    mm_iface_modem_3gpp_update_ps_registration_state,
+    mm_iface_modem_3gpp_update_eps_registration_state,
+    mm_iface_modem_3gpp_update_5gs_registration_state,
+    mm_iface_modem_3gpp_update_access_technologies,
+    mm_iface_modem_3gpp_update_location,
+    reg_get_act,
+};
+static const RegUpdateOps *reg_update = &reg_update_default;
+
+/* every registration line of @text into this object's 3GPP state when
+ * @slot is its stack; returns how many were applied */
+static guint
+reg_apply_text (MMBroadbandModemMtkCcci *self, guint8 slot, const gchar *text, gboolean solicited)
+{
+    MMIfaceModem3gpp *iface = MM_IFACE_MODEM_3GPP (self);
+    g_auto(GStrv)     lines = NULL;
+    guint             i, n = 0;
+
+    if (!text || slot != mm_broadband_modem_mtk_ccci_get_mipc_slot (self))
+        return 0;
+    lines = g_strsplit_set (text, "\r\n", -1);
+    for (i = 0; lines[i]; i++) {
+        MMMtkCcciRegUpdate u;
+
+        if (!mm_mtk_ccci_reg_update_parse (lines[i], solicited, &u))
+            continue;
+        if (u.cgreg)
+            reg_update->ps (iface, u.state, FALSE);
+        else if (u.cereg)
+            reg_update->eps (iface, u.state, FALSE);
+        else if (u.c5greg)
+            reg_update->nr5g (iface, u.state, FALSE);
+        else
+            reg_update->cs (iface, u.state, FALSE);
+        reg_update->act (iface, u.act);
+        reg_update->location (iface, u.lac, u.tac, u.ci);
+        n++;
+    }
+    if (n)
+        mm_obj_dbg (self, "SIM%u: %u registration %s applied from the MIPC AT channel", slot == MM_MIPC_SLOT_SIM2 ? 2 : 1,
+                    n, solicited ? "read response(s)" : "URC(s)");
+    return n;
+}
+
+/* a denial (stat 3) in @text: the next snapshot also reads AT+CEER */
+static gboolean
+reg_text_denied (const gchar *text, gboolean solicited)
+{
+    g_auto(GStrv) lines = NULL;
+    guint         i;
+
+    if (!text)
+        return FALSE;
+    lines = g_strsplit_set (text, "\r\n", -1);
+    for (i = 0; lines[i]; i++) {
+        MMMtkCcciReg reg;
+
+        if (mm_mtk_ccci_reg_parse (lines[i], solicited, &reg) && reg.stat == 3)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* a registration result (stat 1, 3 or 5) in a read response */
+static gboolean
+reg_text_result (const gchar *text)
+{
+    g_auto(GStrv) lines = g_strsplit_set (text ? text : "", "\r\n", -1);
+    guint         i;
+
+    for (i = 0; lines[i]; i++) {
+        MMMtkCcciReg reg;
+
+        if (mm_mtk_ccci_reg_parse (lines[i], TRUE, &reg) && (reg.stat == 1 || reg.stat == 3 || reg.stat == 5))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* the slot's first registration result for the IMS controller (a profile
+ * list held until then): +CREG or +CEREG with stat 1 or 5 */
+static void
+reg_hint_registered (MMBroadbandModemMtkCcci *self, guint8 slot, const gchar *text, gboolean solicited)
+{
+    g_auto(GStrv) lines = NULL;
+    guint         i;
+
+    if (!text || !self->priv->shared || (slot != MM_MIPC_SLOT_SIM1 && slot != MM_MIPC_SLOT_SIM2))
+        return;
+    lines = g_strsplit_set (text, "\r\n", -1);
+    for (i = 0; lines[i]; i++) {
+        MMMtkCcciReg reg;
+
+        if (mm_mtk_ccci_reg_parse (lines[i], solicited, &reg) && (reg.stat == 1 || reg.stat == 5) &&
+            (!strcmp (reg.domain, "CS") || !strcmp (reg.domain, "EPS"))) {
+            mm_mtk_ccci_ims_registered (mm_mtk_ccci_shared_peek_ims (self->priv->shared, slot));
+            return;
+        }
+    }
+}
+
+typedef struct {
+    MMBroadbandModemMtkCcci *self;   /* a reference */
+    guint8                   slot;
+    gboolean                 ceer;   /* AT+CEER after trace_commands */
+    MMModemAccessTechnology  cops_act;
+    guint                    i;
+    gchar                   *reason;
+    gchar                   *stamp;
+    GString                 *out;
+} TraceSnapshot;
+
+static void trace_schedule (MMBroadbandModemMtkCcci *self);
+static void trace_snapshot_step (TraceSnapshot *ctx);
+
+/* diagnostics: SIM1's reject cause read on
+ * the plain AT port (wwan0at0), where the generic code keeps <n> = 2:
+ * AT+CEREG=3, AT+CEREG?, back to AT+CEREG=2 */
+static const gchar *plain_cereg_commands[] = { "+CEREG=3", "+CEREG?", "+CEREG=2" };
+
+typedef struct {
+    guint    i;
+    GString *out;
+    gchar   *stamp;
+} PlainCereg;
+
+static void plain_cereg_step (MMBroadbandModemMtkCcci *self, PlainCereg *ctx);
+
+static void
+plain_cereg_ready (MMBaseModem *_self, GAsyncResult *res, PlainCereg *ctx)
+{
+    MMBroadbandModemMtkCcci *self = MM_BROADBAND_MODEM_MTK_CCCI (_self);
+    g_autoptr(GError)        error = NULL;
+    const gchar             *reply = mm_base_modem_at_command_finish (_self, res, &error);
+
+    g_string_append_printf (ctx->out, "%sAT%s ", ctx->out->len ? "; " : "", plain_cereg_commands[ctx->i]);
+    if (!reply)
+        g_string_append (ctx->out, error->message);
+    else {
+        g_autofree gchar *line = mm_mtk_ccci_at_one_line (reply);
+        g_autofree gchar *reg = mm_mtk_ccci_reg_describe_text (reply, TRUE);
+
+        g_string_append (ctx->out, *line ? line : "OK");
+        if (reg)
+            g_string_append_printf (ctx->out, " [%s]", reg);
+    }
+    ctx->i++;
+    plain_cereg_step (self, ctx);
+    g_object_unref (self);
+}
+
+static void
+plain_cereg_step (MMBroadbandModemMtkCcci *self, PlainCereg *ctx)
+{
+    if (ctx->i < G_N_ELEMENTS (plain_cereg_commands)) {
+        mm_base_modem_at_command (MM_BASE_MODEM (self), plain_cereg_commands[ctx->i], 5, FALSE,
+                                  (GAsyncReadyCallback) plain_cereg_ready, ctx);
+        g_object_ref (self);
+        return;
+    }
+    {
+        MMPortSerialAt *primary = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
+
+        mm_obj_msg (self, "rat-trace SIM1 %s: diag plain AT port (%s): %s", ctx->stamp,
+                    primary ? mm_port_get_device (MM_PORT (primary)) : "gone", ctx->out->str);
+    }
+    self->priv->plain_cereg_busy = FALSE;
+    g_string_free (ctx->out, TRUE);
+    g_free (ctx->stamp);
+    g_free (ctx);
+}
+
+static void
+plain_cereg_read (MMBroadbandModemMtkCcci *self)
+{
+    PlainCereg *ctx;
+
+    /* SIM1's object only, on its own AT port (not the SIM2 bridge) */
+    if (!self->priv->nw_diag || self->priv->bridge || self->priv->plain_cereg_busy ||
+        !mm_base_modem_peek_port_primary (MM_BASE_MODEM (self)))
+        return;
+    self->priv->plain_cereg_busy = TRUE;
+    ctx = g_new0 (PlainCereg, 1);
+    ctx->out = g_string_new (NULL);
+    ctx->stamp = mm_mtk_ccci_trace_stamp ();
+    plain_cereg_step (self, ctx);
+}
+
+static guint
+trace_n_commands (TraceSnapshot *ctx)
+{
+    return G_N_ELEMENTS (trace_commands) + (ctx->ceer ? 1 : 0);
+}
+
+static const gchar *
+trace_command (TraceSnapshot *ctx)
+{
+    return ctx->i < G_N_ELEMENTS (trace_commands) ? trace_commands[ctx->i] : "AT+CEER";
+}
+
+static void
+trace_snapshot_ready (MMPortMipc *port, GAsyncResult *res, TraceSnapshot *ctx)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *reply = mm_port_mipc_at_command_finish (port, res, &error);
+
+    g_string_append_printf (ctx->out, "%s%s ", ctx->out->len ? "; " : "", trace_command (ctx));
+    if (!reply)
+        g_string_append_printf (ctx->out, "failed: %s", error ? error->message : "no reply");
+    else {
+        g_autofree gchar *line = mm_mtk_ccci_at_one_line (reply);
+        g_autofree gchar *reg = mm_mtk_ccci_reg_describe_text (reply, TRUE);
+
+        /* the modem's answer for this slot: into the 3GPP state; a denial
+         * adds AT+CEER (the network cause, if the modem has one) */
+        if (reg) {
+            reg_apply_text (ctx->self, ctx->slot, reply, TRUE);
+            reg_hint_registered (ctx->self, ctx->slot, reply, TRUE);
+            if (reg_text_result (reply))
+                ctx->self->priv->reg_read_done = TRUE;
+            if (reg_text_denied (reply, TRUE))
+                ctx->ceer = TRUE;
+        }
+        if (g_str_equal (trace_command (ctx), "AT+COPS?"))
+            mm_mtk_ccci_cops_act (reply, &ctx->cops_act);
+        g_string_append (ctx->out, line);
+        if (reg)
+            g_string_append_printf (ctx->out, " [%s]", reg);
+        if (reg && strstr (reply, "+CEREG:") && !(trace_first_eps_read & ctx->slot)) {
+            trace_first_eps_read |= ctx->slot;
+            g_string_append (ctx->out, " (first EPS read response since this MM started)");
+        }
+    }
+    ctx->i++;
+    trace_snapshot_step (ctx);
+}
+
+static void
+trace_snapshot_step (TraceSnapshot *ctx)
+{
+    MMBroadbandModemMtkCcci *self = ctx->self;
+
+    if (ctx->i < trace_n_commands (ctx) && self->priv->mipc &&
+        mm_port_mipc_get_session_ready (self->priv->mipc)) {
+        mm_port_mipc_at_command (self->priv->mipc, ctx->slot, trace_command (ctx), 5,
+                                 (GAsyncReadyCallback) trace_snapshot_ready, ctx);
+        return;
+    }
+    if (ctx->i < trace_n_commands (ctx))
+        g_string_append_printf (ctx->out, "%sstopped: no MIPC session", ctx->out->len ? "; " : "");
+    /* the serving AcT the modem reports vs the D-Bus property */
+    if (ctx->cops_act != MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN &&
+        ctx->slot == mm_broadband_modem_mtk_ccci_get_mipc_slot (self)) {
+        MMModemAccessTechnology prop = reg_update->get_act (self);
+
+        if (prop != ctx->cops_act) {
+            g_autofree gchar *prop_str = mm_modem_access_technology_build_string_from_mask (prop);
+            g_autofree gchar *cops_str = mm_modem_access_technology_build_string_from_mask (ctx->cops_act);
+
+            g_string_append_printf (ctx->out, "; AccessTechnologies %s disagreed with +COPS? AcT %s: refreshed",
+                                    prop_str, cops_str);
+            reg_update->act (MM_IFACE_MODEM_3GPP (self), ctx->cops_act);
+        }
+    }
+    mm_obj_msg (self, "rat-trace %s %s: snapshot after %s (read responses): %s",
+                trace_sim_name (ctx->slot), ctx->stamp, ctx->reason, ctx->out->str);
+    if (ctx->slot == MM_MIPC_SLOT_SIM1)
+        plain_cereg_read (self);
+    self->priv->trace_busy = FALSE;
+    trace_schedule (self);
+    g_free (ctx->reason);
+    g_free (ctx->stamp);
+    g_string_free (ctx->out, TRUE);
+    g_object_unref (ctx->self);
+    g_free (ctx);
+}
+
+static gboolean
+trace_timer_cb (MMBroadbandModemMtkCcci *self)
+{
+    TraceSnapshot *ctx;
+    guint8         slot;
+
+    self->priv->trace_timer = 0;
+    if (!self->priv->trace_pending)
+        return G_SOURCE_REMOVE;
+    if (!self->priv->mipc || !mm_port_mipc_get_session_ready (self->priv->mipc)) {
+        mm_obj_dbg (self, "rat-trace: no MIPC session, snapshot dropped");
+        self->priv->trace_pending = 0;
+        g_string_truncate (self->priv->trace_reason, 0);
+        return G_SOURCE_REMOVE;
+    }
+    /* one slot at a time (both only in the single-object mode) */
+    slot = (self->priv->trace_pending & MM_MIPC_SLOT_SIM1) ? MM_MIPC_SLOT_SIM1 : MM_MIPC_SLOT_SIM2;
+    self->priv->trace_pending &= ~slot;
+    ctx = g_new0 (TraceSnapshot, 1);
+    ctx->self = g_object_ref (self);
+    ctx->slot = slot;
+    ctx->ceer = !!(self->priv->trace_ceer & slot);
+    self->priv->trace_ceer &= ~slot;
+    ctx->reason = g_strdup (self->priv->trace_reason->str);
+    ctx->stamp = mm_mtk_ccci_trace_stamp ();
+    ctx->out = g_string_new (NULL);
+    if (!self->priv->trace_pending)
+        g_string_truncate (self->priv->trace_reason, 0);
+    self->priv->trace_busy = TRUE;
+    trace_snapshot_step (ctx);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+trace_schedule (MMBroadbandModemMtkCcci *self)
+{
+    if (self->priv->trace_pending && !self->priv->trace_busy && !self->priv->trace_timer)
+        self->priv->trace_timer = g_timeout_add (TRACE_DELAY_MS, (GSourceFunc) trace_timer_cb, self);
+}
+
+/* @reason: a short label; NULL logs the event without a snapshot */
+static void trace_event (MMBroadbandModemMtkCcci *self, guint8 slots, const gchar *reason,
+                         const gchar *fmt, ...) G_GNUC_PRINTF (4, 5);
+
+static void
+trace_event (MMBroadbandModemMtkCcci *self, guint8 slots, const gchar *reason, const gchar *fmt, ...)
+{
+    g_autofree gchar *stamp = mm_mtk_ccci_trace_stamp ();
+    g_autofree gchar *what = NULL;
+    va_list           ap;
+
+    va_start (ap, fmt);
+    what = g_strdup_vprintf (fmt, ap);
+    va_end (ap);
+    mm_obj_msg (self, "rat-trace %s %s: %s", trace_sim_name (slots), stamp, what);
+    if (!reason || !(slots & (MM_MIPC_SLOT_SIM1 | MM_MIPC_SLOT_SIM2)))
+        return;
+    self->priv->trace_pending |= slots & (MM_MIPC_SLOT_SIM1 | MM_MIPC_SLOT_SIM2);
+    if (!self->priv->trace_reason)
+        self->priv->trace_reason = g_string_new (NULL);
+    if (!strstr (self->priv->trace_reason->str, reason) && self->priv->trace_reason->len < 200)
+        g_string_append_printf (self->priv->trace_reason, "%s%s", self->priv->trace_reason->len ? ", " : "", reason);
+    trace_schedule (self);
+}
+
+/* After the registration reporting is enabled (the 3GPP interface takes
+ * updates from then on): an attach within seconds of radio-on may have
+ * happened before any URC reached this object, so the slot's state is read
+ * every second (a snapshot: its read responses go into the 3GPP state and
+ * +COPS? refreshes AccessTechnologies) until the first registration result
+ * (stat 1, 3 or 5), at most REG_READ_MAX times. */
+#define REG_READ_MAX 20
+
+static void
+reg_read_stop (MMBroadbandModemMtkCcci *self)
+{
+    if (self->priv->reg_read_timer) {
+        g_source_remove (self->priv->reg_read_timer);
+        self->priv->reg_read_timer = 0;
+    }
+}
+
+static gboolean
+reg_read_cb (MMBroadbandModemMtkCcci *self)
+{
+    if (self->priv->reg_read_done || ++self->priv->reg_read_count > REG_READ_MAX) {
+        trace_event (self, mm_broadband_modem_mtk_ccci_get_mipc_slot (self), NULL,
+                     "registration read after enabling stopped after %u reads: %s", self->priv->reg_read_count - 1,
+                     self->priv->reg_read_done ? "registration result read" : "no result");
+        self->priv->reg_read_timer = 0;
+        return G_SOURCE_REMOVE;
+    }
+    if (!self->priv->trace_busy)
+        trace_event (self, mm_broadband_modem_mtk_ccci_get_mipc_slot (self), "registration read", "registration read %u",
+                     self->priv->reg_read_count);
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+reg_read_start (MMBroadbandModemMtkCcci *self)
+{
+    reg_read_stop (self);
+    self->priv->reg_read_done = FALSE;
+    self->priv->reg_read_count = 1;
+    trace_event (self, mm_broadband_modem_mtk_ccci_get_mipc_slot (self), "registration read",
+                 "registration reporting enabled: reading the registration state");
+    self->priv->reg_read_timer = g_timeout_add (1000, (GSourceFunc) reg_read_cb, self);
+}
+
+void
+mm_broadband_modem_mtk_ccci_trace_event (MMBroadbandModemMtkCcci *self, guint8 slot, const gchar *what)
+{
+    g_return_if_fail (MM_IS_BROADBAND_MODEM_MTK_CCCI (self));
+    trace_event (self, slot ? slot : trace_slots (self), "data bearer", "%s", what);
+}
+
+/* the first modem traffic after a suspend: the boot-time clock ran ahead */
+static void
+trace_check_sleep (MMBroadbandModemMtkCcci *self)
+{
+    struct timespec mono = { 0 }, boot = { 0 };
+    gint64          offset;
+
+    clock_gettime (CLOCK_MONOTONIC, &mono);
+    clock_gettime (CLOCK_BOOTTIME, &boot);
+    offset = ((gint64) boot.tv_sec - mono.tv_sec) * G_USEC_PER_SEC + (boot.tv_nsec - mono.tv_nsec) / 1000;
+    if (self->priv->trace_sleep_known && offset - self->priv->trace_sleep_offset >= TRACE_SLEEP_MIN_US)
+        trace_event (self, trace_slots (self), "wake-up",
+                     "first modem traffic after a suspend of %.1f s",
+                     (gdouble) (offset - self->priv->trace_sleep_offset) / G_USEC_PER_SEC);
+    self->priv->trace_sleep_known = TRUE;
+    self->priv->trace_sleep_offset = offset;
+}
+
+static void
+trace_act_changed (MmGdbusModem *skeleton, GParamSpec *pspec, MMBroadbandModemMtkCcci *self)
+{
+    MMModemAccessTechnology act = mm_gdbus_modem_get_access_technologies (skeleton);
+    g_autofree gchar       *old_str = NULL;
+    g_autofree gchar       *new_str = NULL;
+
+    if (act == self->priv->trace_act)
+        return;
+    old_str = mm_modem_access_technology_build_string_from_mask (self->priv->trace_act);
+    new_str = mm_modem_access_technology_build_string_from_mask (act);
+    self->priv->trace_act = act;
+    /* what the D-Bus property (the shell's source) says; the snapshot shows
+     * what the modem says for the same slot */
+    trace_event (self, mm_broadband_modem_mtk_ccci_get_mipc_slot (self), "AccessTechnologies",
+                 "AccessTechnologies %s -> %s (D-Bus property)", old_str, new_str);
+}
+
+/* once the Modem interface has its skeleton (enabling) */
+static void
+trace_watch (MMBroadbandModemMtkCcci *self)
+{
+    MmGdbusModem *skeleton = NULL;
+
+    g_object_get (self, MM_IFACE_MODEM_DBUS_SKELETON, &skeleton, NULL);
+    if (!skeleton)
+        return;
+    if (skeleton == self->priv->trace_skeleton) {
+        g_object_unref (skeleton);
+        return;
+    }
+    if (self->priv->trace_skeleton) {
+        g_signal_handlers_disconnect_by_data (self->priv->trace_skeleton, self);
+        g_object_unref (self->priv->trace_skeleton);
+    }
+    self->priv->trace_skeleton = skeleton;
+    self->priv->trace_act = mm_gdbus_modem_get_access_technologies (skeleton);
+    g_signal_connect (skeleton, "notify::access-technologies", G_CALLBACK (trace_act_changed), self);
+}
+
 /*****************************************************************************/
 /* Port creation (MMBaseModem class): the MIPC port */
 
@@ -175,6 +796,7 @@ static void
 mipc_port_lost (MMPortMipc *port, MMBroadbandModemMtkCcci *self)
 {
     self->priv->mipc_opened = FALSE;
+    self->priv->rat_session_confirmed = FALSE;
     mm_base_modem_set_reprobe (MM_BASE_MODEM (self), TRUE);
     g_cancellable_cancel (mm_base_modem_peek_cancellable (MM_BASE_MODEM (self)));
 }
@@ -223,15 +845,41 @@ voice_mipc_indication (MMPortMipc *port, guint id, guint routing, guint txid,
                        GByteArray *payload, MMBroadbandModemMtkCcci *self)
 {
     guint8 slot = routing & 3;
-    guint32 event = 0, call_id = 0, seq = 0;
+    guint32 event = 0;
     /* any modem traffic after a suspend: one fallback scan (lost notices) */
     mm_mtk_ccci_sms_poll_check_resume (MM_BASE_MODEM (self));
+    trace_check_sleep (self);
     if (slot != 1 && slot != 2)
+        return;
+    /* dual-modem mode: the other SIM's modem object handles its slot */
+    if (!(slot & self->priv->served))
         return;
     if (id == MM_MIPC_SYS_AT_IND) {
         g_autofree gchar *text = mm_mipc_tlv_find_at_string (payload->data, payload->len);
+        g_autofree gchar *reg = NULL;
         if (!text)
             return;
+        /* registration URCs of the slot, as URCs (the snapshot after them
+         * holds the read responses) */
+        reg = mm_mtk_ccci_reg_describe_text (text, FALSE);
+        if (reg || strstr (text, "+CIREGU:")) {
+            g_autofree gchar *line = mm_mtk_ccci_at_one_line (text);
+            gboolean          first_eps = reg && strstr (text, "+CEREG:") && !(trace_first_eps_urc & slot);
+
+            if (first_eps)
+                trace_first_eps_urc |= slot;
+            if (reg && reg_text_denied (text, FALSE))
+                self->priv->trace_ceer |= slot;
+            if (reg)
+                reg_hint_registered (self, slot, text, FALSE);
+            trace_event (self, slot, reg ? "registration URC" : NULL, "URC %s%s%s%s%s",
+                         line, reg ? " [" : "", reg ? reg : "", reg ? "]" : "",
+                         first_eps ? " (first EPS indication since this MM started)" : "");
+        }
+        /* SIM2 object: the slot's URCs are the unsolicited text of its AT port
+         * (the generic handlers apply them); otherwise apply them here */
+        if (!self->priv->bridge || !mm_mtk_ccci_at_bridge_push_urc (self->priv->bridge, text))
+            reg_apply_text (self, slot, text, FALSE);
         if (strstr (text, "+CMTI:"))
             sms_notice (self, slot, "+CMTI");
         else if (strstr (text, "+CDSI:"))
@@ -248,21 +896,16 @@ voice_mipc_indication (MMPortMipc *port, guint id, guint routing, guint txid,
             id == MM_MIPC_SMS_STORE_STATUS_IND || id == MM_MIPC_SMS_CFG_IND)
             sms_notice (self, slot, name ? name : "SMS indication");
     } else if (id == MM_MIPC_CALL_APPROVE_CMD) {
-        g_autoptr(GByteArray) reply = g_byte_array_new ();
-        g_autoptr(GError) error = NULL;
-        if (!mm_mipc_tlv_find_uint (payload->data, payload->len, 0x0100, &call_id) ||
-            !mm_mipc_tlv_find_uint (payload->data, payload->len, 0x0103, &seq) ||
-            !mm_mtk_ccci_call_index (slot, call_id))
-            return;
-        mm_mipc_tlv_add_u8 (reply, 0x0100, 1); /* allow ringing, not auto-answer */
-        mm_mipc_tlv_add_u32 (reply, 0x0102, call_id);
-        mm_mipc_tlv_add_u32 (reply, 0x0103, seq);
-        if (!mm_port_mipc_send_response (port, MM_MIPC_CALL_APPROVE_RSP, txid, routing, reply, &error))
-            mm_obj_warn (self, "SIM%u incoming-call approval: %s", slot, error->message);
+        /* answered once by the shared context (mm-mtk-ccci-shared.c) */
+        mm_obj_dbg (self, "SIM%u incoming-call approval request", slot);
     } else if (id == MM_MIPC_CALL_STATUS_IND) {
         MMCallInfo info;
         if (mm_mtk_ccci_call_parse (slot, payload->data, payload->len, &info)) {
             mm_obj_dbg (self, "SIM%u call index %u state %u", slot, info.index, info.state);
+            if (info.state == MM_CALL_STATE_ACTIVE)
+                trace_event (self, slot, NULL, "call %u active", info.index);
+            else if (info.state == MM_CALL_STATE_TERMINATED)
+                trace_event (self, slot, "call end", "call %u ended", info.index);
             mm_call_mtk_ccci_report (MM_IFACE_MODEM_VOICE (self), port, slot, &info);
             g_free (info.number);
         }
@@ -272,8 +915,20 @@ voice_mipc_indication (MMPortMipc *port, guint id, guint routing, guint txid,
     else if (id == MM_MIPC_NW_CURRENT_RAT_IND) {
         guint32 rat = 0, prefer = 0;
         if (mm_mipc_tlv_find_uint (payload->data, payload->len, MM_MIPC_T_CURRENT_RAT_RAT, &rat) &&
-            mm_mipc_tlv_find_uint (payload->data, payload->len, MM_MIPC_T_CURRENT_RAT_PREFER, &prefer))
-            mm_obj_msg (self, "SIM%u RAT mode now rat %u prefer_rat %u (NW_CURRENT_RAT_IND)", slot, rat, prefer);
+            mm_mipc_tlv_find_uint (payload->data, payload->len, MM_MIPC_T_CURRENT_RAT_PREFER, &prefer)) {
+            g_autofree gchar *cmp = NULL;
+
+            if (!self->priv->rat_known)
+                cmp = g_strdup ("nothing confirmed by this object yet");
+            else if (rat == self->priv->rat_value && prefer == self->priv->rat_prefer)
+                cmp = g_strdup ("the confirmed pair");
+            else
+                cmp = g_strdup_printf ("differs from the confirmed rat %u prefer_rat %u",
+                                       self->priv->rat_value, self->priv->rat_prefer);
+            /* the mode setting only, not the serving RAT: the snapshot shows that */
+            trace_event (self, slot, "NW_CURRENT_RAT_IND",
+                         "RAT mode now rat %u prefer_rat %u (NW_CURRENT_RAT_IND 0x441D; %s)", rat, prefer, cmp);
+        }
     }
 }
 
@@ -293,7 +948,11 @@ create_wwan_port (MMBaseModem *_self,
                          name, mm_port_get_device (MM_PORT (self->priv->mipc)));
             return NULL;
         }
-        self->priv->mipc = mm_port_mipc_new (name);
+        /* one MMPortMipc per MIPC channel for every modem object of this
+         * modem (the SIM2 object may have created it already) */
+        if (!self->priv->shared)
+            self->priv->shared = mm_mtk_ccci_shared_acquire (name);
+        self->priv->mipc = g_object_ref (mm_mtk_ccci_shared_peek_mipc (self->priv->shared));
         g_signal_connect_object (self->priv->mipc, "forced-close", G_CALLBACK (mipc_port_lost), self, 0);
         g_signal_connect_object (self->priv->mipc, MM_PORT_MIPC_SIGNAL_INDICATION, G_CALLBACK (voice_mipc_indication), self, 0);
         mm_obj_dbg (self, "MIPC data port created: %s", name);
@@ -304,78 +963,208 @@ create_wwan_port (MMBaseModem *_self,
 }
 
 /*****************************************************************************/
+/* The DSDS approval policy's view of this object's calls (mm-mtk-ccci-shared.h) */
+
+static guint
+shared_calls_present (GObject *client, guint8 slot)
+{
+    return mm_call_mtk_ccci_count_present (MM_IFACE_MODEM_VOICE (client), slot);
+}
+
+static void
+shared_call_rejected (GObject *client, guint8 slot, guint call_id, const gchar *number)
+{
+    MMBroadbandModemMtkCcci *self = MM_BROADBAND_MODEM_MTK_CCCI (client);
+
+    if (!self->priv->mipc ||
+        !mm_call_mtk_ccci_report_rejected (MM_IFACE_MODEM_VOICE (self), self->priv->mipc, slot, number))
+        mm_obj_msg (self, "SIM%u rejected incoming call %u not shown: voice not set up", slot, call_id);
+    else
+        mm_obj_msg (self, "SIM%u rejected incoming call %u shown as a terminated call", slot, call_id);
+}
+
+/*****************************************************************************/
 /* Configuration from the AT port's udev properties */
+
+/* the kernel device that carries this object's udev configuration: the
+ * AT port (wwan0at0) for SIM1/legacy, the anchor port (wwan0mipc2) for SIM2 */
+static MMKernelDevice *
+config_kernel_device (MMBroadbandModemMtkCcci *self)
+{
+    MMPortSerialAt *primary;
+
+    if (self->priv->config_kdev)
+        return self->priv->config_kdev;
+    primary = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
+    return primary ? mm_port_peek_kernel_device (MM_PORT (primary)) : NULL;
+}
+
+/* the LTE start-up contract, one property per trial
+ * group, read from the SIM1/legacy object's port (wwan0at0):
+ *   ID_MM_MTK_CCCI_DATA_ALLOW    group 1, data allow after radio-on (default 1)
+ *   ID_MM_MTK_CCCI_DATA_SIM      the data SIM for it, 1 or 2 (default 1)
+ *   ID_MM_MTK_CCCI_RADIO_CONFIG  group 2, radio capability, multi-SIM config,
+ *                                DSBP before radio-on (default 0)
+ *   ID_MM_MTK_CCCI_PREFER_SBP    group 3, call/data prefer and the
+ *                                ESBP/EIAREG/ECCAUSE commands (default 0)
+ *   ID_MM_MTK_CCCI_REG_CAUSE     CREG/CGREG/CEREG level 3 with reject
+ *                                causes where offered (default 0) */
+static gboolean
+lte_property (MMKernelDevice *kdev, const gchar *name, gboolean fallback)
+{
+    return mm_kernel_device_has_property (kdev, name) ? mm_kernel_device_get_property_as_boolean (kdev, name) : fallback;
+}
+
+static void
+load_lte_configuration (MMBroadbandModemMtkCcci *self, MMKernelDevice *kdev)
+{
+    MMMtkCcciLteConfig config = { 0 };
+    gint               v = 1;
+
+    config.data_allow = lte_property (kdev, "ID_MM_MTK_CCCI_DATA_ALLOW", TRUE);
+    config.radio_config = lte_property (kdev, "ID_MM_MTK_CCCI_RADIO_CONFIG", FALSE);
+    config.prefer_sbp = lte_property (kdev, "ID_MM_MTK_CCCI_PREFER_SBP", FALSE);
+    config.reg_cause = lte_property (kdev, "ID_MM_MTK_CCCI_REG_CAUSE", FALSE);
+    config.radio_off_mipc = !g_strcmp0 (mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_RADIO_OFF"), "mipc");
+    config.nw_diag = lte_property (kdev, "ID_MM_MTK_CCCI_NW_DIAG", FALSE);
+    self->priv->nw_diag = config.nw_diag;
+    if (mm_kernel_device_has_property (kdev, "ID_MM_MTK_CCCI_DATA_SIM")) {
+        v = mm_kernel_device_get_property_as_int (kdev, "ID_MM_MTK_CCCI_DATA_SIM");
+        if (v != 1 && v != 2) {
+            mm_obj_warn (self, "ignoring invalid ID_MM_MTK_CCCI_DATA_SIM %d", v);
+            v = 1;
+        }
+    }
+    config.data_slot = (guint8) (1u << (v - 1));
+    mm_mtk_ccci_shared_set_lte_config (self->priv->shared, &config);
+}
 
 static void
 load_port_configuration (MMBroadbandModemMtkCcci *self)
 {
-    MMPortSerialAt *primary;
     MMKernelDevice *kdev;
     const gchar    *name, *p;
     gint            v;
 
-    primary = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
-    if (!primary)
-        return;
-    kdev = mm_port_peek_kernel_device (MM_PORT (primary));
+    kdev = config_kernel_device (self);
     if (!kdev)
         return;
 
     self->priv->ims_enabled = !mm_kernel_device_has_property (kdev, "ID_MM_MTK_CCCI_IMS") ||
                              mm_kernel_device_get_property_as_boolean (kdev, "ID_MM_MTK_CCCI_IMS");
-    if (mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_RADIO_MASK)) {
+    self->priv->start_rat = lte_property (kdev, "ID_MM_MTK_CCCI_START_RAT", TRUE);
+    if (!self->priv->sim2_role && mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_RADIO_MASK)) {
         v = mm_kernel_device_get_property_as_int (kdev, ID_MM_MTK_CCCI_RADIO_MASK);
         if (v >= 1 && v <= 3)
             self->priv->radio_mask = (guint) v;
         else
             mm_obj_warn (self, "ignoring invalid " ID_MM_MTK_CCCI_RADIO_MASK " %d", v);
     }
-    if (mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_SIM_SLOT)) {
-        v = mm_kernel_device_get_property_as_int (kdev, ID_MM_MTK_CCCI_SIM_SLOT);
-        if (v == 1 || v == 2)
-            self->priv->sim_slot = (guint) v;
-        else
-            mm_obj_warn (self, "ignoring invalid " ID_MM_MTK_CCCI_SIM_SLOT " %d", v);
-    }
-    /* a slot chosen through the SimSlots API wins over the udev default */
-    {
-        g_autofree gchar *contents = NULL;
 
-        if (g_file_get_contents (SIM_SLOT_STATE_FILE, &contents, NULL, NULL)) {
-            v = (gint) g_ascii_strtoll (g_strstrip (contents), NULL, 10);
-            if (v == 1 || v == 2) {
-                self->priv->sim_slot = (guint) v;
-                mm_obj_dbg (self, "SIM slot %d from %s", v, SIM_SLOT_STATE_FILE);
-            } else
-                mm_obj_warn (self, "ignoring invalid SIM slot '%s' in %s", contents, SIM_SLOT_STATE_FILE);
+    if (self->priv->sim2_role) {
+        /* the second SIM stack's own modem object (DESIGN.md §11) */
+        self->priv->dual = TRUE;
+        self->priv->sim_slot = 2;
+        self->priv->sim2_data = mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_SIM2_DATA) &&
+                                mm_kernel_device_get_property_as_boolean (kdev, ID_MM_MTK_CCCI_SIM2_DATA);
+    } else {
+        /* SIM1 / legacy: two modem objects unless switched off */
+        self->priv->dual = !mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_DUAL_MODEM) ||
+                           mm_kernel_device_get_property_as_boolean (kdev, ID_MM_MTK_CCCI_DUAL_MODEM);
+        if (self->priv->dual) {
+            self->priv->sim_slot = 1;
+            if (mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_SIM_SLOT) &&
+                mm_kernel_device_get_property_as_int (kdev, ID_MM_MTK_CCCI_SIM_SLOT) != 1)
+                mm_obj_warn (self, "dual-modem mode: " ID_MM_MTK_CCCI_SIM_SLOT " ignored (this object is SIM1)");
+            if (g_file_test (SIM_SLOT_STATE_FILE, G_FILE_TEST_EXISTS))
+                mm_obj_dbg (self, "dual-modem mode: %s (single-modem SIM choice) ignored", SIM_SLOT_STATE_FILE);
+        } else {
+            if (mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_SIM_SLOT)) {
+                v = mm_kernel_device_get_property_as_int (kdev, ID_MM_MTK_CCCI_SIM_SLOT);
+                if (v == 1 || v == 2)
+                    self->priv->sim_slot = (guint) v;
+                else
+                    mm_obj_warn (self, "ignoring invalid " ID_MM_MTK_CCCI_SIM_SLOT " %d", v);
+            }
+            /* a slot chosen through the SimSlots API wins over the udev default */
+            {
+                g_autofree gchar *contents = NULL;
+
+                if (g_file_get_contents (SIM_SLOT_STATE_FILE, &contents, NULL, NULL)) {
+                    v = (gint) g_ascii_strtoll (g_strstrip (contents), NULL, 10);
+                    if (v == 1 || v == 2) {
+                        self->priv->sim_slot = (guint) v;
+                        mm_obj_dbg (self, "SIM slot %d from %s", v, SIM_SLOT_STATE_FILE);
+                    } else
+                        mm_obj_warn (self, "ignoring invalid SIM slot '%s' in %s", contents, SIM_SLOT_STATE_FILE);
+                }
+            }
         }
     }
+    self->priv->served = self->priv->dual ? (guint8) (1u << (self->priv->sim_slot - 1))
+                                          : (MM_MIPC_SLOT_SIM1 | MM_MIPC_SLOT_SIM2);
+
     if (mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_SPEECHD_SOCKET)) {
         g_free (self->priv->speechd_socket);
         self->priv->speechd_socket = g_strdup (mm_kernel_device_get_property (kdev, ID_MM_MTK_CCCI_SPEECHD_SOCKET));
     }
 
     /* the WWAN device the ports hang off: the wwan class device's name when the
-     * kernel device backend knows it, else derived from the port name
-     * ("wwan0at0" -> "wwan0") */
+     * kernel device backend knows it, else derived from the MIPC port name
+     * ("wwan0mipc1" -> "wwan0") or the AT port name ("wwan0at0" -> "wwan0") */
     g_clear_pointer (&self->priv->wwan_device, g_free);
     p = mm_kernel_device_get_wwandev_sysfs_path (kdev);
     if (p && *p)
         self->priv->wwan_device = g_path_get_basename (p);
+    if (!self->priv->wwan_device && self->priv->shared)
+        self->priv->wwan_device = g_strdup (mm_mtk_ccci_shared_get_wwan_device (self->priv->shared));
     if (!self->priv->wwan_device) {
         name = mm_kernel_device_get_name (kdev);
         p = name ? strstr (name, "at") : NULL;
         if (p && p > name)
             self->priv->wwan_device = g_strndup (name, p - name);
     }
-    mm_obj_dbg (self, "configuration: radio mask %u, SIM slot %u, WWAN device %s, speechd socket '%s'",
+
+    if (self->priv->shared) {
+        if (!self->priv->sim2_role) {
+            MMPortSerialAt *primary = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
+
+            /* the SIM1 object (or the single legacy object) owns the radio
+             * configuration and wwan0at0, the proven radio command port */
+            mm_mtk_ccci_shared_set_radio_mask (self->priv->shared, self->priv->radio_mask);
+            load_lte_configuration (self, kdev);
+            mm_mtk_ccci_shared_set_dual (self->priv->shared, self->priv->dual);
+            if (primary)
+                mm_mtk_ccci_shared_set_radio_port (self->priv->shared, primary);
+            /* the incoming-call policy is one setting of the modem (both SIMs) */
+            mm_mtk_ccci_shared_set_dsds_busy (self->priv->shared,
+                                              !mm_kernel_device_has_property (kdev, ID_MM_MTK_CCCI_DSDS_BUSY) ||
+                                              mm_kernel_device_get_property_as_boolean (kdev, ID_MM_MTK_CCCI_DSDS_BUSY));
+        } else
+            /* SIM2 may start first: give the SIM1 object time to appear */
+            mm_mtk_ccci_shared_set_radio_port_wait (self->priv->shared, 20);
+        /* this object's calls decide on the other slot's incoming calls */
+        mm_mtk_ccci_shared_set_voice_client (self->priv->shared, self->priv->served, G_OBJECT (self),
+                                             shared_calls_present, shared_call_rejected);
+    }
+
+    mm_obj_dbg (self, "configuration: %s, radio mask %u, SIM slot %u, WWAN device %s, speechd socket '%s', DSDS busy %s",
+                self->priv->dual ? (self->priv->sim2_role ? "dual-modem SIM2 object" : "dual-modem SIM1 object")
+                                 : "single modem object",
                 self->priv->radio_mask, self->priv->sim_slot,
                 mm_broadband_modem_mtk_ccci_get_wwan_device (self),
-                self->priv->speechd_socket ? self->priv->speechd_socket : "");
+                self->priv->speechd_socket ? self->priv->speechd_socket : "",
+                self->priv->shared && !mm_mtk_ccci_shared_get_dsds_busy (self->priv->shared) ? "off" : "on");
 }
 
 /*****************************************************************************/
 /* Power (Modem interface) */
+
+/* Radio power goes through the shared coordinator: the stacks of both modem
+ * objects are one AT+EFUN mask (mm-mtk-ccci-shared.h). Power up of this
+ * object adds its slot(s), low power removes them; no slot left gives
+ * AT+CFUN=4, exactly the old single-object commands (EFUN=<mask>, SIM busy
+ * retried 30 x 1 s, CFUN=1 for SIM1 alone, CFUN=4 for off). */
 
 static gboolean
 modem_power_up_finish (MMIfaceModem  *self,
@@ -386,55 +1175,36 @@ modem_power_up_finish (MMIfaceModem  *self,
 }
 
 static void
-cfun_power_up_ready (MMBaseModem *self, GAsyncResult *res, GTask *task)
+radio_set_ready (MMMtkCcciShared *shared, GAsyncResult *res, GTask *task)
 {
-    GError *error = NULL;
-    if (!mm_base_modem_at_command_finish (self, res, &error))
+    MMBroadbandModemMtkCcci *self = g_task_get_source_object (task);
+    gboolean                 on = GPOINTER_TO_INT (g_task_get_task_data (task));
+    GError                  *error = NULL;
+
+    if (!mm_mtk_ccci_shared_radio_set_finish (shared, res, &error)) {
+        trace_event (self, trace_slots (self), NULL, "radio %s failed: %s", on ? "on" : "to low power", error->message);
         g_task_return_error (task, error);
-    else
+    } else {
+        trace_event (self, trace_slots (self), NULL, "radio %s", on ? "on" : "in low power");
         g_task_return_boolean (task, TRUE);
+    }
     g_object_unref (task);
 }
-
-static gboolean retry_radio (gpointer user_data);
 
 static void
-efun_power_up_ready (MMBaseModem *self, GAsyncResult *res, GTask *task)
+radio_set (MMBroadbandModemMtkCcci *self, gboolean on, GAsyncReadyCallback callback, gpointer user_data)
 {
-    g_autoptr(GError) error = NULL;
-    guint tries = GPOINTER_TO_UINT (g_task_get_task_data (task));
-    if (!mm_base_modem_at_command_finish (self, res, &error)) {
-        if (g_error_matches (error, MM_MOBILE_EQUIPMENT_ERROR, MM_MOBILE_EQUIPMENT_ERROR_SIM_BUSY) && tries < 30) {
-            g_task_set_task_data (task, GUINT_TO_POINTER (tries + 1), NULL);
-            g_timeout_add_seconds (1, retry_radio, task);
-            return;
-        }
-        if (MM_BROADBAND_MODEM_MTK_CCCI (self)->priv->radio_mask == 1) {
-            mm_base_modem_at_command (self, "+CFUN=1", 10, FALSE,
-                                      (GAsyncReadyCallback) cfun_power_up_ready, task);
-            return;
-        }
-        /* CFUN=1 cannot express a SIM2/both-radio mask. */
-        g_task_return_error (task, g_steal_pointer (&error));
-    } else
-        g_task_return_boolean (task, TRUE);
-    g_object_unref (task);
-}
+    GTask *task = g_task_new (self, NULL, callback, user_data);
 
-static gboolean
-retry_radio (gpointer user_data)
-{
-    GTask *task = user_data;
-    MMBroadbandModemMtkCcci *self = g_task_get_source_object (task);
-    g_autofree gchar *cmd = g_strdup_printf ("+EFUN=%u", self->priv->radio_mask);
-    if (g_cancellable_is_cancelled (mm_base_modem_peek_cancellable (MM_BASE_MODEM (self)))) {
-        g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Modem removed during radio start");
+    if (!self->priv->shared) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_WRONG_STATE, "No MIPC port");
         g_object_unref (task);
-        return G_SOURCE_REMOVE;
+        return;
     }
-    mm_base_modem_at_command (MM_BASE_MODEM (self), cmd, 15, FALSE,
-                              (GAsyncReadyCallback) efun_power_up_ready, task);
-    return G_SOURCE_REMOVE;
+    g_task_set_task_data (task, GINT_TO_POINTER (on), NULL);
+    mm_obj_dbg (self, "radio of slot mask 0x%02x %s", self->priv->served, on ? "on" : "to low power");
+    mm_mtk_ccci_shared_radio_set (self->priv->shared, self->priv->served, on,
+                                  (GAsyncReadyCallback) radio_set_ready, task);
 }
 
 static void
@@ -442,18 +1212,7 @@ modem_power_up (MMIfaceModem        *_self,
                 GAsyncReadyCallback  callback,
                 gpointer             user_data)
 {
-    MMBroadbandModemMtkCcci *self = MM_BROADBAND_MODEM_MTK_CCCI (_self);
-    GTask                   *task;
-    g_autofree gchar        *cmd = NULL;
-
-    task = g_task_new (self, NULL, callback, user_data);
-
-    /* AT+EFUN=<mask>: 1 = SIM1 radio (equivalent to the 3GPP AT+CFUN=1,
-     * observed), 2 = SIM2, 3 = both (observed on the phone) */
-    cmd = g_strdup_printf ("+EFUN=%u", self->priv->radio_mask);
-    mm_obj_dbg (self, "powering the radio up with AT%s", cmd);
-    mm_base_modem_at_command (MM_BASE_MODEM (self), cmd, 15, FALSE,
-                              (GAsyncReadyCallback) efun_power_up_ready, task);
+    radio_set (MM_BROADBAND_MODEM_MTK_CCCI (_self), TRUE, callback, user_data);
 }
 
 static gboolean
@@ -461,23 +1220,24 @@ modem_power_down_finish (MMIfaceModem  *self,
                          GAsyncResult  *res,
                          GError       **error)
 {
-    return !!mm_base_modem_at_command_finish (MM_BASE_MODEM (self), res, error);
+    return g_task_propagate_boolean (G_TASK (res), error);
 }
 
 static void
-modem_power_down (MMIfaceModem        *self,
+modem_power_down (MMIfaceModem        *_self,
                   GAsyncReadyCallback  callback,
                   gpointer             user_data)
 {
-    /* 3GPP flight mode, the modem's start-up state; AT+EFUN=0 is untried
-     * (t2-modemd QUESTIONS C17) */
-    mm_base_modem_at_command (MM_BASE_MODEM (self), "+CFUN=4", 15, FALSE, callback, user_data);
+    /* low power of one SIM keeps the other stack's radio (AT+EFUN=<rest>);
+     * the last one gives the 3GPP flight mode AT+CFUN=4 (start-up state;
+     * AT+EFUN=0 is untried, t2-modemd QUESTIONS C17) */
+    radio_set (MM_BROADBAND_MODEM_MTK_CCCI (_self), FALSE, callback, user_data);
 }
 
 /*****************************************************************************/
 /* Allowed/preferred modes (Modem interface): the RAT mode
  *
- * The factory firmware's RIL sets the RAT mode with MIPC
+ * Android's RIL sets the RAT mode with MIPC
  * NW_SET_RAT_REQ (TLV 0x0100 u8 rat, 0x0101 u8 prefer_rat) per slot at
  * start-up, rat 22 = GSM|UMTS|LTE|NR, prefer_rat 128, Android's default
  * NR/LTE/WCDMA/GSM; the plugin sends the same at every enable unless a client
@@ -517,6 +1277,13 @@ parent_load_supported_modes_ready (MMIfaceModem *_self,
     mask &= (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G | MM_MODEM_MODE_5G);
     if (!mask)
         mask = MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G;
+    /* a pair the modem already accepted (cold start, before this probing)
+     * shows what it supports better than the probing of the AT port */
+    if (self->priv->rat_known && (self->priv->rat_allowed & ~mask & MM_MODEM_MODE_5G)) {
+        mm_obj_msg (self, "SIM%u generic probing did not report 5G, but the modem accepted rat %u prefer_rat %u: 5G kept",
+                    self->priv->sim_slot, self->priv->rat_value, self->priv->rat_prefer);
+        mask |= self->priv->rat_allowed & (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G | MM_MODEM_MODE_5G);
+    }
     self->priv->rat_mask = mask;
 
     combinations = mm_mtk_ccci_rat_build_combinations (mask);
@@ -579,6 +1346,11 @@ load_current_modes_reply (MMBroadbandModemMtkCcci *self,
                                      "unknown RAT mode in +ERAT: rat %u prefer_rat %u", rat, prefer);
             g_object_unref (task);
             return;
+        } else if (self->priv->rat_known) {
+            /* the modem's pair wins over what this object last had confirmed */
+            mm_obj_msg (self, "SIM%u +ERAT? pair rat %u prefer_rat %u differs from the last confirmed "
+                        "rat %u prefer_rat %u; reporting the modem's pair",
+                        self->priv->sim_slot, rat, prefer, self->priv->rat_value, self->priv->rat_prefer);
         }
         mm_obj_msg (self, "SIM%u RAT mode: rat %u prefer_rat %u (current RAT %u)",
                     self->priv->sim_slot, rat, prefer, curr);
@@ -640,11 +1412,53 @@ typedef struct {
     MMModemMode preferred;
     guint8      rat;
     guint8      prefer;
+    gboolean    encoded;   /* rat/prefer hold the pair sent (or to be sent) */
+    guint8      slot;      /* the MIPC slot bit the request is addressed to */
 } SetRatContext;
 
-static gboolean
-set_rat_finish (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GError **error)
+/* @rat/@prefer (optional): the pair that was sent, when there was one */
+/* the modem accepted a pair with modes the generic probing did not report
+ * (e.g. NR when +C5GREG=? did not answer in time): offer them too */
+static void
+rat_mask_extend (MMBroadbandModemMtkCcci *self, MMModemMode allowed)
 {
+    MMModemMode       added = allowed & (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G | MM_MODEM_MODE_5G);
+    MmGdbusModem     *skeleton = NULL;
+    g_autoptr(GArray) combinations = NULL;
+    g_autofree gchar *added_str = NULL;
+
+    /* not probed yet: the probing result is extended when it comes */
+    if (!self->priv->rat_mask || !(added & ~self->priv->rat_mask))
+        return;
+    added &= ~self->priv->rat_mask;
+    self->priv->rat_mask |= added;
+    combinations = mm_mtk_ccci_rat_build_combinations (self->priv->rat_mask);
+    added_str = mm_modem_mode_build_string_from_mask (added);
+    mm_obj_msg (self, "SIM%u the modem accepted '%s', which the generic probing did not report: "
+                "%u allowed/preferred combinations offered now", self->priv->sim_slot, added_str, combinations->len);
+    g_object_get (self, MM_IFACE_MODEM_DBUS_SKELETON, &skeleton, NULL);
+    if (skeleton) {
+        mm_gdbus_modem_set_supported_modes (skeleton, mm_common_mode_combinations_garray_to_variant (combinations));
+        g_object_unref (skeleton);
+    }
+}
+
+static gboolean
+set_rat_finish (MMBroadbandModemMtkCcci  *self,
+                GAsyncResult             *res,
+                gboolean                 *encoded,
+                guint8                   *rat,
+                guint8                   *prefer,
+                GError                  **error)
+{
+    SetRatContext *ctx = g_task_get_task_data (G_TASK (res));
+
+    if (encoded)
+        *encoded = ctx->encoded;
+    if (rat)
+        *rat = ctx->rat;
+    if (prefer)
+        *prefer = ctx->prefer;
     return g_task_propagate_boolean (G_TASK (res), error);
 }
 
@@ -656,31 +1470,62 @@ set_rat_ready (MMPortMipc *port, GAsyncResult *res, GTask *task)
     g_autoptr(MMMipcCnf)     cnf = NULL;
     GError                  *error = NULL;
 
+    gsize                    vlen = 0;
+
     cnf = mm_port_mipc_request_finish (port, res, &error);
     if (!cnf) {
+        /* no confirm (timeout, port gone): nothing proves a change, the
+         * last confirmed pair stays */
+        trace_event (self, ctx->slot, NULL, "RAT mode rat %u prefer_rat %u: no confirm: %s",
+                     ctx->rat, ctx->prefer, error->message);
         g_task_return_error (task, error);
         g_object_unref (task);
         return;
     }
-    if (cnf->result) {
+    /* Only NW_SET_RAT_CNF 0x0428 of this request's slot with result 0 is an
+     * acceptance. The port completes a request with the confirm of its own
+     * transaction id, confirm id and slot only (a late confirm of another
+     * slot or of an earlier request is dropped there); id and slot are
+     * checked here once more. */
+    if (cnf->msg_id != MM_MIPC_NW_SET_RAT_CNF || cnf->slot != ctx->slot) {
+        trace_event (self, ctx->slot, NULL, "RAT mode rat %u prefer_rat %u: unexpected confirm 0x%04x for slot 0x%02x",
+                     ctx->rat, ctx->prefer, cnf->msg_id, cnf->slot);
         g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-                                 "NW_SET_RAT rat %u prefer_rat %u: result %u",
-                                 ctx->rat, ctx->prefer, cnf->result);
+                                 "NW_SET_RAT rat %u prefer_rat %u: unexpected confirm 0x%04x for slot 0x%02x",
+                                 ctx->rat, ctx->prefer, cnf->msg_id, cnf->slot);
+        g_object_unref (task);
+        return;
+    }
+    if (cnf->result) {
+        /* MM_MIPC_RESULT_MISSING is 2 as well: say which one it was */
+        trace_event (self, ctx->slot, NULL, "RAT mode rat %u prefer_rat %u refused: NW_SET_RAT_CNF result %u%s",
+                     ctx->rat, ctx->prefer, cnf->result,
+                     mm_mipc_tlv_find (cnf->payload->data, cnf->payload->len, MM_MIPC_T_RESULT, &vlen) ?
+                         "" : " (no result TLV)");
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "NW_SET_RAT rat %u prefer_rat %u: result %u%s",
+                                 ctx->rat, ctx->prefer, cnf->result,
+                                 mm_mipc_tlv_find (cnf->payload->data, cnf->payload->len, MM_MIPC_T_RESULT, &vlen) ?
+                                     "" : " (no result TLV in the confirm)");
         g_object_unref (task);
         return;
     }
     self->priv->rat_known = TRUE;
+    self->priv->rat_session_confirmed = TRUE;
     self->priv->rat_value = ctx->rat;
     self->priv->rat_prefer = ctx->prefer;
     self->priv->rat_allowed = ctx->allowed;
     self->priv->rat_preferred = ctx->preferred;
     mm_obj_msg (self, "SIM%u RAT mode set: rat %u prefer_rat %u",
                 mm_broadband_modem_mtk_ccci_get_mipc_slot (self), ctx->rat, ctx->prefer);
+    trace_event (self, ctx->slot, NULL, "RAT mode confirmed (NW_SET_RAT_CNF result 0): rat %u prefer_rat %u",
+                 ctx->rat, ctx->prefer);
+    rat_mask_extend (self, ctx->allowed);
     g_task_return_boolean (task, TRUE);
     g_object_unref (task);
 }
 
-/* NW_SET_RAT_REQ on the selected slot; ANY/NONE means the factory default */
+/* NW_SET_RAT_REQ on the selected slot; ANY/NONE means the modem's start-up default */
 static void
 set_rat (MMBroadbandModemMtkCcci *self,
          MMModemMode              allowed,
@@ -693,10 +1538,9 @@ set_rat (MMBroadbandModemMtkCcci *self,
     g_autoptr(GByteArray) tlvs = NULL;
 
     g_task_set_task_data (task, ctx, g_free);
-    if (allowed == MM_MODEM_MODE_ANY && preferred == MM_MODEM_MODE_NONE)
-        mm_mtk_ccci_rat_default (self->priv->rat_mask, &allowed, &preferred);
-    ctx->allowed = allowed;
-    ctx->preferred = preferred;
+    ctx->slot = mm_broadband_modem_mtk_ccci_get_mipc_slot (self);
+    /* ANY/NONE is encoded as such: the automatic pair does not depend on
+     * the probed modes */
     if (!mm_mtk_ccci_rat_from_modes (self->priv->rat_mask, allowed, preferred, &ctx->rat, &ctx->prefer)) {
         g_autofree gchar *allowed_str = mm_modem_mode_build_string_from_mask (allowed);
         g_autofree gchar *preferred_str = mm_modem_mode_build_string_from_mask (preferred);
@@ -706,15 +1550,19 @@ set_rat (MMBroadbandModemMtkCcci *self,
         g_object_unref (task);
         return;
     }
+    if (allowed == MM_MODEM_MODE_ANY && preferred == MM_MODEM_MODE_NONE)
+        mm_mtk_ccci_rat_default (&allowed, &preferred);
+    ctx->allowed = allowed;
+    ctx->preferred = preferred;
     if (!self->priv->mipc || !mm_port_mipc_get_session_ready (self->priv->mipc)) {
         g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_WRONG_STATE,
                                  "MIPC session not ready");
         g_object_unref (task);
         return;
     }
+    ctx->encoded = TRUE;
     tlvs = mm_mipc_build_set_rat (ctx->rat, ctx->prefer);
-    mm_port_mipc_request (self->priv->mipc, MM_MIPC_NW_SET_RAT_REQ,
-                          mm_broadband_modem_mtk_ccci_get_mipc_slot (self), tlvs, 15, NULL,
+    mm_port_mipc_request (self->priv->mipc, MM_MIPC_NW_SET_RAT_REQ, ctx->slot, tlvs, 15, NULL,
                           (GAsyncReadyCallback) set_rat_ready, task);
 }
 
@@ -731,7 +1579,9 @@ set_current_modes_ready (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GTask
 {
     GError *error = NULL;
 
-    if (!set_rat_finish (self, res, &error))
+    /* a refused explicit request: the error to the client, the last
+     * confirmed pair (and CurrentModes) unchanged */
+    if (!set_rat_finish (self, res, NULL, NULL, NULL, &error))
         g_task_return_error (task, error);
     else {
         /* ANY/NONE returns to the default: not a choice to keep */
@@ -757,21 +1607,43 @@ modem_set_current_modes (MMIfaceModem        *_self,
     set_rat (self, allowed, preferred, (GAsyncReadyCallback) set_current_modes_ready, task);
 }
 
-/* Before the radio comes up (cold start) and at every enable: the factory
- * default, or what a client chose for this modem object. Never fatal: the
- * modem then keeps the mode it has. */
+/* Before the radio comes up (cold start) and at every enable: the automatic
+ * mode 22/128 (whatever the generic probing found), or what a client chose
+ * for this modem object. Never fatal: the modem then keeps the mode it has.
+ * A pair this object had confirmed in the same MIPC session (the cold start
+ * just before enabling) is not sent again. */
 static void
 initial_rat_ready (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GTask *task);
+static void
+initial_rat_continue (MMBroadbandModemMtkCcci *self, GTask *task);
 
 static void
 apply_initial_rat (MMBroadbandModemMtkCcci *self, GTask *task)
 {
     MMModemMode allowed = MM_MODEM_MODE_ANY;
     MMModemMode preferred = MM_MODEM_MODE_NONE;
+    guint8      rat, prefer;
 
+    if (!self->priv->start_rat) {
+        trace_event (self, mm_broadband_modem_mtk_ccci_get_mipc_slot (self), NULL,
+                     "start-up step RAT setting: off (ID_MM_MTK_CCCI_START_RAT=0)");
+        trace_watch (self);
+        initial_rat_continue (self, task);
+        return;
+    }
     if (self->priv->rat_user_set) {
         allowed = self->priv->rat_allowed;
         preferred = self->priv->rat_preferred;
+    }
+    if (self->priv->rat_session_confirmed && self->priv->rat_known &&
+        mm_mtk_ccci_rat_from_modes (self->priv->rat_mask, allowed, preferred, &rat, &prefer) &&
+        rat == self->priv->rat_value && prefer == self->priv->rat_prefer) {
+        trace_event (self, mm_broadband_modem_mtk_ccci_get_mipc_slot (self), NULL,
+                     "RAT mode rat %u prefer_rat %u already confirmed in this MIPC session: not sent again",
+                     rat, prefer);
+        trace_watch (self);
+        initial_rat_continue (self, task);
+        return;
     }
     set_rat (self, allowed, preferred, (GAsyncReadyCallback) initial_rat_ready, task);
 }
@@ -911,6 +1783,15 @@ modem_load_sim_slots (MMIfaceModem        *_self,
     LoadSimSlotsContext     *ctx;
 
     task = g_task_new (self, NULL, callback, user_data);
+    if (self->priv->dual) {
+        /* one SIM per modem object: ModemManager's generic SIM of the
+         * object's own stack, no SimSlots/PrimarySimSlot (DESIGN.md §11) */
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                 "dual-modem mode: SIM%u is the only SIM of this modem object",
+                                 self->priv->sim_slot);
+        g_object_unref (task);
+        return;
+    }
     ctx = g_slice_new0 (LoadSimSlotsContext);
     ctx->primary = self->priv->sim_slot;
     g_task_set_task_data (task, ctx, (GDestroyNotify) load_sim_slots_context_free);
@@ -941,6 +1822,12 @@ modem_set_primary_sim_slot (MMIfaceModem        *_self,
 
     task = g_task_new (self, NULL, callback, user_data);
 
+    if (self->priv->dual) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                 "dual-modem mode: each SIM has its own modem object");
+        g_object_unref (task);
+        return;
+    }
     if (sim_slot < 1 || sim_slot > N_SIM_SLOTS) {
         g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
                                  "SIM slot %u does not exist (1..%u)", sim_slot, N_SIM_SLOTS);
@@ -980,17 +1867,39 @@ modem_set_primary_sim_slot (MMIfaceModem        *_self,
 /*****************************************************************************/
 /* Bearers (Modem interface) */
 
+static void
+ims_prepare_data_ready (GObject *source, GAsyncResult *res, GTask *task)
+{
+    GError *error = NULL;
+
+    /* source is the shared context (the IMS controller's owner) */
+    if (!mm_mtk_ccci_ims_prepare_data_finish (res, &error))
+        g_task_return_error (task, error);
+    else
+        g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
 void
 mm_broadband_modem_mtk_ccci_prepare_data (MMBroadbandModemMtkCcci *self, const gchar *apn,
                                          GAsyncReadyCallback callback, gpointer user_data)
 {
-    if (self->priv->ims_enabled) {
-        mm_mtk_ccci_ims_prepare_data (self->priv->ims[self->priv->sim_slot - 1], apn, callback, user_data);
-    } else {
-        GTask *task = g_task_new (self, NULL, callback, user_data);
-        g_task_return_boolean (task, TRUE);
+    /* the result's source object is this modem (the bearer's callback takes
+     * it as the modem), not the shared IMS controller's owner */
+    GTask *task = g_task_new (self, NULL, callback, user_data);
+    MMMtkCcciIms *ims = self->priv->ims_enabled ? ims_of (self, self->priv->sim_slot) : NULL;
+
+    if (self->priv->ims_enabled && !ims) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_WRONG_STATE, "No IMS controller (no MIPC port)");
         g_object_unref (task);
+        return;
     }
+    if (ims) {
+        mm_mtk_ccci_ims_prepare_data (ims, apn, (GAsyncReadyCallback) ims_prepare_data_ready, task);
+        return;
+    }
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
 }
 
 gboolean
@@ -1018,6 +1927,14 @@ modem_create_bearer (MMIfaceModem        *self,
     MMBaseBearer *bearer;
 
     task = g_task_new (self, NULL, callback, user_data);
+    if (MM_BROADBAND_MODEM_MTK_CCCI (self)->priv->sim2_role && !MM_BROADBAND_MODEM_MTK_CCCI (self)->priv->sim2_data) {
+        /* default: mobile data on SIM1 only; a connection manager
+         * profile without a SIM binding must not end up on SIM2 */
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                 "mobile data is configured for SIM1 only (" ID_MM_MTK_CCCI_SIM2_DATA ")");
+        g_object_unref (task);
+        return;
+    }
     mm_obj_dbg (self, "creating MIPC data bearer...");
     bearer = mm_bearer_mtk_ccci_new (MM_BROADBAND_MODEM_MTK_CCCI (self), properties);
     g_task_return_pointer (task, bearer, g_object_unref);
@@ -1048,7 +1965,7 @@ ims_urc_received (MMPortSerialAt          *port,
 
     str = g_match_info_fetch (info, 1);
     mm_obj_dbg (self, "IMS report: %s", str);
-    mm_mtk_ccci_ims_urc (self->priv->ims[self->priv->sim_slot - 1], str);
+    mm_mtk_ccci_ims_urc (ims_of (self, self->priv->sim_slot), str);
 }
 
 /* +ESPEECH: <speech_on>,<x>,<y>: only the first field is used */
@@ -1062,7 +1979,7 @@ espeech_received (MMPortSerialAt          *port,
     if (!mm_get_uint_from_match_info (info, 1, &on))
         return;
     self->priv->speech_on = (on != 0);
-    /* the speech path is switched on MM's in-call state (factory timing), this
+    /* the speech path is switched on MM's in-call state (Android's timing), this
      * is the modem's view of it */
     mm_obj_msg (self, "modem speech path %s", on ? "on" : "off");
 }
@@ -1177,7 +2094,7 @@ ecpi_received (MMPortSerialAt          *port,
                                                (GAsyncReadyCallback) reload_all_calls_ready, NULL);
         return;
     default:
-        /* 1, 3, 4, 5, 129, 134..137: progress/sync, not forwarded by the factory firmware's RIL either */
+        /* 1, 3, 4, 5, 129, 134..137: progress/sync, not forwarded by Android's RIL either */
         return;
     }
 
@@ -1210,13 +2127,20 @@ eaic_received (MMPortSerialAt          *port,
         !mm_get_uint_from_match_info (info, 5, &seq))
         return;
     number = g_match_info_fetch (info, 2);
-    mm_obj_msg (self, "incoming call indication: id %u from %s, approving", call_id, number);
+    mm_obj_msg (self, "incoming call indication: id %u from %s", call_id, number);
 
     /* The call does not ring until the AP answers; mode 0 = let it proceed
-     * (the modem then sends RING, +CLIP, +ECPI). Rejecting would be
-     * AT+EAIC=1,<id>,<seq>,21. Policy: always approve; the user rejects the
-     * ringing call through the Call object as with any modem. */
-    cmd = g_strdup_printf ("+EAIC=0,%u,%u", call_id, seq);
+     * (the modem then sends RING, +CLIP, +ECPI), 1 = reject with cause 21
+     *. Policy as for CALL_APPROVE_INCOMING_CMD
+     * (shared context): approve, except the DSDS case; the user rejects a
+     * ringing call through the Call object as with any modem. This port
+     * serves the stack of the selected SIM (+ESUO). */
+    if (self->priv->shared &&
+        !mm_mtk_ccci_shared_incoming_decide (self->priv->shared, (guint8) self->priv->sim_slot,
+                                             call_id, seq, number))
+        cmd = g_strdup_printf ("+EAIC=1,%u,%u,21", call_id, seq);
+    else
+        cmd = g_strdup_printf ("+EAIC=0,%u,%u", call_id, seq);
     mm_base_modem_at_command_full (MM_BASE_MODEM (self), MM_IFACE_PORT_AT (port), cmd, 5,
                                    FALSE, FALSE, NULL,
                                    (GAsyncReadyCallback) eaic_answer_ready, NULL);
@@ -1414,6 +2338,11 @@ dual_voice_step (GTask *task)
         g_object_unref (task);
         return;
     }
+    /* the slots this object serves (both in the single-object mode) */
+    while (ctx->slot_index < 2 && !(self->priv->served & (1u << ctx->slot_index))) {
+        ctx->slot_index++;
+        ctx->command_index = 0;
+    }
     if (ctx->slot_index == 2) {
         g_task_return_boolean (task, TRUE);
         g_object_unref (task);
@@ -1446,7 +2375,7 @@ modem_voice_enable_unsolicited_events (MMIfaceModemVoice *self, GAsyncReadyCallb
  * the MIPC AT channel (SYS_AT_IND per slot, after AT+EURCRPT=2 there), so the
  * same 27.005 +CNMI goes to that channel of both slots as well: <mt>=1 keeps
  * "store, then indicate the index" (+CMTI). In addition the SMS-group
- * indications that the factory firmware's RIL registers (mm-mipc-proto.h) are registered
+ * indications that Android's RIL registers (mm-mipc-proto.h) are registered
  * per slot. Both steps are best effort: the generic CNMI result decides. */
 
 static const guint16 sms_indications[] = {
@@ -1518,6 +2447,11 @@ sms_enable_step (GTask *task)
             mm_obj_warn (self, "no MIPC session: new-SMS notices not enabled, the fallback scan only");
         ctx->step = 2 + n_reg;
     }
+    /* the slots this object serves only (both in the single-object mode) */
+    while ((ctx->step < 2 && !(self->priv->served & (1u << ctx->step))) ||
+           (ctx->step >= 2 && ctx->step < 2 + n_reg &&
+            !(self->priv->served & (1u << ((ctx->step - 2) / G_N_ELEMENTS (sms_indications))))))
+        ctx->step++;
     if (ctx->step < 2) {
         mm_port_mipc_at_command (self->priv->mipc, (guint8) (1u << ctx->step), SMS_TUNNEL_CNMI, 5,
                                  (GAsyncReadyCallback) sms_tunnel_cnmi_ready, task);
@@ -1569,8 +2503,8 @@ modem_messaging_enable_unsolicited_events (MMIfaceModemMessaging *self, GAsyncRe
 /*****************************************************************************/
 /* Voice: call list (+CLCC)
  *
- * The modem reports IMS (VoLTE) calls with <mode> 20..25
- * (observed on the phone: "+CLCC: 1,0,2,20,0,...,145" for a dialing
+ * The modem reports IMS (VoLTE) calls with <mode> 20..25 (observed on the
+ * phone: "+CLCC: 1,0,2,20,0,...,145" for a dialing
  * call). ModemManager's generic parser lists voice calls (mode 0) only and
  * would terminate the call object, so the mode is rewritten before parsing. */
 
@@ -1626,7 +2560,7 @@ static void calls_step (GTask *task)
 {
     MMBroadbandModemMtkCcci *self = g_task_get_source_object (task);
     CallsContext *ctx = g_task_get_task_data (task);
-    while (ctx->slot < 2 && !self->priv->sim_ready[ctx->slot])
+    while (ctx->slot < 2 && (!(self->priv->served & (1u << ctx->slot)) || !self->priv->sim_ready[ctx->slot]))
         ctx->slot++;
     if (ctx->slot == 2) {
         GList *calls = ctx->calls;
@@ -1684,7 +2618,7 @@ static void hangup_all_step (GTask *task)
 {
     MMBroadbandModemMtkCcci *self = g_task_get_source_object (task);
     guint slot = GPOINTER_TO_UINT (g_task_get_task_data (task));
-    while (slot < 2 && !self->priv->sim_ready[slot]) slot++;
+    while (slot < 2 && (!(self->priv->served & (1u << slot)) || !self->priv->sim_ready[slot])) slot++;
     if (slot == 2) {
         g_task_return_boolean (task, TRUE);
         g_object_unref (task);
@@ -1704,8 +2638,8 @@ static void modem_voice_hangup_all (MMIfaceModemVoice *self, GAsyncReadyCallback
  *
  * MM enters the "in-call" state when a call is dialing, ringing out, held or
  * active (not for a ringing incoming call) and leaves it when no call is:
- * exactly the timing of the factory firmware ("speech on when ATD/ATA
- * is accepted, off when the last call is gone"). t2-speechd owns the audio
+ * exactly Android's timing (speech on when ATD/ATA is accepted, off when
+ * the last call is gone). t2-speechd owns the audio
  * path and the modem's speech engine; its line protocol is
  * tools/speechd/README.md ("call-start", "call-stop", reply ends with "ok" or
  * "error: ..."). */
@@ -1873,9 +2807,20 @@ modem_voice_setup_in_call_audio_channel (MMIfaceModemVoice   *self,
                                          GAsyncReadyCallback  callback,
                                          gpointer             user_data)
 {
+    MMBroadbandModemMtkCcci *modem = MM_BROADBAND_MODEM_MTK_CCCI (self);
+
+    /* one speech path for both SIMs: the first call switches it on */
+    if (modem->priv->shared && mm_mtk_ccci_shared_speech_update (modem->priv->shared, modem->priv->served, TRUE) != 1) {
+        GTask *task = g_task_new (self, NULL, callback, user_data);
+
+        mm_obj_msg (self, "call in progress: voice audio path already on (other SIM's call)");
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
     mm_obj_msg (self, "call in progress: switching the voice audio path on");
-    /* 48 kHz: the rate t2-speechd assumes (unverified) */
-    speechd_command (MM_BROADBAND_MODEM_MTK_CCCI (self), "call-start --rate 48000", NULL,
+    /* 48 kHz: the rate t2-speechd assumes (speech-ccci questions 5) */
+    speechd_command (modem, "call-start --rate 48000", NULL,
                      (GAsyncReadyCallback) speechd_in_call_ready,
                      g_task_new (self, NULL, callback, user_data));
 }
@@ -1893,8 +2838,19 @@ modem_voice_cleanup_in_call_audio_channel (MMIfaceModemVoice   *self,
                                            GAsyncReadyCallback  callback,
                                            gpointer             user_data)
 {
+    MMBroadbandModemMtkCcci *modem = MM_BROADBAND_MODEM_MTK_CCCI (self);
+
+    /* the other SIM's call still needs the speech path */
+    if (modem->priv->shared && mm_mtk_ccci_shared_speech_update (modem->priv->shared, modem->priv->served, FALSE) != -1) {
+        GTask *task = g_task_new (self, NULL, callback, user_data);
+
+        mm_obj_msg (self, "no call left on this SIM: voice audio path kept for the other SIM's call");
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
     mm_obj_msg (self, "no call left: switching the voice audio path off");
-    speechd_command (MM_BROADBAND_MODEM_MTK_CCCI (self), "call-stop", NULL,
+    speechd_command (modem, "call-stop", NULL,
                      (GAsyncReadyCallback) speechd_in_call_ready,
                      g_task_new (self, NULL, callback, user_data));
 }
@@ -1953,17 +2909,13 @@ enabling_started_finish (MMBroadbandModem  *self,
 }
 
 static void
-secondary_ims_ready (MMBaseModem *modem, GAsyncResult *res, GTask *task)
+secondary_ims_ready (GObject *source, GAsyncResult *res, GTask *task)
 {
+    /* the IMS controllers are shared (mm-mtk-ccci-shared): the source object
+     * of their results is the shared context, not this modem */
+    MMBaseModem *modem = g_task_get_source_object (task);
     GError *error = NULL;
     if (!mm_mtk_ccci_ims_setup_finish (res, &error)) {
-        if (g_object_get_data (G_OBJECT (task), "cold-start")) {
-            mm_obj_warn (modem, "secondary IMS setup before SIM power: %s; retrying after SIM discovery", error->message);
-            g_clear_error (&error);
-            mm_base_modem_at_sequence (modem, voice_init_sequence, NULL, NULL,
-                                       (GAsyncReadyCallback) voice_init_ready, task);
-            return;
-        }
         g_prefix_error (&error, "secondary IMS setup: ");
         g_task_return_error (task, error);
         g_object_unref (task);
@@ -1979,87 +2931,199 @@ secondary_pin_ready (MMPortMipc *port, GAsyncResult *res, GTask *task)
     MMBroadbandModemMtkCcci *self = g_task_get_source_object (task);
     g_autoptr(GError) error = NULL;
     g_autofree gchar *reply = mm_port_mipc_at_command_finish (port, res, &error);
-    guint secondary = self->priv->sim_slot == 1 ? 1 : 0;
+    guint secondary = self->priv->sim_slot == 1 ? 2 : 1;
     if (reply && strstr (reply, "READY")) {
-        mm_mtk_ccci_ims_setup (self->priv->ims[secondary], (GAsyncReadyCallback) secondary_ims_ready, task);
+        mm_mtk_ccci_ims_setup (ims_of (self, secondary), (GAsyncReadyCallback) secondary_ims_ready, task);
         return;
     }
-    mm_obj_warn (self, "SIM%u not ready for IMS: %s", secondary + 1, error ? error->message : (reply ? reply : "unknown"));
+    mm_obj_warn (self, "SIM%u not ready for IMS: %s", secondary, error ? error->message : (reply ? reply : "unknown"));
     mm_base_modem_at_sequence (MM_BASE_MODEM (self), voice_init_sequence, NULL, NULL,
                                (GAsyncReadyCallback) voice_init_ready, task);
 }
 
 static void
-ims_setup_ready (MMBaseModem *modem, GAsyncResult *res, GTask *task)
+ims_setup_ready (GObject *source, GAsyncResult *res, GTask *task)
 {
+    /* source is the shared context that owns the IMS controller, not this modem */
+    MMBaseModem *modem = g_task_get_source_object (task);
     MMBroadbandModemMtkCcci *self = MM_BROADBAND_MODEM_MTK_CCCI (modem);
     GError *error = NULL;
     guint8 secondary_slot = self->priv->sim_slot == 1 ? MM_MIPC_SLOT_SIM2 : MM_MIPC_SLOT_SIM1;
     if (!mm_mtk_ccci_ims_setup_finish (res, &error)) {
-        g_prefix_error (&error, "primary IMS setup before radio-on: ");
+        g_prefix_error (&error, "primary IMS setup: ");
         g_task_return_error (task, error);
         g_object_unref (task);
         return;
     }
-    if (g_object_get_data (G_OBJECT (task), "cold-start")) {
-        /* CPIN stays busy until EFUN on a cold modem. Configure both stacks
-         * before powering SIMs; a missing secondary is checked after discovery. */
-        mm_mtk_ccci_ims_setup (self->priv->ims[secondary_slot - 1],
-                               (GAsyncReadyCallback) secondary_ims_ready, task);
+    if (self->priv->dual) {
+        /* the other stack is the other modem object's */
+        mm_base_modem_at_sequence (modem, voice_init_sequence, NULL, NULL,
+                                   (GAsyncReadyCallback) voice_init_ready, task);
         return;
     }
     mm_port_mipc_at_command (self->priv->mipc, secondary_slot, "AT+CPIN?", 10,
                               (GAsyncReadyCallback) secondary_pin_ready, task);
 }
 
+/* the IMS profiles and radio-owner flags of the shared controllers: the
+ * SIM1/legacy object configures both stacks from wwan0at0's properties (as
+ * before); the SIM2 object applies its anchor's properties to SIM2 */
+static void
+configure_ims_controllers (MMBroadbandModemMtkCcci *self)
+{
+    MMKernelDevice *kdev = config_kernel_device (self);
+    guint i;
+
+    for (i = 0; i < 2; i++) {
+        g_autofree gchar *property = g_strdup_printf ("ID_MM_MTK_CCCI_DATA_APN_SIM%u", i + 1);
+        MMMtkCcciIms *ims = ims_of (self, i + 1);
+        const gchar *internet;
+        const gchar *source;
+
+        if (!ims || (self->priv->sim2_role && i == 0))
+            continue;
+        /* legacy: the selected stack issues the radio-off step; dual: each
+         * stack may, the shared radio hook keeps the other stack's radio */
+        mm_mtk_ccci_ims_set_radio_owner (ims, self->priv->dual || i + 1 == self->priv->sim_slot);
+        if (!kdev)
+            continue;
+        internet = mm_kernel_device_get_property (kdev, property);
+        source = i ? "udev ID_MM_MTK_CCCI_DATA_APN_SIM2" : "udev ID_MM_MTK_CCCI_DATA_APN_SIM1";
+        if (!internet && i + 1 == self->priv->sim_slot) {
+            internet = mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_DATA_APN");
+            source = "udev ID_MM_MTK_CCCI_DATA_APN";
+        }
+        mm_mtk_ccci_ims_set_profiles (ims, internet, source,
+                                      mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_IMS_APN"),
+                                      mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_SOS_APN"));
+        /* the initial-attach experiment: A (unset, 0) or B (1), per SIM or for both */
+        {
+            g_autofree gchar *ia_property = g_strdup_printf ("ID_MM_MTK_CCCI_IA_SIM%u", i + 1);
+            const gchar      *name = mm_kernel_device_has_property (kdev, ia_property) ? ia_property :
+                                     "ID_MM_MTK_CCCI_IA";
+
+            mm_mtk_ccci_ims_set_initial_attach (ims, mm_kernel_device_has_property (kdev, name) &&
+                                                     mm_kernel_device_get_property_as_boolean (kdev, name));
+        }
+        /* the start-up steps before radio-on, each switchable */
+        {
+            const gchar          *profiles = mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_START_PROFILES");
+            MMMtkCcciImsProfiles  mode = MM_MTK_CCCI_IMS_PROFILES_BEFORE_RADIO;
+            guint                 steps = 0;
+
+            if (!g_strcmp0 (profiles, "after-registration"))
+                mode = MM_MTK_CCCI_IMS_PROFILES_AFTER_REGISTRATION;
+            else if (!g_strcmp0 (profiles, "off") || !g_strcmp0 (profiles, "0"))
+                mode = MM_MTK_CCCI_IMS_PROFILES_OFF;
+            else if (profiles && g_strcmp0 (profiles, "before-radio") && g_strcmp0 (profiles, "1"))
+                mm_obj_warn (self, "ignoring invalid ID_MM_MTK_CCCI_START_PROFILES '%s'", profiles);
+            if (lte_property (kdev, "ID_MM_MTK_CCCI_IMS_MIPC_CONFIG", TRUE))
+                steps |= MM_MTK_CCCI_IMS_STEP_MIPC_CONFIG;
+            if (lte_property (kdev, "ID_MM_MTK_CCCI_CIREG", TRUE))
+                steps |= MM_MTK_CCCI_IMS_STEP_CIREG;
+            if (lte_property (kdev, "ID_MM_MTK_CCCI_EIMSPDN", TRUE))
+                steps |= MM_MTK_CCCI_IMS_STEP_EIMSPDN;
+            if (lte_property (kdev, "ID_MM_MTK_CCCI_EIMSCFG", TRUE))
+                steps |= MM_MTK_CCCI_IMS_STEP_EIMSCFG;
+            if (lte_property (kdev, "ID_MM_MTK_CCCI_EIMSRCS", TRUE))
+                steps |= MM_MTK_CCCI_IMS_STEP_EIMSRCS;
+            mm_mtk_ccci_ims_set_start_steps (ims, steps, mode);
+        }
+    }
+}
+
+/* enabling: this object's IMS stack (idempotent when configured before
+ * radio-on), the other one in the single-object mode, then the voice
+ * initialisation on the AT port */
 static void
 prepare_ims_and_voice (MMBroadbandModemMtkCcci *self, GTask *task)
 {
-    MMPortMipc *mipc = self->priv->mipc;
-    guint i;
-
     set_vendor_unsolicited_events_handlers (self, TRUE);
-    if (self->priv->ims_enabled) {
-        MMKernelDevice *kdev = mm_port_peek_kernel_device (MM_PORT (mm_base_modem_peek_port_primary (MM_BASE_MODEM (self))));
-        for (i = 0; i < 2; i++) {
-            g_autofree gchar *property = g_strdup_printf ("ID_MM_MTK_CCCI_DATA_APN_SIM%u", i + 1);
-            const gchar *internet = kdev ? mm_kernel_device_get_property (kdev, property) : NULL;
-            if (!self->priv->ims[i])
-                self->priv->ims[i] = mm_mtk_ccci_ims_new (MM_BASE_MODEM (self), mipc, 1u << i,
-                    mm_broadband_modem_mtk_ccci_get_wwan_device (self));
-            mm_mtk_ccci_ims_set_radio_owner (self->priv->ims[i], i + 1 == self->priv->sim_slot);
-            if (!internet && kdev && i + 1 == self->priv->sim_slot)
-                internet = mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_DATA_APN");
-            if (kdev)
-                mm_mtk_ccci_ims_set_profiles (self->priv->ims[i], internet,
-                    mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_IMS_APN"),
-                    mm_kernel_device_get_property (kdev, "ID_MM_MTK_CCCI_SOS_APN"));
-        }
-        mm_mtk_ccci_ims_setup (self->priv->ims[self->priv->sim_slot - 1], (GAsyncReadyCallback) ims_setup_ready, task);
+    /* the LTE start-up contract's parts that do not need the radio off */
+    if (self->priv->shared)
+        mm_mtk_ccci_shared_lte_session (self->priv->shared, self->priv->served);
+    if (self->priv->ims_enabled && ims_of (self, self->priv->sim_slot)) {
+        configure_ims_controllers (self);
+        mm_mtk_ccci_ims_setup (ims_of (self, self->priv->sim_slot), (GAsyncReadyCallback) ims_setup_ready, task);
     } else
         mm_base_modem_at_sequence (MM_BASE_MODEM (self), voice_init_sequence, NULL, NULL,
                                    (GAsyncReadyCallback) voice_init_ready, task);
+}
+
+/* cold start (this stack's radio off): IMS of every stack about to come on
+ * (the shared coordinator), the voice initialisation, then (caller) radio */
+static void
+cold_prepare_ready (MMMtkCcciShared *shared, GAsyncResult *res, GTask *task)
+{
+    MMBroadbandModemMtkCcci *self = g_task_get_source_object (task);
+    GError *error = NULL;
+
+    if (!mm_mtk_ccci_shared_radio_prepare_finish (shared, res, &error)) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+    mm_base_modem_at_sequence (MM_BASE_MODEM (self), voice_init_sequence, NULL, NULL,
+                               (GAsyncReadyCallback) voice_init_ready, task);
+}
+
+static void
+cold_prepare (MMBroadbandModemMtkCcci *self, GTask *task)
+{
+    set_vendor_unsolicited_events_handlers (self, TRUE);
+    configure_ims_controllers (self);
+    mm_mtk_ccci_shared_radio_prepare (self->priv->shared, (guint8) (1u << (self->priv->sim_slot - 1)),
+                                      self->priv->ims_enabled,
+                                      (GAsyncReadyCallback) cold_prepare_ready, task);
 }
 
 static void
 initial_rat_ready (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GTask *task)
 {
     g_autoptr(GError) error = NULL;
+    gboolean          encoded = FALSE;
+    guint8            rat = 0, prefer = 0;
 
-    if (!set_rat_finish (self, res, &error)) {
-        if (!self->priv->rat_user_set && !g_object_get_data (G_OBJECT (task), "rat-lte-fallback")) {
-            MMModemMode allowed, preferred;
-            /* the NR-first default rejected (no NR in this firmware/SIM?):
-             * the LTE-first default instead (user decision 2026-11-12) */
-            mm_mtk_ccci_rat_default (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G | MM_MODEM_MODE_4G,
-                                     &allowed, &preferred);
-            mm_obj_warn (self, "NR-first RAT mode not accepted: %s; trying LTE first", error->message);
-            g_object_set_data (G_OBJECT (task), "rat-lte-fallback", GINT_TO_POINTER (TRUE));
+    trace_watch (self);
+    if (!set_rat_finish (self, res, &encoded, &rat, &prefer, &error)) {
+        MMModemMode allowed, preferred;
+
+        /* the default rejected (e.g. NR first without NR in this
+         * firmware/SIM): one retry with another pair (decided
+         * 2026-11-12), never the rejected one again; a client's choice is
+         * not replaced */
+        if (!self->priv->rat_user_set && encoded &&
+            !g_object_get_data (G_OBJECT (task), "rat-fallback") &&
+            mm_mtk_ccci_rat_fallback (self->priv->rat_mask, rat, prefer, &allowed, &preferred)) {
+            g_autofree gchar *allowed_str = mm_modem_mode_build_string_from_mask (allowed);
+            g_autofree gchar *preferred_str = mm_modem_mode_build_string_from_mask (preferred);
+
+            mm_obj_warn (self, "SIM%u start-up RAT mode not accepted: %s; one retry with allowed '%s', preferred '%s'",
+                         self->priv->sim_slot, error->message, allowed_str, preferred_str);
+            g_object_set_data (G_OBJECT (task), "rat-fallback", GINT_TO_POINTER (TRUE));
             set_rat (self, allowed, preferred, (GAsyncReadyCallback) initial_rat_ready, task);
             return;
         }
-        mm_obj_warn (self, "RAT mode not set: %s; the modem keeps its own", error->message);
-    } else if (self->priv->rat_mask) {
+        if (self->priv->rat_known)
+            mm_obj_warn (self, "SIM%u RAT mode not set: %s; no other pair to try, the modem keeps its own "
+                         "(last confirmed here: rat %u prefer_rat %u)",
+                         self->priv->sim_slot, error->message, self->priv->rat_value, self->priv->rat_prefer);
+        else
+            mm_obj_warn (self, "SIM%u RAT mode not set: %s; no other pair to try, the modem keeps its own",
+                         self->priv->sim_slot, error->message);
+        if (g_object_get_data (G_OBJECT (task), "cold-start"))
+            cold_prepare (self, task);
+        else
+            prepare_ims_and_voice (self, task);
+        return;
+    }
+    initial_rat_continue (self, task);
+}
+
+static void
+initial_rat_continue (MMBroadbandModemMtkCcci *self, GTask *task)
+{
+    if (self->priv->rat_mask && self->priv->rat_known) {
         /* enabling: show the mode on D-Bus (the generic init read it before) */
         MmGdbusModem *skeleton = NULL;
         g_object_get (self, MM_IFACE_MODEM_DBUS_SKELETON, &skeleton, NULL);
@@ -2069,7 +3133,10 @@ initial_rat_ready (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GTask *task
             g_object_unref (skeleton);
         }
     }
-    prepare_ims_and_voice (self, task);
+    if (g_object_get_data (G_OBJECT (task), "cold-start"))
+        cold_prepare (self, task);
+    else
+        prepare_ims_and_voice (self, task);
 }
 
 static void
@@ -2081,6 +3148,7 @@ mipc_session_ready (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GTask *tas
         g_object_unref (task);
         return;
     }
+    trace_event (self, trace_slots (self), NULL, "enabling");
     apply_initial_rat (self, task);
 }
 
@@ -2120,14 +3188,19 @@ disabling_stopped (MMBroadbandModem  *_self,
     MMBroadbandModemMtkCcci *self = MM_BROADBAND_MODEM_MTK_CCCI (_self);
 
     mm_mtk_ccci_sms_poll_stop (MM_BASE_MODEM (self));
-    mm_mtk_ccci_ims_stop (self->priv->ims[0]);
-    mm_mtk_ccci_ims_stop (self->priv->ims[1]);
+    reg_read_stop (self);
+    /* this object's stacks only: the other SIM's modem object keeps its own */
+    if (self->priv->served & MM_MIPC_SLOT_SIM1)
+        mm_mtk_ccci_ims_stop (ims_of (self, 1));
+    if (self->priv->served & MM_MIPC_SLOT_SIM2)
+        mm_mtk_ccci_ims_stop (ims_of (self, 2));
     if (self->priv->mipc && self->priv->mipc_opened) {
         /* INTERNAL_CLOSE_REQ is not sent: a new session simply starts with
          * INTERNAL_TEST/OPEN next time, as after a client restart */
         mm_port_mipc_close (self->priv->mipc);
         self->priv->mipc_opened = FALSE;
     }
+    self->priv->rat_session_confirmed = FALSE;
 
     return MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_mtk_ccci_parent_class)->disabling_stopped (_self, error);
 }
@@ -2233,6 +3306,10 @@ initial_power_ready (MMBaseModem *modem, GAsyncResult *res, GTask *task)
         initial_complete (task, error);
         return;
     }
+    /* AT+CFUN? answers for the stack of this object's AT port */
+    mm_mtk_ccci_shared_radio_note (MM_BROADBAND_MODEM_MTK_CCCI (modem)->priv->shared,
+                                   (guint8) (1u << (MM_BROADBAND_MODEM_MTK_CCCI (modem)->priv->sim_slot - 1)),
+                                   state == MM_MODEM_POWER_STATE_ON);
     if (state == MM_MODEM_POWER_STATE_ON) {
         initial_query_pin (task);
         return;
@@ -2240,10 +3317,34 @@ initial_power_ready (MMBaseModem *modem, GAsyncResult *res, GTask *task)
     /* On this firmware CFUN=4 leaves both SIMs inaccessible. IMS must be
      * configured before EFUN, but EFUN must precede generic SIM discovery. */
     mm_obj_msg (modem, "cold start: preparing IMS before powering SIMs for discovery");
+    trace_event (MM_BROADBAND_MODEM_MTK_CCCI (modem), trace_slots (MM_BROADBAND_MODEM_MTK_CCCI (modem)), NULL,
+                 "cold start (radio was off)");
     prepare = g_task_new (modem, NULL, (GAsyncReadyCallback) initial_ims_ready, task);
     g_object_set_data (G_OBJECT (prepare), "cold-start", GINT_TO_POINTER (TRUE));
     /* the RAT mode first, so that the radio camps with it from the start */
     apply_initial_rat (MM_BROADBAND_MODEM_MTK_CCCI (modem), prepare);
+}
+
+/* SIM2 object: its AT port is the slot-2 tunnel channel. Numeric +CME
+ * errors (the port's open-time +CMEE=1 ran before the session existed) and
+ * the slot's URCs on MIPC (+EURCRPT=2, sent by Android's RIL at start)
+ * before anything else; not fatal. */
+static const MMBaseModemAtCommand sim2_channel_sequence[] = {
+    { "+CMEE=1",     5, FALSE, mm_base_modem_response_processor_continue_on_error },
+    { "+EURCRPT=2",  5, FALSE, mm_base_modem_response_processor_continue_on_error },
+    { NULL }
+};
+
+static void
+sim2_channel_ready (MMBaseModem *self, GAsyncResult *res, GTask *task)
+{
+    g_autoptr(GError) error = NULL;
+
+    mm_base_modem_at_sequence_finish (self, res, NULL, &error);
+    if (error)
+        mm_obj_warn (self, "SIM2 AT channel setup: %s", error->message);
+    mm_base_modem_at_command (self, "+CFUN?", 5, FALSE,
+                              (GAsyncReadyCallback) initial_power_ready, task);
 }
 
 static void
@@ -2252,6 +3353,11 @@ initial_session_ready (MMBroadbandModemMtkCcci *self, GAsyncResult *res, GTask *
     GError *error = NULL;
     if (!g_task_propagate_boolean (G_TASK (res), &error)) {
         initial_complete (task, error);
+        return;
+    }
+    if (self->priv->sim2_role) {
+        mm_base_modem_at_sequence (MM_BASE_MODEM (self), sim2_channel_sequence, NULL, NULL,
+                                   (GAsyncReadyCallback) sim2_channel_ready, task);
         return;
     }
     mm_base_modem_at_command (MM_BASE_MODEM (self), "+CFUN?", 5, FALSE,
@@ -2289,6 +3395,12 @@ parent_initialization_ready (MMBroadbandModem *modem, GAsyncResult *res, GTask *
         return;
     }
     g_object_set_data (G_OBJECT (task), "parent-ports", ports);
+    if (self->priv->sim2_role) {
+        /* +ESUO selects the stack of the physical AT port (wwan0at0) only;
+         * the tunnel channel is addressed by the MIPC slot */
+        ensure_session (self, (GAsyncReadyCallback) initial_session_ready, task);
+        return;
+    }
     cmd = g_strdup_printf ("+ESUO=%u", 3 + self->priv->sim_slot);
     mm_base_modem_at_command (MM_BASE_MODEM (self), cmd, 10, FALSE,
                               (GAsyncReadyCallback) initial_stack_ready, task);
@@ -2348,6 +3460,86 @@ mm_broadband_modem_mtk_ccci_new (const gchar  *device,
                          NULL);
 }
 
+MMBroadbandModemMtkCcci *
+mm_broadband_modem_mtk_ccci_new_sim2 (const gchar     *device,
+                                      const gchar     *physdev,
+                                      const gchar    **drivers,
+                                      const gchar     *plugin,
+                                      MMKernelDevice  *anchor,
+                                      GError         **error)
+{
+    MMBroadbandModemMtkCcci         *self;
+    g_autoptr(MMKernelDevice)        kdev = NULL;
+    g_autoptr(MMKernelEventProperties) props = NULL;
+    g_autofree gchar                *mipc_name = NULL;
+    const gchar                     *name;
+
+    /* the MIPC channel of the SIM1 object (Android's data and
+     * control channel, ttyCMIPC1): from the anchor's properties, else
+     * "<wwan device>mipc1" */
+    name = mm_kernel_device_get_property (anchor, ID_MM_MTK_CCCI_MIPC_PORT);
+    if (name && name[0])
+        mipc_name = g_strdup (name);
+    else {
+        const gchar *anchor_name = mm_kernel_device_get_name (anchor);
+        const gchar *p = anchor_name ? strstr (anchor_name, "mipc") : NULL;
+
+        if (!p || p == anchor_name) {
+            g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                         "cannot derive the MIPC port from %s", anchor_name ? anchor_name : "(null)");
+            return NULL;
+        }
+        mipc_name = g_strdup_printf ("%.*smipc1", (gint) (p - anchor_name), anchor_name);
+    }
+
+    self = g_object_new (MM_TYPE_BROADBAND_MODEM_MTK_CCCI,
+                         MM_BASE_MODEM_DEVICE,     device,
+                         MM_BASE_MODEM_PHYSDEV,    physdev,
+                         MM_BASE_MODEM_DRIVERS,    drivers,
+                         MM_BASE_MODEM_PLUGIN,     plugin,
+                         MM_BASE_MODEM_VENDOR_ID,  0,
+                         MM_BASE_MODEM_PRODUCT_ID, 0,
+                         /* the AT port stands in as the data port, see _new() */
+                         MM_BASE_MODEM_DATA_NET_SUPPORTED, TRUE,
+                         MM_BASE_MODEM_DATA_TTY_SUPPORTED, TRUE,
+                         MM_IFACE_MODEM_VOICE_PERIODIC_CALL_LIST_CHECK_DISABLED, FALSE,
+                         NULL);
+    self->priv->sim2_role = TRUE;
+    self->priv->dual = TRUE;
+    self->priv->sim_slot = 2;
+    self->priv->served = MM_MIPC_SLOT_SIM2;
+    self->priv->config_kdev = g_object_ref (anchor);
+    self->priv->shared = mm_mtk_ccci_shared_acquire (mipc_name);
+    self->priv->mipc = g_object_ref (mm_mtk_ccci_shared_peek_mipc (self->priv->shared));
+    g_signal_connect_object (self->priv->mipc, "forced-close", G_CALLBACK (mipc_port_lost), self, 0);
+    g_signal_connect_object (self->priv->mipc, MM_PORT_MIPC_SIGNAL_INDICATION, G_CALLBACK (voice_mipc_indication), self, 0);
+
+    self->priv->bridge = mm_mtk_ccci_at_bridge_new (self->priv->mipc, MM_MIPC_SLOT_SIM2, error);
+    if (!self->priv->bridge) {
+        g_object_unref (self);
+        return NULL;
+    }
+
+    /* the primary AT port: ModemManager's "virtual" (unix socket) AT port,
+     * connected to the bridge (mm-base-modem.c base_modem_create_virtual_port,
+     * mm-port-serial.c "abstract:" addresses) */
+    props = mm_kernel_event_properties_new ();
+    mm_kernel_event_properties_set_action (props, "add");
+    mm_kernel_event_properties_set_subsystem (props, "virtual");
+    mm_kernel_event_properties_set_name (props, mm_mtk_ccci_at_bridge_get_name (self->priv->bridge));
+    kdev = mm_kernel_device_generic_new_with_rules (props, NULL, error);
+    if (!kdev ||
+        !mm_base_modem_grab_port (MM_BASE_MODEM (self), kdev, MM_PORT_GROUP_USED, MM_PORT_TYPE_AT,
+                                  MM_PORT_SERIAL_AT_FLAG_PRIMARY, error)) {
+        g_prefix_error (error, "SIM2 AT port: ");
+        g_object_unref (self);
+        return NULL;
+    }
+    mm_obj_msg (self, "SIM2 modem object: AT port %s over the MIPC tunnel of %s",
+                mm_mtk_ccci_at_bridge_get_name (self->priv->bridge), mipc_name);
+    return self;
+}
+
 static void
 mm_broadband_modem_mtk_ccci_init (MMBroadbandModemMtkCcci *self)
 {
@@ -2355,7 +3547,10 @@ mm_broadband_modem_mtk_ccci_init (MMBroadbandModemMtkCcci *self)
                                               MMBroadbandModemMtkCcciPrivate);
     self->priv->radio_mask     = DEFAULT_RADIO_MASK;
     self->priv->sim_slot       = DEFAULT_SIM_SLOT;
+    self->priv->served         = MM_MIPC_SLOT_SIM1 | MM_MIPC_SLOT_SIM2;
     self->priv->speechd_socket = g_strdup (DEFAULT_SPEECHD_SOCKET);
+    self->priv->start_rat = TRUE;
+    trace_process_marker (self);
 
     /* +ECPI: <call_id>,<msg_type>,<is_ibt>,<is_tch>,<dir>,<call_mode>,"<number>",<type>,"<pau>"[,<cause>] */
     self->priv->ecpi_regex = g_regex_new ("\\r\\n\\+ECPI:\\s*(\\d+),\\s*(\\d+)(?:,\\s*([^\\r\\n]*))?\\r\\n",
@@ -2384,13 +3579,35 @@ dispose (GObject *object)
 
     mm_mtk_ccci_sms_poll_stop (MM_BASE_MODEM (self));
 
-    g_clear_pointer (&self->priv->ims[0], mm_mtk_ccci_ims_free);
-    g_clear_pointer (&self->priv->ims[1], mm_mtk_ccci_ims_free);
+    if (self->priv->trace_timer) {
+        g_source_remove (self->priv->trace_timer);
+        self->priv->trace_timer = 0;
+    }
+    reg_read_stop (self);
+    if (self->priv->mipc) {
+        g_autofree gchar *stamp = mm_mtk_ccci_trace_stamp ();
+        mm_obj_msg (self, "rat-trace %s %s: modem object released (MM stop, reprobe or removal)",
+                    trace_sim_name (trace_slots (self)), stamp);
+    }
+    if (self->priv->trace_skeleton) {
+        g_signal_handlers_disconnect_by_data (self->priv->trace_skeleton, self);
+        g_clear_object (&self->priv->trace_skeleton);
+    }
+    g_clear_pointer (&self->priv->bridge, mm_mtk_ccci_at_bridge_free);
     if (self->priv->mipc && self->priv->mipc_opened) {
         mm_port_mipc_close (self->priv->mipc);
         self->priv->mipc_opened = FALSE;
     }
     g_clear_object (&self->priv->mipc);
+    if (self->priv->shared) {
+        mm_mtk_ccci_shared_unset_voice_client (self->priv->shared, G_OBJECT (self));
+        /* a call of this object can no longer end through it */
+        if (mm_mtk_ccci_shared_speech_get (self->priv->shared) & self->priv->served &&
+            mm_mtk_ccci_shared_speech_update (self->priv->shared, self->priv->served, FALSE) == -1)
+            mm_obj_warn (self, "modem object gone during a call: the voice audio path may stay on");
+        g_clear_object (&self->priv->shared);
+    }
+    g_clear_object (&self->priv->config_kdev);
 
     G_OBJECT_CLASS (mm_broadband_modem_mtk_ccci_parent_class)->dispose (object);
 }
@@ -2402,6 +3619,8 @@ finalize (GObject *object)
 
     g_free (self->priv->wwan_device);
     g_free (self->priv->speechd_socket);
+    if (self->priv->trace_reason)
+        g_string_free (self->priv->trace_reason, TRUE);
     g_regex_unref (self->priv->ecpi_regex);
     g_regex_unref (self->priv->eaic_regex);
     g_regex_unref (self->priv->espeech_regex);
@@ -2435,10 +3654,54 @@ iface_modem_init (MMIfaceModemInterface *iface)
     iface->set_current_modes_finish = modem_set_current_modes_finish;
 }
 
+/* the generic registration reporting setup: on the SIM2 AT port (the slot-2
+ * MIPC AT channel) it sets <n> = 2, so the reject causes (step 6) are set
+ * again after it */
+static gboolean
+modem_3gpp_enable_registration_events_finish (MMIfaceModem3gpp *self, GAsyncResult *res, GError **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+parent_enable_registration_events_ready (MMIfaceModem3gpp *_self, GAsyncResult *res, GTask *task)
+{
+    MMBroadbandModemMtkCcci *self = MM_BROADBAND_MODEM_MTK_CCCI (_self);
+    GError                  *error = NULL;
+
+    if (!iface_modem_3gpp_parent->enable_unsolicited_registration_events_finish (_self, res, &error))
+        g_task_return_error (task, error);
+    else {
+        if (self->priv->bridge && self->priv->shared)
+            mm_mtk_ccci_shared_lte_reg_cause (self->priv->shared, mm_broadband_modem_mtk_ccci_get_mipc_slot (self),
+                                              "after the generic <n> = 2 setting of this SIM's AT port");
+        reg_read_start (self);
+        g_task_return_boolean (task, TRUE);
+    }
+    g_object_unref (task);
+}
+
+static void
+modem_3gpp_enable_registration_events (MMIfaceModem3gpp    *self,
+                                       gboolean             cs_supported,
+                                       gboolean             ps_supported,
+                                       gboolean             eps_supported,
+                                       GAsyncReadyCallback  callback,
+                                       gpointer             user_data)
+{
+    iface_modem_3gpp_parent->enable_unsolicited_registration_events (
+        self, cs_supported, ps_supported, eps_supported,
+        (GAsyncReadyCallback) parent_enable_registration_events_ready,
+        g_task_new (self, NULL, callback, user_data));
+}
+
 static void
 iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface)
 {
     iface_modem_3gpp_parent = g_type_interface_peek_parent (iface);
+
+    iface->enable_unsolicited_registration_events = modem_3gpp_enable_registration_events;
+    iface->enable_unsolicited_registration_events_finish = modem_3gpp_enable_registration_events_finish;
 
     iface->setup_unsolicited_events = modem_3gpp_setup_unsolicited_events;
     iface->setup_unsolicited_events_finish = modem_3gpp_setup_cleanup_unsolicited_events_finish;
@@ -2502,6 +3765,5 @@ mm_broadband_modem_mtk_ccci_class_init (MMBroadbandModemMtkCcciClass *klass)
 gboolean
 mm_broadband_modem_mtk_ccci_ims_owns_link (MMBroadbandModemMtkCcci *self, guint link_id)
 {
-    return mm_mtk_ccci_ims_owns_link (self->priv->ims[0], link_id) ||
-           mm_mtk_ccci_ims_owns_link (self->priv->ims[1], link_id);
+    return self->priv->shared && mm_mtk_ccci_shared_ims_owns_link (self->priv->shared, link_id);
 }

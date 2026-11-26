@@ -3,7 +3,7 @@
 /*
  * MMPortMipc: MIPC control port with independent request and modem-response queues.
  *
- * Written from a clean-room behavioural description of the protocol; no code of the factory firmware was used.
+ * Written from a clean-room behavioural description of the protocol; no code of the phone's Android software was used.
  * A modem command may arrive while a request awaits its confirm; its response
  * must be written without completing or waiting for that request.
  * Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
@@ -55,6 +55,10 @@ struct _MMPortMipcPrivate {
     GByteArray *rx;
     GHashTable *pending;
     GQueue output;
+    /* callers waiting for the session start in flight (NULL: none in flight);
+     * two modem objects (one per SIM, DESIGN.md §11) share this port and may
+     * both ask for the session while it starts */
+    GPtrArray *session_waiters;
 };
 
 static void pending_disarm (Pending *p)
@@ -581,6 +585,29 @@ session_step (GTask *task)
     }
 }
 
+static void
+session_internal_ready (MMPortMipc   *self,
+                        GAsyncResult *res,
+                        gpointer      user_data)
+{
+    g_autoptr(GPtrArray) waiters = NULL;
+    g_autoptr(GError)    error = NULL;
+    guint                i;
+
+    g_task_propagate_boolean (G_TASK (res), &error);
+    /* a completion callback may start the next session: detach first */
+    waiters = g_steal_pointer (&self->priv->session_waiters);
+    for (i = 0; waiters && i < waiters->len; i++) {
+        GTask *task = g_ptr_array_index (waiters, i);
+
+        if (error)
+            g_task_return_error (task, g_error_copy (error));
+        else
+            g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+    }
+}
+
 void
 mm_port_mipc_open_session (MMPortMipc          *self,
                            guint8               slot,
@@ -592,6 +619,7 @@ mm_port_mipc_open_session (MMPortMipc          *self,
                            gpointer             user_data)
 {
     GTask          *task;
+    GTask          *internal;
     SessionContext *ctx;
 
     g_return_if_fail (MM_IS_PORT_MIPC (self));
@@ -605,6 +633,18 @@ mm_port_mipc_open_session (MMPortMipc          *self,
         return;
     }
 
+    /* One session start at a time on the shared port: a second caller
+     * joins the one in flight and gets its result (the indication list and
+     * slot mask are the plugin's constants, the same for every caller). */
+    if (self->priv->session_waiters) {
+        mm_obj_dbg (self, "MIPC session start in progress: joining it");
+        g_ptr_array_add (self->priv->session_waiters, task);
+        return;
+    }
+    self->priv->session_waiters = g_ptr_array_new ();
+    g_ptr_array_add (self->priv->session_waiters, task);
+
+    internal = g_task_new (self, cancellable, (GAsyncReadyCallback) session_internal_ready, NULL);
     ctx = g_slice_new0 (SessionContext);
     ctx->step          = SESSION_STEP_FIRST;
     ctx->slot          = slot;
@@ -627,12 +667,17 @@ mm_port_mipc_open_session (MMPortMipc          *self,
         }
     }
     ctx->client_name   = g_strdup (client_name ? client_name : "ModemManager");
-    g_task_set_task_data (task, ctx, (GDestroyNotify) session_context_free);
+    g_task_set_task_data (internal, ctx, (GDestroyNotify) session_context_free);
 
     self->priv->session_ready = FALSE;
-    session_step (task);
+    session_step (internal);
 }
 
+gboolean
+mm_port_mipc_session_starting (MMPortMipc *self)
+{
+    return self->priv->session_waiters != NULL;
+}
 
 static void removed_cb (MMPort *port, MMPortMipc *self)
 {
