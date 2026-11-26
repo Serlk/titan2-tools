@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Runs niri (tty/DRM backend through seatd) as user atl with a session bus; logs to /host/out/niri.log.
+# GPU: Alpine's aarch64 Mesa has no virgl driver, so the guest renders through zink on the venus
+# Vulkan device (virtio-gpu-gl with venus=on) — real dmabuf/KMS path, like panfrost on the phone.
+# Extra environment for the session (experiments): /host/session.env (out/atl-vm/share/session.env).
+set -u
+U=atl
+UIDN=$(id -u $U)
+RT=/run/user/$UIDN
+mkdir -p -m 700 $RT
+chown $U:$U $RT
+: >/host/out/niri.log
+chown $U:$U /host/out/niri.log 2>/dev/null
+extra=
+[ ! -r /host/session.env ] || extra=$(grep -vE '^\s*(#|$)' /host/session.env | tr '\n' ' ')
+exec su $U -s /bin/sh -c "exec env -i HOME=/home/$U USER=$U LOGNAME=$U SHELL=/bin/sh \
+	PATH=/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=$RT XDG_SESSION_TYPE=wayland XDG_SEAT=seat0 \
+	XDG_VTNR=1 RUST_LOG=niri=info MESA_LOADER_DRIVER_OVERRIDE=zink $extra \
+	dbus-run-session -- niri" >>/host/out/niri.log 2>&1

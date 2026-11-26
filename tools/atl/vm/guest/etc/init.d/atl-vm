@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# ATL VM bench (scripts/atl-vm.sh): host share on /host (9p), niri session as user atl, command agent.
+description="ATL VM bench session"
+
+depend() {
+	need seatd dbus
+	after udev-settle
+}
+
+start() {
+	ebegin "Mounting the host share and starting the niri session"
+	modprobe uinput 2>/dev/null
+	mkdir -p /host
+	mountpoint -q /host || mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 host /host || eend 1 "9p mount failed"
+	mkdir -p /host/out /host/cmd
+	start-stop-daemon --start --background --make-pidfile --pidfile /run/atl-vm.pid \
+		--exec /usr/local/bin/atl-vm-session
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping the niri session"
+	start-stop-daemon --stop --pidfile /run/atl-vm.pid
+	pkill -u atl 2>/dev/null
+	eend 0
+}

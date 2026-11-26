@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+// ATL VM bench: niri config of user atl (tools/atl/vm/guest-niri.kdl). The Titan 2 snippet is the
+// same file the phone image installs; the virtio-gpu output gets the phone's 1440x1440 mode.
+include "/usr/share/titan2/niri/atl.kdl"
+
+output "Virtual-1" {
+    mode "1440x1440"
+    scale 1
+}
+
+spawn-at-startup "atl-vm-agent"
+
+prefer-no-csd
+
+layout {
+    gaps 0
+    focus-ring { off; }
+    border { off; }
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+binds {
+    Mod+Q { close-window; }
+    Mod+Return { spawn "foot"; }
+}

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# ATL VM bench: the session user (group input) injects keys/touches through uinput
+KERNEL=="uinput", GROUP="input", MODE="0660"

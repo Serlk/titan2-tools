@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+"""Inject evdev input through uinput inside the ATL VM (the virtio keyboard of qemu cannot send the
+Titan 2 keys: KEY_PROG3/PROG4/APPSELECT/BACK). Needs /dev/uinput writable (group input).
+
+  atl-vm-input key  CHORD [CHORD...]     press/release; CHORD = code[+code...], e.g. 100+17 (Alt+W), 202+57 (Sym+Space), 158 (Back)
+  atl-vm-input hold CODE SECONDS         hold a key
+  atl-vm-input tap  X Y [X Y...]         touch taps (touchscreen 1440x1440)
+  atl-vm-input swipe X1 Y1 X2 Y2 [MS]    one-finger swipe
+Codes are the Linux KEY_*/evdev numbers (see the device tree keymap); names KEY_* from the small table below work too."""
+import ctypes, fcntl, os, struct, sys, time
+
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+SYN_REPORT = 0
+BTN_TOUCH = 0x14a
+ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0, 1, 0x2f, 0x35, 0x36, 0x39
+INPUT_PROP_DIRECT = 1
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_ABSBIT, UI_SET_PROPBIT = 0x40045564, 0x40045565, 0x40045567, 0x4004556e
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+UI_DEV_SETUP = 0x405c5503
+UI_ABS_SETUP = 0x401c5504
+NAMES = {"BACK": 158, "MENU": 580, "APPSELECT": 580, "SYM": 202, "PROG3": 202, "FN": 203, "PROG4": 203,
+         "ALT": 100, "RIGHTALT": 100, "LEFTALT": 56, "SHIFT": 42, "LEFTSHIFT": 42, "ENTER": 28, "SPACE": 57,
+         "ESC": 1, "TAB": 15, "BACKSPACE": 14, "UP": 103, "DOWN": 108, "LEFT": 105, "RIGHT": 106,
+         "POWER": 116, "VOLUMEUP": 115, "VOLUMEDOWN": 114, "HOME": 172, "LEFTMETA": 125, "CTRL": 29}
+LETTERS = "qwertyuiop"
+for i, c in enumerate("qwertyuiop"): NAMES[c.upper()] = 16 + i
+for i, c in enumerate("asdfghjkl"): NAMES[c.upper()] = 30 + i
+for i, c in enumerate("zxcvbnm"): NAMES[c.upper()] = 44 + i
+for i, c in enumerate("1234567890"): NAMES[c] = 2 + i
+
+
+def code(s):
+    s = s.upper()
+    if s.startswith("KEY_"):
+        s = s[4:]
+    return int(s) if s.isdigit() else NAMES[s]
+
+
+def emit(fd, t, c, v):
+    sec, usec = divmod(time.time(), 1)
+    os.write(fd, struct.pack("llHHi", int(sec), int(usec * 1e6), t, c, v))
+
+
+def syn(fd):
+    emit(fd, EV_SYN, SYN_REPORT, 0)
+
+
+def setup(fd, name):
+    # struct uinput_setup { struct input_id {u16 bustype,vendor,product,version}; char name[80]; u32 ff_effects_max; }
+    buf = struct.pack("HHHH80sI", 0x06, 0x1d6b, 0x0104, 1, name.encode(), 0)
+    fcntl.ioctl(fd, UI_DEV_SETUP, buf)
+
+
+def abs_setup(fd, c, mn, mx):
+    # struct uinput_abs_setup { u16 code; struct input_absinfo {s32 value,minimum,maximum,fuzz,flat,resolution} }
+    fcntl.ioctl(fd, UI_ABS_SETUP, struct.pack("HHiiiiii", c, 0, 0, mn, mx, 0, 0, 0))
+
+
+def keyboard():
+    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+    for k in range(1, 0x2ff):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, k)
+    setup(fd, "Titan 2 keyboard (virtual)")
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    time.sleep(1.5)  # udev + libinput pick the device up
+    return fd
+
+
+def touchscreen():
+    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+    fcntl.ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH)
+    fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
+    fcntl.ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT)
+    for a in (ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID):
+        fcntl.ioctl(fd, UI_SET_ABSBIT, a)
+    setup(fd, "Titan 2 touchscreen (virtual)")
+    for a in (ABS_X, ABS_MT_POSITION_X, ABS_Y, ABS_MT_POSITION_Y):
+        abs_setup(fd, a, 0, 1439)
+    abs_setup(fd, ABS_MT_SLOT, 0, 9)
+    abs_setup(fd, ABS_MT_TRACKING_ID, 0, 65535)
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    time.sleep(1.5)
+    return fd
+
+
+def finish(fd):
+    time.sleep(0.5)
+    fcntl.ioctl(fd, UI_DEV_DESTROY)
+    os.close(fd)
+
+
+def touch_down(fd, tid, x, y):
+    emit(fd, EV_ABS, ABS_MT_SLOT, 0)
+    emit(fd, EV_ABS, ABS_MT_TRACKING_ID, tid)
+    emit(fd, EV_ABS, ABS_MT_POSITION_X, x)
+    emit(fd, EV_ABS, ABS_MT_POSITION_Y, y)
+    emit(fd, EV_KEY, BTN_TOUCH, 1)
+    emit(fd, EV_ABS, ABS_X, x)
+    emit(fd, EV_ABS, ABS_Y, y)
+    syn(fd)
+
+
+def touch_move(fd, x, y):
+    emit(fd, EV_ABS, ABS_MT_POSITION_X, x)
+    emit(fd, EV_ABS, ABS_MT_POSITION_Y, y)
+    emit(fd, EV_ABS, ABS_X, x)
+    emit(fd, EV_ABS, ABS_Y, y)
+    syn(fd)
+
+
+def touch_up(fd):
+    emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1)
+    emit(fd, EV_KEY, BTN_TOUCH, 0)
+    syn(fd)
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        return 2
+    cmd, args = argv[1], argv[2:]
+    if cmd == "key":
+        fd = keyboard()
+        for chord in args:
+            codes = [code(c) for c in chord.split("+")]
+            for c in codes:
+                emit(fd, EV_KEY, c, 1)
+                syn(fd)
+                time.sleep(0.03)
+            time.sleep(0.08)
+            for c in reversed(codes):
+                emit(fd, EV_KEY, c, 0)
+                syn(fd)
+                time.sleep(0.03)
+            time.sleep(0.15)
+        finish(fd)
+    elif cmd == "hold":
+        fd = keyboard()
+        c = code(args[0])
+        emit(fd, EV_KEY, c, 1); syn(fd)
+        time.sleep(float(args[1]))
+        emit(fd, EV_KEY, c, 0); syn(fd)
+        finish(fd)
+    elif cmd == "tap":
+        fd = touchscreen()
+        pts = [int(v) for v in args]
+        tid = 1
+        for x, y in zip(pts[0::2], pts[1::2]):
+            touch_down(fd, tid, x, y)
+            time.sleep(0.08)
+            touch_up(fd)
+            time.sleep(0.3)
+            tid += 1
+        finish(fd)
+    elif cmd == "swipe":
+        fd = touchscreen()
+        x1, y1, x2, y2 = [int(v) for v in args[:4]]
+        ms = int(args[4]) if len(args) > 4 else 300
+        steps = max(5, ms // 16)
+        touch_down(fd, 1, x1, y1)
+        for i in range(1, steps + 1):
+            time.sleep(ms / 1000 / steps)
+            touch_move(fd, x1 + (x2 - x1) * i // steps, y1 + (y2 - y1) * i // steps)
+        touch_up(fd)
+        finish(fd)
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+sys.exit(main(sys.argv))
