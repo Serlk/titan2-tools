@@ -37,7 +37,27 @@ top of the kernel's suspend-to-idle.
 - **One RTC alarm** for everybody: user alarms (`alarm set NAME +SEC|EPOCH [quiet]`; when it
   fires, the `wake-alarm` hook and an event for subscribers, with `ui` `wake_grace_alarm`
   seconds awake) and the maintenance windows; the nearest one is armed before sleep.
-- **Back-off on short sleeps without a reason:** `backoff` 2, 5, 15, 60 s.
+- **Back-off on short sleeps without a reason:** `backoff` 2, 5, 15, 60 s (a sleep shorter than
+  `short_sleep` measured on CLOCK_BOOTTIME, i.e. including the time asleep).
+- **Time asleep:** the log says `resumed after N s asleep (M s in transitions)`: N is CLOCK_BOOTTIME
+  minus CLOCK_MONOTONIC (MONOTONIC stops in suspend), M the entry and exit; `t2-powerctl status`
+  shows `asleep N s (since boot: M s)`: our sleeps and all of the kernel's sleeps since boot.
+- **GPU boost on input:** the GPU governor (panthor devfreq simple_ondemand) raises the clock only
+  after a busy sampling period, so the first frames of a scroll or an animation that starts from an
+  idle GPU run at the lowest clock. On a touch or a key the devfreq `min_freq` is raised to
+  `gpu_boost_hz` for `gpu_boost_ms` (each event extends it), then put back; off while the screen
+  is off; `gpu_boost = no` disables it.
+- **Battery guard** (only while discharging): `battery_low` (15 %) and `battery_critical` (5 %) run
+  their hooks and send `battery low|critical N` to subscribers, once per discharge;
+  `battery_shutdown` (2 %) runs the `battery-shutdown` hooks and `battery_shutdown_cmd`
+  (`/sbin/poweroff`), but only after two readings in a row at that level (one odd fuel-gauge value
+  does not power the phone off). A charger, or `battery_low + 5 %`, resets the levels (`battery-ok`).
+  The battery is read every `battery_poll` seconds (60) while awake and right after every wake-up,
+  so a sleeping phone checks it in its maintenance windows (CLOCK_MONOTONIC stops in s2idle, one
+  poll interval alone would not be enough). `status` has a line
+  `battery N% Status level=ok|low|critical|shutdown`; `battery = no` disables the guard.
+- **Supervision:** the OpenRC service runs under `supervise-daemon` (restart after a crash, at most
+  5 within 10 minutes) and allows a core dump into `/var/crash`.
 - **Power key** (evdev `mtk-pmic-keys`, no grab): a short press runs the `screen-off` /
   `screen-on` hooks (default: `niri msg action power-off/on-monitors` for every niri socket in
   `/run/user/*`). Disabled with `power_key = no` when the desktop takes over the key.
@@ -61,6 +81,8 @@ inhibit NAME [reason]          lease until the connection closes → ok
 block NAME SEC [reason]        lease for a time;  unblock NAME
 screen off|on                  screen state from the compositor (5 s priority over DRM)
 activity                       the user is active (stay awake wake_grace_user s)
+gpu boost [MS]                 raise the GPU min_freq for MS (default gpu_boost_ms); the daemon does this
+                               itself on every touchscreen/keyboard event (gpu_boost in the configuration)
 suspend [force]                sleep now (force: ignore the observed blockers)
 alarm set NAME +SEC|EPOCH [quiet] | alarm clear NAME | alarm list
 subscribe                      event stream: suspend, wake CLASS SOURCES, alarm NAME ui|quiet,
@@ -71,8 +93,9 @@ reload                         re-read the configuration
 
 Hooks (`/etc/t2-powerd/hooks/<name>` or `<name>.d/*`): `pre-suspend`, `post-resume`,
 `wake-user`, `wake-modem`, `wake-alarm`, `wake-other`, `maintenance`, `screen-off`,
-`screen-on`. Environment: `T2_WAKE_CLASS`, `T2_WAKE_SOURCES`, `T2_WAKE_SPM`, `T2_SLEPT_MS`,
-`T2_ALARM`, `T2_MAINTENANCE_LEVEL`.
+`screen-on`, `battery-low`, `battery-critical`, `battery-shutdown`, `battery-ok`. Environment:
+`T2_WAKE_CLASS`, `T2_WAKE_SOURCES`, `T2_WAKE_SPM`, `T2_SLEPT_MS`, `T2_ALARM`,
+`T2_MAINTENANCE_LEVEL`, `T2_BATTERY_CAPACITY`, `T2_BATTERY_STATUS`, `T2_BATTERY_LEVEL`.
 
 ## Build
 

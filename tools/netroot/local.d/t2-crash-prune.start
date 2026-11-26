@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: /var/crash holds the core dumps of crashed services (sysctl.d/70-titan2-coredump.conf).
+# A core of ModemManager is tens of megabytes: keep only the newest T2_CRASH_KEEP (5) so a crash
+# loop at night cannot fill the root file system. T2_CRASH_KEEP in /etc/conf.d/local.
+: ${T2_CRASH_KEEP:=5}
+d=/var/crash
+mkdir -p "$d"
+chmod 1777 "$d"
+# newest first; everything after the first T2_CRASH_KEEP goes
+ls -1t "$d"/core.* 2>/dev/null | tail -n +$((T2_CRASH_KEEP + 1)) | while IFS= read -r f; do
+	rm -f "$f"
+done
+n=$(ls -1 "$d"/core.* 2>/dev/null | wc -l)
+[ "$n" -gt 0 ] && logger -t t2-crash-prune "$n core dump(s) in $d (ls -lt $d)"
+exit 0

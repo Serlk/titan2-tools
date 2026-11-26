@@ -17,7 +17,14 @@ description="Titan 2 voice-call speech control"
 
 command=/usr/local/bin/t2-speechd
 command_args="${T2_SPEECHD_ARGS:--v} -r $T2_SPEECHD_CODEC_ROUTES -s $T2_SPEECHD_SOCK -d /dev/ccci_aud"
-command_background=yes
+# supervise-daemon restarts it when it dies (an unattended phone must keep this service); a
+# crash loop gives up after respawn_max deaths within respawn_period seconds
+supervisor=supervise-daemon
+respawn_delay=2
+respawn_max=5
+respawn_period=600
+# a crash leaves a core in /var/crash (sysctl.d/70-titan2-coredump.conf) for a stack trace
+rc_ulimit="-c unlimited"
 pidfile=/run/t2-speechd.pid
 output_log="$T2_SPEECHD_LOG"
 error_log="$T2_SPEECHD_LOG"

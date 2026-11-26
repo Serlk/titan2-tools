@@ -14,7 +14,14 @@ description="Titan 2 system sleep broker"
 
 command=/usr/local/bin/t2-powerd
 command_args="$T2_POWERD_ARGS"
-command_background=yes
+# supervise-daemon restarts it when it dies (an unattended phone must keep this service); a
+# crash loop gives up after respawn_max deaths within respawn_period seconds
+supervisor=supervise-daemon
+respawn_delay=2
+respawn_max=5
+respawn_period=600
+# a crash leaves a core in /var/crash (sysctl.d/70-titan2-coredump.conf) for a stack trace
+rc_ulimit="-c unlimited"
 pidfile=/run/t2-powerd.pid
 
 depend() {

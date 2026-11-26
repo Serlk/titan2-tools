@@ -69,6 +69,7 @@
 #define MAX_CALLS 8
 #define MAX_WS 128
 #define MAX_INTERVALS 8
+#define MAX_INPUTS 8
 #define LINE_MAX_LEN 512
 
 /* ---- configuration ----------------------------------------------------- */
@@ -103,7 +104,20 @@ struct config {
 	int hook_timeout;
 	bool dbus_modem;
 	bool dry_run;			/* never write /sys/power/state */
+	int dry_run_asleep;		/* s: a dry run counts this as time suspended (tests) */
 	int log_level;
+	/* GPU boost on input: devfreq min_freq raised for gpu_boost_ms after a touch or a key */
+	bool gpu_boost;
+	int gpu_boost_ms;
+	long gpu_boost_hz;
+	char gpu_boost_devices[256];	/* substrings of evdev device names */
+	char gpu_devfreq[PATH_MAX];
+	/* battery guard: hooks at battery_low/critical, a shutdown at battery_shutdown */
+	bool battery;
+	char battery_supply[64];	/* /sys/class/power_supply/<name>, empty = the first "Battery" */
+	int battery_low, battery_critical, battery_shutdown;	/* %, 0 = that level off */
+	int battery_poll;		/* s between readings while awake */
+	char battery_shutdown_cmd[PATH_MAX];	/* run at battery_shutdown, empty = hooks only */
 	char class_user[256];
 	char class_modem[256];
 	char class_network[256];
@@ -138,6 +152,17 @@ static struct config cfg = {
 	.hook_timeout = 60,
 	.dbus_modem = true,
 	.log_level = LOG_INFO,
+	.gpu_boost = true,
+	.gpu_boost_ms = 400,
+	.gpu_boost_hz = 664000000,
+	.gpu_boost_devices = "Synaptics,TitanKey,keyboard,keypad,aw9523,mtk-kpd",
+	.gpu_devfreq = "/sys/class/devfreq/13000000.gpu",
+	.battery = true,
+	.battery_low = 15,
+	.battery_critical = 5,
+	.battery_shutdown = 2,
+	.battery_poll = 60,
+	.battery_shutdown_cmd = "/sbin/poweroff",
 	.class_user = "gpio-keys,keys,keypad,keyboard,aw9523,focaltech,fingerprint,touch",
 	.class_modem = "mddriver,ccci,modem",
 	.class_network = "wifi,wlan,mt7921,bt@,btmtkbgf,bluetooth",
@@ -189,7 +214,7 @@ struct ws_count {
 struct state {
 	/* screen */
 	bool screen_off;
-	struct timespec screen_off_since;
+	struct timespec screen_off_since;	/* BOOTTIME */
 	bool screen_from_socket;	/* the compositor tells us */
 	struct timespec screen_socket_at;
 	char connector_path[PATH_MAX];
@@ -201,6 +226,25 @@ struct state {
 	int listen_fd;
 	int key_fd;
 	struct timespec key_down;
+
+	/* GPU boost on input */
+	int in_fds[MAX_INPUTS];
+	int n_in;
+	struct timespec in_scan;	/* last scan for input devices */
+	bool gpu_boosted;
+	struct timespec gpu_boost_until;
+	char gpu_min_saved[32];		/* devfreq min_freq before the boost */
+	bool gpu_boost_broken;		/* min_freq not writable: logged once, boost off */
+	unsigned long gpu_boosts;
+
+	/* battery guard */
+	char battery_path[PATH_MAX];	/* /sys/class/power_supply/<name>, empty = not found yet */
+	int battery_capacity;		/* %, -1 unknown */
+	char battery_status[32];
+	int battery_level;		/* 0 ok, 1 low, 2 critical, 3 shutdown */
+	int battery_shutdown_hits;	/* readings in a row at the shutdown level */
+	struct timespec battery_checked;
+	bool battery_check_due;		/* read now (after a resume) */
 
 	/* modem */
 	struct call calls[MAX_CALLS];
@@ -220,7 +264,9 @@ struct state {
 	char last_sources[256];
 	char last_spm[256];
 	unsigned long last_slept_ms;
-	time_t last_resume;
+	time_t last_resume;		/* REALTIME, for the status */
+	struct timespec last_resume_boot; /* BOOTTIME: "right after a wake-up" */
+	double asleep_total;		/* s suspended (BOOTTIME minus MONOTONIC) by our suspends */
 	long kernel_suspends;		/* /sys/power/suspend_stats/success seen, -1 unknown */
 	struct ws_count ws[MAX_WS];
 	int n_ws;
@@ -254,7 +300,15 @@ static void logmsg(int prio, const char *fmt, ...)
 #define LOGI(...) logmsg(LOG_INFO, __VA_ARGS__)
 #define LOGD(...) logmsg(LOG_DEBUG, __VA_ARGS__)
 
+/*
+ * Clocks: CLOCK_MONOTONIC stands still while the system is suspended (s2idle
+ * too), CLOCK_BOOTTIME runs on. Intervals measured while awake (leases, the
+ * awake-until deadline, the maintenance window, retries, key presses) use
+ * MONOTONIC; anything that spans a suspend (how long we slept, "since the
+ * screen went off", "right after a wake-up") uses BOOTTIME.
+ */
 static void now_mono(struct timespec *ts) { clock_gettime(CLOCK_MONOTONIC, ts); }
+static void now_boot(struct timespec *ts) { clock_gettime(CLOCK_BOOTTIME, ts); }
 static double ts_diff(const struct timespec *a, const struct timespec *b)
 {
 	return (a->tv_sec - b->tv_sec) + (a->tv_nsec - b->tv_nsec) / 1e9;
@@ -264,6 +318,13 @@ static double since(const struct timespec *ts)
 	struct timespec n;
 
 	now_mono(&n);
+	return ts_diff(&n, ts);
+}
+static double since_boot(const struct timespec *ts)
+{
+	struct timespec n;
+
+	now_boot(&n);
 	return ts_diff(&n, ts);
 }
 static void in_seconds(struct timespec *ts, int s)
@@ -396,6 +457,22 @@ static int load_config(const char *p)
 		SET_INT("hook_timeout", hook_timeout)
 		SET_BOOL("dbus_modem", dbus_modem)
 		SET_BOOL("dry_run", dry_run)
+		SET_INT("dry_run_asleep", dry_run_asleep)
+		SET_BOOL("gpu_boost", gpu_boost)
+		SET_INT("gpu_boost_ms", gpu_boost_ms)
+		SET_STR("gpu_boost_devices", gpu_boost_devices)
+		SET_STR("gpu_devfreq", gpu_devfreq)
+		if (!strcmp(k, "gpu_boost_hz")) {
+			cfg.gpu_boost_hz = atol(v);
+			continue;
+		}
+		SET_BOOL("battery", battery)
+		SET_STR("battery_supply", battery_supply)
+		SET_INT("battery_low", battery_low)
+		SET_INT("battery_critical", battery_critical)
+		SET_INT("battery_shutdown", battery_shutdown)
+		SET_INT("battery_poll", battery_poll)
+		SET_STR("battery_shutdown_cmd", battery_shutdown_cmd)
 		SET_STR("rtc", rtc)
 		SET_STR("connector", connector)
 		SET_STR("socket", sock_path)
@@ -498,6 +575,142 @@ static int run_hooks(const char *name, int timeout_s)
 	return ran;
 }
 
+/* ---- battery ------------------------------------------------------------ */
+
+static void broadcast(const char *fmt, ...);
+
+/*
+ * A phone left alone must not run its battery down to nothing: the fuel
+ * gauge loses its calibration, the kernel and the file systems get no
+ * clean stop, and a dead phone misses the morning alarm. While the battery
+ * discharges, the hooks battery-low and battery-critical run once each at
+ * their levels (the desktop shows the warning, a hook may stop services),
+ * and at battery_shutdown the battery-shutdown hooks run and
+ * battery_shutdown_cmd is executed -- after two readings in a row at that
+ * level, so one odd value from the gauge does not switch the phone off.
+ * A charger, or a few percent more, resets the levels. The battery is read
+ * every battery_poll seconds while awake and right after every wake-up: a
+ * sleeping phone checks it in its maintenance windows (CLOCK_MONOTONIC
+ * stands still in s2idle, so the poll interval alone would not do).
+ */
+static const char * const battery_level_names[] = { "ok", "low", "critical", "shutdown" };
+
+static void find_battery(void)
+{
+	const char *base = "/sys/class/power_supply";
+	DIR *dir;
+	struct dirent *de;
+
+	st.battery_path[0] = 0;
+	if (cfg.battery_supply[0]) {
+		snprintf(st.battery_path, sizeof(st.battery_path), "%s/%s", base,
+			 cfg.battery_supply);
+		return;
+	}
+	dir = opendir(path(base));
+	if (!dir)
+		return;
+	while ((de = readdir(dir))) {
+		char p[PATH_MAX], type[32];
+
+		if (de->d_name[0] == '.')
+			continue;
+		snprintf(p, sizeof(p), "%s/%s/type", base, de->d_name);
+		if (read_file(p, type, sizeof(type)) > 0 && !strcmp(type, "Battery")) {
+			snprintf(st.battery_path, sizeof(st.battery_path), "%s/%s", base,
+				 de->d_name);
+			break;
+		}
+	}
+	closedir(dir);
+}
+
+static void battery_env(int level)
+{
+	char b[16];
+
+	snprintf(b, sizeof(b), "%d", st.battery_capacity);
+	setenv("T2_BATTERY_CAPACITY", b, 1);
+	setenv("T2_BATTERY_STATUS", st.battery_status, 1);
+	setenv("T2_BATTERY_LEVEL", battery_level_names[level], 1);
+}
+
+static void battery_check(void)
+{
+	char p[PATH_MAX], b[32];
+	int cap, level;
+	bool discharging;
+
+	if (!cfg.battery)
+		return;
+	if (!st.battery_check_due && !ts_zero(&st.battery_checked) &&
+	    since(&st.battery_checked) < cfg.battery_poll)
+		return;
+	st.battery_check_due = false;
+	now_mono(&st.battery_checked);
+	if (!st.battery_path[0]) {
+		find_battery();
+		if (!st.battery_path[0])
+			return;	/* no battery (yet): a bench board, the gauge driver not loaded */
+		LOGI("battery: %s", st.battery_path);
+	}
+	snprintf(p, sizeof(p), "%s/capacity", st.battery_path);
+	if (read_file(p, b, sizeof(b)) <= 0) {
+		st.battery_capacity = -1;
+		return;
+	}
+	cap = atoi(b);
+	snprintf(p, sizeof(p), "%s/status", st.battery_path);
+	if (read_file(p, st.battery_status, sizeof(st.battery_status)) <= 0)
+		snprintf(st.battery_status, sizeof(st.battery_status), "Unknown");
+	st.battery_capacity = cap;
+	discharging = !strcmp(st.battery_status, "Discharging");
+
+	if (!discharging || cap > cfg.battery_low + 5) {
+		st.battery_shutdown_hits = 0;
+		if (st.battery_level) {
+			LOGI("battery %d%% (%s): back to normal", cap, st.battery_status);
+			st.battery_level = 0;
+			battery_env(0);
+			run_hooks("battery-ok", cfg.hook_timeout);
+			broadcast("battery ok %d", cap);
+		}
+		return;
+	}
+	level = cfg.battery_shutdown > 0 && cap <= cfg.battery_shutdown ? 3 :
+		cfg.battery_critical > 0 && cap <= cfg.battery_critical ? 2 :
+		cfg.battery_low > 0 && cap <= cfg.battery_low ? 1 : 0;
+	if (level < 3)
+		st.battery_shutdown_hits = 0;
+	while (st.battery_level < level) {
+		int next = st.battery_level + 1;
+
+		if (next == 3 && ++st.battery_shutdown_hits < 2) {
+			LOGW("battery %d%% (%s): at the shutdown level, confirming at the next reading",
+			     cap, st.battery_status);
+			break;
+		}
+		st.battery_level = next;
+		battery_env(next);
+		LOGW("battery %d%% (%s): %s", cap, st.battery_status, battery_level_names[next]);
+		broadcast("battery %s %d", battery_level_names[next], cap);
+		if (next == 1) {
+			run_hooks("battery-low", cfg.hook_timeout);
+		} else if (next == 2) {
+			run_hooks("battery-critical", cfg.hook_timeout);
+		} else {
+			run_hooks("battery-shutdown", cfg.hook_timeout);
+			if (cfg.battery_shutdown_cmd[0]) {
+				char *argv[] = { cfg.battery_shutdown_cmd, NULL };
+
+				LOGW("battery: running %s", cfg.battery_shutdown_cmd);
+				sync();
+				run_one(cfg.battery_shutdown_cmd, argv, cfg.hook_timeout);
+			}
+		}
+	}
+}
+
 /* ---- screen --------------------------------------------------------------- */
 
 static void find_connector(void)
@@ -530,14 +743,12 @@ static void find_connector(void)
 		LOGW("no connected DRM connector: screen state only from the socket");
 }
 
-static void broadcast(const char *fmt, ...);
-
 static void set_screen(bool off, const char *how)
 {
 	if (off == st.screen_off)
 		return;
 	st.screen_off = off;
-	now_mono(&st.screen_off_since);
+	now_boot(&st.screen_off_since);
 	LOGI("screen %s (%s)", off ? "off" : "on", how);
 	/* subscribers (t2-fpd: the fingerprint HAL arms the sensor only with the panel on) */
 	broadcast("screen %s", off ? "off" : "on");
@@ -984,9 +1195,12 @@ static void status_text(struct client *c)
 
 	client_send(c, "state %s\n", st.screen_off ? "screen-off" : "awake");
 	client_send(c, "screen %s since %.0f s (%s)\n", st.screen_off ? "off" : "on",
-		    since(&st.screen_off_since), st.screen_from_socket ? "socket" : "drm");
+		    since_boot(&st.screen_off_since), st.screen_from_socket ? "socket" : "drm");
 	client_send(c, "blocker %s\n", blk ? blk : "none");
 	client_send(c, "suspend_delay %d\n", cfg.suspend_delay);
+	client_send(c, "gpu_boost %s inputs=%d boosts=%lu\n",
+		    !cfg.gpu_boost ? "off" : st.gpu_boost_broken ? "broken" :
+		    st.gpu_boosted ? "active" : "armed", st.n_in, st.gpu_boosts);
 	for (i = 0; i < MAX_LEASES; i++)
 		if (st.leases[i].used)
 			client_send(c, "lease %s client=%d %s%s\n", st.leases[i].name,
@@ -1008,8 +1222,20 @@ static void status_text(struct client *c)
 	client_send(c, "rtc_armed %ld %s\n", (long)st.armed_alarm, st.armed_name);
 	client_send(c, "next_user_alarm %ld\n", a ? (long)a->when : 0L);
 	client_send(c, "mm %s\n", st.mm_ok ? "connected" : "off");
+	if (cfg.battery)
+		client_send(c, "battery %d%% %s level=%s\n", st.battery_capacity,
+			    st.battery_status[0] ? st.battery_status : "unknown",
+			    battery_level_names[st.battery_level]);
 	client_send(c, "suspends %lu failed %lu backoff %d\n", st.suspends, st.suspend_fail,
 		    st.backoff_level);
+	{
+		struct timespec m, bt;
+
+		now_mono(&m);
+		now_boot(&bt);
+		/* ours, and all the kernel's since boot (BOOTTIME minus MONOTONIC) */
+		client_send(c, "asleep %.0f s (since boot: %.0f s)\n", st.asleep_total, ts_diff(&bt, &m));
+	}
 	client_send(c, "wakes user=%lu modem=%lu network=%lu alarm=%lu maintenance=%lu other=%lu\n",
 		    st.wakes[WAKE_USER], st.wakes[WAKE_MODEM], st.wakes[WAKE_NETWORK],
 		    st.wakes[WAKE_ALARM], st.wakes[WAKE_MAINTENANCE], st.wakes[WAKE_OTHER]);
@@ -1035,6 +1261,7 @@ static void write_status_file(void)
 
 static int do_suspend(bool force);
 static long kernel_suspend_count(void);
+static void gpu_boost_start(int ms, const char *how);
 
 static void handle_command(int idx, char *line)
 {
@@ -1071,6 +1298,13 @@ static void handle_command(int idx, char *line)
 		in_seconds(&st.awake_until, cfg.wake_grace_user);
 		snprintf(st.awake_reason, sizeof(st.awake_reason), "activity");
 		client_send(c, "ok\n");
+	} else if (!strcmp(cmd, "gpu") && a1 && !strcmp(a1, "boost")) {
+		if (!cfg.gpu_boost || st.gpu_boost_broken) {
+			client_send(c, "error: gpu boost off\n");
+		} else {
+			gpu_boost_start(a2 ? atoi(a2) : 0, "socket");
+			client_send(c, st.gpu_boosted ? "ok\n" : "error: screen off\n");
+		}
 	} else if (!strcmp(cmd, "suspend")) {
 		int r = do_suspend(a1 && !strcmp(a1, "force"));
 
@@ -1131,6 +1365,8 @@ static void handle_command(int idx, char *line)
 		client_send(c, "ok\n");
 	} else if (!strcmp(cmd, "reload")) {
 		load_config(cfg.conf_path);
+		st.battery_path[0] = 0;	/* battery_supply may have changed */
+		st.battery_check_due = true;
 		client_send(c, "ok\n");
 	} else if (!strcmp(cmd, "quit")) {
 		client_close(idx);
@@ -1235,7 +1471,8 @@ static void read_power_key(void)
 			if (held > 0.8)
 				continue;	/* long press: not ours */
 			/* a short press right after a wake-up woke us: screen on */
-			if (st.screen_off || (st.last_resume && time(NULL) - st.last_resume < 2)) {
+			if (st.screen_off ||
+			    (!ts_zero(&st.last_resume_boot) && since_boot(&st.last_resume_boot) < 2)) {
 				LOGI("power key: screen on");
 				run_hooks("screen-on", cfg.hook_timeout);
 				set_screen(false, "power key");
@@ -1246,6 +1483,146 @@ static void read_power_key(void)
 			}
 		}
 	}
+}
+
+/* ---- GPU boost on input -------------------------------------------------------
+ *
+ * The GPU governor (panthor devfreq, simple_ondemand) samples the load every
+ * polling_interval ms and raises the clock only after a busy period; the first
+ * frames of a scroll or an animation that starts from an idle GPU (265 MHz,
+ * runtime suspended) are rendered at the lowest clock and miss their TE. The
+ * phone's own input (touch screen, keyboard) is the earliest sign that frames
+ * are coming: raise devfreq min_freq to gpu_boost_hz for gpu_boost_ms (every
+ * event extends it), then put the previous min_freq back. The governor stays in
+ * charge above the floor. Nothing is done while the screen is off, and a
+ * min_freq that cannot be written switches the feature off for this run.
+ * "gpu boost [MS]" on the socket does the same for a compositor or a launcher.
+ */
+
+static void open_input_devices(void)
+{
+	glob_t g;
+	size_t i;
+	char pat[PATH_MAX], name[128];
+
+	if (since(&st.in_scan) < 10 && !ts_zero(&st.in_scan))
+		return;
+	now_mono(&st.in_scan);
+	snprintf(pat, sizeof(pat), "%s/dev/input/event*", cfg.root);
+	if (glob(pat, 0, NULL, &g))
+		return;
+	for (i = 0; i < g.gl_pathc && st.n_in < MAX_INPUTS; i++) {
+		int f, j;
+		bool have = false;
+
+		/* already open (same path)? the fd table keeps the paths' order by node */
+		f = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (f < 0)
+			continue;
+		if (ioctl(f, EVIOCGNAME(sizeof(name)), name) <= 0 ||
+		    !list_has(cfg.gpu_boost_devices, name)) {
+			close(f);
+			continue;
+		}
+		for (j = 0; j < st.n_in; j++) {
+			struct stat a, b;
+
+			if (!fstat(st.in_fds[j], &a) && !fstat(f, &b) && a.st_rdev == b.st_rdev)
+				have = true;
+		}
+		if (have) {
+			close(f);
+			continue;
+		}
+		LOGI("gpu boost: input %s (%s)", g.gl_pathv[i], name);
+		st.in_fds[st.n_in++] = f;
+	}
+	globfree(&g);
+}
+
+static void gpu_boost_end(void)
+{
+	char p[PATH_MAX];
+
+	if (!st.gpu_boosted)
+		return;
+	st.gpu_boosted = false;
+	snprintf(p, sizeof(p), "%s/min_freq", cfg.gpu_devfreq);
+	if (write_file(p, st.gpu_min_saved) < 0)
+		LOGW("gpu boost: cannot restore min_freq %s", st.gpu_min_saved);
+}
+
+static void gpu_boost_start(int ms, const char *how)
+{
+	char p[PATH_MAX], val[32];
+	int r;
+
+	if (!cfg.gpu_boost || st.gpu_boost_broken || st.screen_off)
+		return;
+	if (ms <= 0)
+		ms = cfg.gpu_boost_ms;
+	now_mono(&st.gpu_boost_until);
+	st.gpu_boost_until.tv_nsec += (long)(ms % 1000) * 1000000L;
+	st.gpu_boost_until.tv_sec += ms / 1000 + st.gpu_boost_until.tv_nsec / 1000000000L;
+	st.gpu_boost_until.tv_nsec %= 1000000000L;
+	if (st.gpu_boosted)
+		return;
+	snprintf(p, sizeof(p), "%s/min_freq", cfg.gpu_devfreq);
+	r = read_file(p, st.gpu_min_saved, sizeof(st.gpu_min_saved));
+	if (r <= 0) {
+		st.gpu_boost_broken = true;
+		LOGW("gpu boost: no %s (%s), feature off", p, strerror(r < 0 ? -r : EINVAL));
+		return;
+	}
+	snprintf(val, sizeof(val), "%ld", cfg.gpu_boost_hz);
+	if (write_file(p, val) < 0) {
+		st.gpu_boost_broken = true;
+		LOGW("gpu boost: cannot write %s to %s, feature off", val, p);
+		return;
+	}
+	st.gpu_boosted = true;
+	st.gpu_boosts++;
+	LOGD("gpu boost: min_freq %s for %d ms (%s)", val, ms, how);
+}
+
+/* the poll timeout: the configured period, or sooner if a boost expires */
+static int gpu_boost_poll_ms(int poll_ms)
+{
+	double left;
+
+	if (!st.gpu_boosted)
+		return poll_ms;
+	left = -since(&st.gpu_boost_until);
+	if (left <= 0) {
+		gpu_boost_end();
+		return poll_ms;
+	}
+	if (left * 1000 < poll_ms)
+		return (int)(left * 1000) + 1;
+	return poll_ms;
+}
+
+static void read_input(int i)
+{
+	struct input_event ev[32];
+	ssize_t r = read(st.in_fds[i], ev, sizeof(ev));
+	size_t k;
+	bool input = false;
+
+	if (r <= 0) {
+		if (r < 0 && errno != EAGAIN) {
+			/* the device went away (rescan picks it up again) */
+			close(st.in_fds[i]);
+			st.in_fds[i] = st.in_fds[--st.n_in];
+			memset(&st.in_scan, 0, sizeof(st.in_scan));
+		}
+		return;
+	}
+	for (k = 0; k < (size_t)r / sizeof(ev[0]); k++)
+		if (ev[k].type == EV_KEY || ev[k].type == EV_ABS || ev[k].type == EV_REL)
+			input = true;
+	if (input)
+		gpu_boost_start(0, "input");
 }
 
 /* ---- ModemManager over D-Bus ---------------------------------------------- */
@@ -1532,7 +1909,8 @@ static int do_suspend(bool force)
 	enum wake_class cls;
 	bool alarm_due, maint_due, deepest;
 	unsigned long slept_ms;
-	struct timespec t0, t1;
+	struct timespec t0, t1, b0, b1;
+	double total, transitions, asleep;
 	int r;
 
 	if (blk) {
@@ -1562,6 +1940,7 @@ static int do_suspend(bool force)
 	broadcast("suspend");
 	write_status_file();
 	now_mono(&t0);
+	now_boot(&b0);
 	if (cfg.dry_run) {
 		LOGI("dry run: not writing /sys/power/state");
 		sleep(2);	/* room for a fake wake-up source to fire */
@@ -1570,7 +1949,18 @@ static int do_suspend(bool force)
 		r = write_file("/sys/power/state", "mem");
 	}
 	now_mono(&t1);
+	now_boot(&b1);
+	if (cfg.dry_run)
+		b1.tv_sec += cfg.dry_run_asleep;
 	st.last_resume = time(NULL);
+	now_boot(&st.last_resume_boot);	/* the real clock, also in a dry run */
+	/* BOOTTIME runs on in suspend, MONOTONIC does not: the difference is the
+	 * time asleep, MONOTONIC alone the time entering and leaving it */
+	total = ts_diff(&b1, &b0);
+	transitions = ts_diff(&t1, &t0);
+	asleep = total > transitions ? total - transitions : 0;
+	if (!r)
+		st.asleep_total += asleep;
 	if (r) {
 		st.suspend_fail++;
 		LOGW("suspend failed: %s", strerror(-r));
@@ -1591,8 +1981,8 @@ static int do_suspend(bool force)
 		 sources[0] && irq[0] ? " " : "", irq);
 	snprintf(st.last_spm, sizeof(st.last_spm), "%s", spm);
 	st.last_slept_ms = slept_ms;
-	LOGI("resumed after %.1f s: %s wake (sources: %s; spm: %s; slept %lu ms, deepest %s)",
-	     ts_diff(&t1, &t0), wake_class_names[cls], st.last_sources[0] ? st.last_sources : "-",
+	LOGI("resumed after %.1f s asleep (%.1f s in transitions): %s wake (sources: %s; spm: %s; slept %lu ms, deepest %s)",
+	     asleep, transitions, wake_class_names[cls], st.last_sources[0] ? st.last_sources : "-",
 	     spm[0] ? spm : "-", slept_ms, deepest ? "yes" : "no");
 	broadcast("wake %s %s", wake_class_names[cls], st.last_sources);
 
@@ -1603,8 +1993,10 @@ static int do_suspend(bool force)
 	setenv("T2_SLEPT_MS", b, 1);
 	run_hooks("post-resume", cfg.hook_timeout);
 
-	/* an unexplained short sleep: back off before trying again */
-	if (!r && cls == WAKE_OTHER && !sources[0] && ts_diff(&t1, &t0) < cfg.short_sleep) {
+	/* an unexplained short sleep: back off before trying again. The whole
+	 * span on BOOTTIME: on MONOTONIC every sleep looked short (it stands
+	 * still in suspend), so the back-off also grew after long sleeps */
+	if (!r && cls == WAKE_OTHER && !sources[0] && total < cfg.short_sleep) {
 		if (st.backoff_level + 1 < cfg.n_backoff)
 			st.backoff_level++;
 	} else if (!r) {
@@ -1652,6 +2044,7 @@ static int do_suspend(bool force)
 		break;
 	}
 	fire_alarms();
+	st.battery_check_due = true;
 	if (r == -EBUSY || r == -EINVAL)
 		r = 0;	/* aborted by a wakeup event: a wake, not an error */
 	write_status_file();
@@ -1680,6 +2073,7 @@ static void poll_foreign_resume(void)
 		return;
 	if (st.kernel_suspends >= 0) {
 		st.last_resume = time(NULL);
+		now_boot(&st.last_resume_boot);
 		LOGI("resume from a suspend not done by t2-powerd (%ld kernel suspends)", n);
 	}
 	st.kernel_suspends = n;
@@ -1689,7 +2083,7 @@ static void poll_foreign_resume(void)
 
 static void loop(void)
 {
-	struct pollfd pfd[MAX_CLIENTS + 3];
+	struct pollfd pfd[MAX_CLIENTS + MAX_INPUTS + 3];
 	int i, n, fd;
 
 	while (!stop_flag) {
@@ -1701,10 +2095,15 @@ static void loop(void)
 		poll_screen();
 		poll_foreign_resume();
 		fire_alarms();
+		battery_check();
 		if (cfg.power_key && st.key_fd < 0)
 			st.key_fd = open_power_key();
+		if (cfg.gpu_boost && !st.gpu_boost_broken)
+			open_input_devices();
+		if (st.screen_off)
+			gpu_boost_end();
 
-		if (st.screen_off && since(&st.screen_off_since) >= cfg.suspend_delay) {
+		if (st.screen_off && since_boot(&st.screen_off_since) >= cfg.suspend_delay) {
 			blk = blocker(b, sizeof(b));
 			if (!blk)
 				do_suspend(false);
@@ -1724,12 +2123,16 @@ static void loop(void)
 			pfd[n].fd = st.key_fd;
 			pfd[n++].events = POLLIN;
 		}
+		for (i = 0; i < st.n_in; i++) {
+			pfd[n].fd = st.in_fds[i];
+			pfd[n++].events = POLLIN;
+		}
 		for (i = 0; i < MAX_CLIENTS; i++)
 			if (st.clients[i].fd >= 0) {
 				pfd[n].fd = st.clients[i].fd;
 				pfd[n++].events = POLLIN;
 			}
-		if (poll(pfd, n, cfg.poll_ms) < 0) {
+		if (poll(pfd, n, gpu_boost_poll_ms(cfg.poll_ms)) < 0) {
 			if (errno == EINTR)
 				continue;
 			LOGE("poll: %s", strerror(errno));
@@ -1759,7 +2162,16 @@ static void loop(void)
 				read_power_key();
 			} else {
 				int j;
+				bool is_input = false;
 
+				for (j = 0; j < st.n_in; j++)
+					if (st.in_fds[j] == pfd[i].fd) {
+						read_input(j);
+						is_input = true;
+						break;
+					}
+				if (is_input)
+					continue;
 				for (j = 0; j < MAX_CLIENTS; j++)
 					if (st.clients[j].fd == pfd[i].fd) {
 						client_read(j);
@@ -1768,7 +2180,9 @@ static void loop(void)
 			}
 		}
 		mm_poll();
+		gpu_boost_poll_ms(cfg.poll_ms);	/* expire a boost */
 	}
+	gpu_boost_end();
 }
 
 /* ---- t2-powerctl: a client of the socket -------------------------------------- */
@@ -1908,8 +2322,10 @@ int main(int argc, char **argv)
 	for (i = 0; i < MAX_CLIENTS; i++)
 		st.clients[i].fd = -1;
 	st.key_fd = -1;
+	st.n_in = 0;
 	st.kernel_suspends = -1;
-	now_mono(&st.screen_off_since);
+	st.battery_capacity = -1;
+	now_boot(&st.screen_off_since);
 	mkdir(cfg.run_dir, 0755);
 	st.listen_fd = listen_socket();
 	if (st.listen_fd < 0) {
