@@ -40,7 +40,10 @@
 # Host requirements: docker, and either an arm64 host or qemu-user binfmt support for aarch64
 # (e.g. the qemu-user-static package of your distribution, registered with the "F" flag, as
 # docker --platform linux/arm64 needs). About 25 GB of free disk; under emulation the build takes
-# several hours.
+# several hours. The arm64 container image is a local image of its own, ARM_IMG (default
+# titan2-alpine-arm64:3.24, made once from alpine:3.24 with docker build --platform linux/arm64):
+# pulling the arm64 variant under the alpine:3.24 tag itself would replace the host's own image
+# of that tag, which the other scripts run (docker rmi titan2-alpine-arm64:3.24 to refresh it).
 #
 # Variables: JOBS (default: nproc), PACKAGER (written into the packages, e.g.
 #   PACKAGER="Your Name <you@example.org>"), ALPINE_RELEASE (default v3.24), and for a different
@@ -58,6 +61,7 @@ KEY=t2-repo.rsa
 PKG=$ROOT/out/t2-packages
 REL=${ALPINE_RELEASE:-v3.24}
 IMG=alpine:${REL#v}
+ARM_IMG=${ARM_IMG:-titan2-alpine-arm64:${REL#v}}
 # aports main/mesa (mesa 26.2.6-r0 of edge); its pkgver is replaced by MESA_VER
 APORTS_COMMIT=${APORTS_COMMIT:-82a2f41f324a}
 # aports main/wayland-protocols 1.49 (edge)
@@ -148,13 +152,15 @@ cmd_fetch() {
 
 cmd_build() {
 	command -v docker >/dev/null || die "needs docker"
-	# checked before docker pulls the arm64 image: without emulation that pull would only
-	# replace the host's own $IMG tag with an image it cannot run (NO_BINFMT_CHECK=1 skips this,
-	# e.g. for Docker Desktop, which brings its own emulation)
+	# checked before the arm64 image $ARM_IMG is made: without emulation it could not run
+	# (NO_BINFMT_CHECK=1 skips this, e.g. for Docker Desktop, which brings its own emulation)
 	[ -n "${NO_BINFMT_CHECK:-}" ] || [ "$(uname -m)" = aarch64 ] ||
 		grep -qs '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64 ||
 		die "no qemu-aarch64 binfmt handler on this host (install qemu-user-static, or use an arm64 host)"
-	docker run --rm --platform linux/arm64 "$IMG" true 2>/dev/null ||
+	docker image inspect "$ARM_IMG" >/dev/null 2>&1 ||
+		printf 'FROM %s\n' "$IMG" | docker build -q --platform linux/arm64 -t "$ARM_IMG" - >/dev/null ||
+		die "cannot make the arm64 image $ARM_IMG from $IMG"
+	docker run --rm --platform linux/arm64 "$ARM_IMG" true 2>/dev/null ||
 		die "cannot run arm64 containers: the host needs qemu-user binfmt support for aarch64 (or an arm64 host)"
 	[ -f "$KEYS/$KEY" ] || "$ROOT/scripts/t2-repo.sh" keygen
 	[ -f "$KEYS/$KEY.pub" ] || die "no $KEYS/$KEY.pub"
@@ -171,7 +177,7 @@ cmd_build() {
 			-v "$OUT/packages:/packages" \
 			-e UIDGID="$(id -u):$(id -g)" -e KEY="$KEY" -e JOBS="${JOBS:-$(nproc)}" \
 			-e PACKAGER="${PACKAGER:-}" \
-			"$IMG" sh /tools/inner.sh wayland-protocols mesa 2>&1 | tee "$OUT/build.log" || rc=$?
+			"$ARM_IMG" sh /tools/inner.sh wayland-protocols mesa 2>&1 | tee "$OUT/build.log" || rc=$?
 		[ "$rc" -ne 0 ] && grep -q 'I/O error' "$OUT/build.log" || break
 		echo "attempt $try: apk download error, retrying" >&2
 	done
