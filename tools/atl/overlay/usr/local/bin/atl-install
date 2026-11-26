@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Install, update or remove an Android package for the Android Translation Layer.
+#   atl-install app.apk                        install or update (the package is named by its manifest,
+#                                              not by the file: a renamed file updates the same package)
+#   atl-install base.apk split_a.apk ...       a base APK with its split APKs, as one package
+#   atl-install --inherit split_x.apk          add splits to the installed version
+#   atl-install --allow-downgrade app.apk      replace a newer installed version
+#   atl-install -r org.example.app [--keep-data]   remove a package (and its data)
+#   atl-install -r app.apk                     same, the package name is read from the file
+# Before anything is published the files are verified (signature of every file, same signer as the
+# installed version or a proven successor, version, complete split set, usable native code); on any
+# failure the installed version and its data stay as they were. Nothing of the package is run.
+# The launcher entry (~/.local/share/applications/<package>.desktop) and the D-Bus activation file
+# (~/.local/share/dbus-1/services/<package>.service) are written and removed with the package.
+# More: atl-pm help
+set -eu
+[ -n "${1:-}" ] || { sed -n '5,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+if [ "$1" = -r ]; then
+	shift
+	target=${1:?usage: atl-install -r PACKAGE|app.apk [--keep-data]}
+	shift
+	if [ -f "$target" ]; then
+		# the file only names the package; it is not installed
+		pkg=$(atl-run --pm info "$target" | sed -n 's/^package: *//p' | head -n 1)
+		[ -n "$pkg" ] || { echo "atl-install: cannot read the package name of $target" >&2; exit 1; }
+		target=$pkg
+	fi
+	set -- uninstall "$target" "$@"
+else
+	set -- install "$@"
+fi
+# every word that is not a file becomes one --pm argument
+args=
+for a in "$@"; do
+	if [ -f "$a" ]; then
+		args="$args $(printf '%s' "$a" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"
+	else
+		args="$args --pm $(printf '%s' "$a" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"
+	fi
+done
+# through atl-run: it drops the ART cache of an older ATL build before anything is loaded
+eval "exec atl-run $args"

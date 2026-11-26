@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# The installed-package catalogue of the Android Translation Layer (per user):
+#   atl-pm list                              installed packages: name, version code, version, label
+#   atl-pm info PACKAGE | FILE.apk...        version, signer, minSdk/targetSdk, ABIs, splits, directories
+#   atl-pm path PACKAGE                      files of the installed version
+#   atl-pm components PACKAGE                components with their enabled state
+#   atl-pm enable|disable|default PACKAGE CLASS
+#   atl-pm permissions PACKAGE               requested permissions and the user's decisions
+#   atl-pm grant|revoke|reset-permission PACKAGE PERMISSION
+#   atl-pm install ... | uninstall PACKAGE [--keep-data]     (see atl-install)
+#   atl-pm migrate-data PACKAGE [DIR]        take over data of the older file-name based layout
+#   atl-pm stop PACKAGE                      end the running process of a package
+#   atl-pm running                           packages that have a process
+# The catalogue commands start no application and need no display.
+set -eu
+[ -n "${1:-}" ] || { sed -n '5,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+case "$1" in
+stop)
+	pkg=${2:?usage: atl-pm stop PACKAGE}
+	path=/$(printf '%s' "$pkg" | tr '.-' '/_')
+	exec gdbus call --session --dest "$pkg" --object-path "$path" --method org.gtk.Actions.Activate quit '[]' '{}'
+	;;
+running)
+	for pkg in $(atl-run --pm list | cut -f1); do
+		if gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+			--method org.freedesktop.DBus.NameHasOwner "$pkg" 2>/dev/null | grep -q true; then
+			echo "$pkg"
+		fi
+	done
+	exit 0
+	;;
+esac
+args=
+for a in "$@"; do
+	if [ -f "$a" ]; then
+		args="$args $(printf '%s' "$a" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"
+	else
+		args="$args --pm $(printf '%s' "$a" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"
+	fi
+done
+# through atl-run: it drops the ART cache of an older ATL build before anything is loaded
+eval "exec atl-run $args"

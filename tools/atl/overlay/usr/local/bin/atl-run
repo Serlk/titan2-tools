@@ -1,0 +1,152 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Run an APK through the Android Translation Layer on the Titan 2 (Wayland, GPU rendering).
+#   atl-run --package org.example.app [arguments]   start an installed package (see atl-install);
+#                                        this is what launcher entries and D-Bus activation call
+#   atl-run app.apk [android-translation-layer arguments]   run a loose APK file without installing
+#                                        it (-l Activity, -X ART option, ...); its data directory is
+#                                        named after the file
+#   atl-run --install app.apk [split.apk...]   same as atl-install
+#
+# Rendering goes straight to the GPU: GTK4 -> GSK -> Mesa (panfrost/panvk) -> the compositor; no
+# software renderer is ever selected here. Environment:
+#   ATL_GSK=gl|vulkan|cairo    GSK renderer (default gl = GLES through panfrost; vulkan = panvk)
+#   ATL_W/ATL_H                window size at start (some apps dislike resizes)
+#   ATL_DATA                   data directory (default ~/.local/share/android_translation_layer)
+#   ATL_HUD=1                  GALLIUM_HUD=fps overlay (GLES path) to see the frame rate
+#   ATL_WLDEBUG=1              WAYLAND_DEBUG=1 (shows whether buffers go as linux-dmabuf)
+#   ATL_LOG=<filter>           log filter (ANDROID_LOG_TAGS), e.g. '*:v' or '*:i'
+#   ATL_LOGFILE=0|<path>       started without a terminal the output goes to
+#                              ~/.local/state/atl/logs/<package>.log (see below); 0 = leave
+#                              stdout/stderr where the caller put them (atl-run ... >file)
+set -eu
+[ -n "${1:-}" ] || { echo "usage: atl-run --package NAME [args] | atl-run app.apk [args] | atl-run --install app.apk..." >&2; exit 2; }
+[ -z "${ATL_DATA:-}" ] || export ANDROID_APP_DATA_DIR="$ATL_DATA"
+# started by the session bus (D-Bus activation for a request from another package) the process has
+# the environment of the bus, which need not name the compositor: find its socket
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+	for s in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/wayland-[0-9]*; do
+		case "$s" in *.lock) continue ;; esac
+		[ -S "$s" ] && export WAYLAND_DISPLAY=$(basename "$s") && export XDG_RUNTIME_DIR=$(dirname "$s") && break
+	done
+fi
+export GDK_BACKEND=${GDK_BACKEND:-wayland}
+# Trusted roots for the TLS libraries applications bring along (OpenSSL-style libraries read
+# these two variables): this system's bundle and its hashed directory. The Android layout of the
+# same set, /system/etc/security/cacerts, is written by atl-cacerts.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+	export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+fi
+if [ -z "${SSL_CERT_DIR:-}" ] && [ -d /etc/ssl/certs ]; then
+	export SSL_CERT_DIR=/etc/ssl/certs
+fi
+if command -v atl-cacerts >/dev/null && ! atl-cacerts --check 2>/dev/null; then
+	echo "atl-run: /system/etc/security/cacerts is missing or older than the CA bundle; run atl-cacerts as root" >&2
+fi
+# GTK >= 4.20 calls the new GL renderer "gl" ("ngl" still works with a warning)
+export GSK_RENDERER=${ATL_GSK:-gl}
+# panvk hides the Mali-G615 (Valhall v11, "not well-tested" in Mesa) without this; GSK vulkan and
+# Vulkan APKs need it (/etc/profile.d/titan2-panvk.sh sets it for login shells too)
+export PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=${PAN_I_WANT_A_BROKEN_VULKAN_DRIVER:-1}
+# never fall back to a software renderer silently: drop software overrides only (a hardware
+# override such as zink stays, e.g. on the qemu bench where zink runs on venus)
+unset LIBGL_ALWAYS_SOFTWARE
+case "${MESA_LOADER_DRIVER_OVERRIDE:-}" in llvmpipe|softpipe|swrast|kms_swrast) unset MESA_LOADER_DRIVER_OVERRIDE ;; esac
+if ! ls /dev/dri/renderD* >/dev/null 2>&1; then
+	echo "atl-run: no /dev/dri/renderD*: the GPU driver (panthor) is not loaded, Mesa would use software rendering" >&2
+fi
+[ -z "${ATL_HUD:-}" ] || export GALLIUM_HUD=fps
+[ -z "${ATL_WLDEBUG:-}" ] || export WAYLAND_DEBUG=1
+[ -z "${ATL_LOG:-}" ] || export ANDROID_LOG_TAGS="$ATL_LOG"
+if [ "$1" = --install ]; then
+	shift
+	exec android-translation-layer --pm install "$@"
+fi
+case "$1" in
+--package | -p)
+	[ -n "${2:-}" ] || { echo "atl-run: --package needs a package name" >&2; exit 2; }
+	apk="--package=$2"
+	shift 2
+	;;
+--package=*)
+	apk=$1
+	shift
+	;;
+--pm | --pm=*)
+	# a catalogue command (atl-install, atl-pm): all arguments go through as they are
+	apk=
+	;;
+*)
+	apk=$1
+	shift
+	;;
+esac
+mkdir -p "${ANDROID_APP_DATA_DIR:-$HOME/.local/share/android_translation_layer}"
+# ART does not notice a new api-impl.jar/libart after an ATL update and uses the old oat in
+# ~/.cache/art -> SIGSEGV (seen r1 -> r101). Version stamp; changed -> drop the cache.
+# apk lives in /sbin, which a user session PATH may not include
+APK=$(command -v apk 2>/dev/null || echo /sbin/apk)
+stamp=$($APK info -e -v android-translation-layer art_standalone 2>/dev/null | tr '\n' ' ')
+# a rebuilt package with the same version (own builds) still changes the jar: add its size/mtime
+jar=/usr/lib/java/dex/android_translation_layer/api-impl.jar
+[ ! -f "$jar" ] || stamp="$stamp $(stat -c '%s %Y' "$jar" 2>/dev/null)"
+# the TLS provider is a boot class path jar that a package of ours replaces (titan2-art-wolfssljni)
+jar=/usr/lib/java/dex/art/wolfssljni-hostdex.jar
+[ ! -f "$jar" ] || stamp="$stamp $(stat -c '%s %Y' "$jar" 2>/dev/null)"
+cache=$HOME/.cache/art
+if [ -n "$stamp" ] && [ "$(cat "$cache/.atl-stamp" 2>/dev/null)" != "$stamp" ]; then
+	rm -rf "$cache"
+	mkdir -p "$cache"
+	printf %s "$stamp" >"$cache/.atl-stamp"
+fi
+[ -n "$apk" ] || exec android-translation-layer "$@"
+# Started without a terminal (launcher entry, D-Bus activation, file manager) the output of the
+# runtime goes to ~/.local/state/atl/logs/<package>.log, the previous run is kept as
+# <package>.log.1. A run that writes more than ATL_LOGFILE_MAX bytes (default 4 MiB) keeps its
+# last part in .log and the part before it in .log.0. Wherever the starter pointed stdout does
+# not matter: a launcher hands its own log file to everything it starts, and the application's
+# lines would be mixed into it and gone with the next session. With a terminal nothing changes.
+# A caller that wants the output itself says so: ATL_LOGFILE=0 atl-run ... >file 2>&1
+# (ATL_LOGFILE=<path> names another log file).
+if [ "${ATL_LOGFILE:-}" != 0 ] && ! [ -t 0 ] && ! [ -t 1 ] && ! [ -t 2 ]; then
+	case "$apk" in
+	--package=*) logname=${apk#--package=} ;;
+	*) logname=$(basename "$apk" .apk) ;;
+	esac
+	logname=$(printf %s "$logname" | tr -c 'A-Za-z0-9._-' _)
+	log=${ATL_LOGFILE:-${XDG_STATE_HOME:-$HOME/.local/state}/atl/logs/$logname.log}
+	max=${ATL_LOGFILE_MAX:-4194304}
+	if mkdir -p "$(dirname "$log")" 2>/dev/null; then
+		# application logs can quote what the user typed or received: for the user only
+		[ -n "${ATL_LOGFILE:-}" ] || chmod 700 "$(dirname "$log")" 2>/dev/null
+		[ ! -s "$log" ] || mv -f "$log" "$log.1"
+		rm -f "$log.0"
+		fifo=$log.fifo.$$
+		rm -f "$fifo"
+		if mkfifo -m 600 "$fifo" 2>/dev/null; then
+			(
+				# full pieces rotate once, so the end of a long run is always kept
+				while :; do
+					head -c "$max" >"$log.part"
+					size=$(stat -c %s "$log.part" 2>/dev/null || echo 0)
+					if [ "$size" -ge "$max" ]; then
+						mv -f "$log.part" "$log.0"
+					else
+						mv -f "$log.part" "$log"
+						break
+					fi
+				done
+			) <"$fifo" >/dev/null 2>&1 &
+			exec >"$fifo" 2>&1
+			rm -f "$fifo"
+			echo "== $(date "+%Y-%m-%d %H:%M:%S") atl-run $apk $* ($stamp)"
+		fi
+	fi
+fi
+if [ -n "${ATL_W:-}" ] && [ -n "${ATL_H:-}" ]; then
+	set -- -w "$ATL_W" -h "$ATL_H" "$@"
+fi
+# options first: a package start has no file argument
+exec android-translation-layer "$@" "$apk"

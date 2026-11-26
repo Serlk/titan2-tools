@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Maintainer: serlk <22211586+Serlk@users.noreply.github.com>
+# Titan 2 tools around the Android Translation Layer: atl-run (start an installed package or an
+# APK file, per-app logs), atl-install, atl-pm, atl-check, atl-open-apk and the desktop entry that
+# makes APK files installable from a file manager; atl-cacerts, which lays the system's trusted
+# roots out the way Android applications look for them (/system/etc/security/cacerts, rewritten
+# by the install script and by the trigger whenever the CA bundle changes). Sources: tools/atl/overlay (the same files an
+# image build copies to /usr/local/bin). Built by scripts/build-atl.sh build titan2-atl-tools
+# (tarball made there) or scripts/t2-repo.sh aport tools/aports/titan2-atl-tools, indexed by
+# scripts/t2-repo.sh build.
+pkgname=titan2-atl-tools
+pkgver=0.4
+pkgrel=0
+pkgdesc="Unihertz Titan 2: install, start and inspect Android packages of the Android Translation Layer"
+url="https://github.com/Serlk/titan2-tools"
+arch="noarch"
+license="GPL-2.0-or-later"
+# glib: gdbus (atl-pm stop/running); desktop-file-utils: update-desktop-database, run by the
+# catalogue after every install and removal and by the trigger for our own entry
+# openssl, ca-certificates-bundle: atl-cacerts (subject hashes; the bundle it reads)
+depends="android-translation-layer ca-certificates-bundle desktop-file-utils glib openssl shared-mime-info"
+options="!check"
+install="$pkgname.post-install $pkgname.post-upgrade $pkgname.pre-deinstall"
+triggers="$pkgname.trigger=/etc/ssl/certs"
+source="titan2-atl-tools.tar.gz"
+builddir="$srcdir/overlay"
+
+build() {
+	:
+}
+
+package() {
+	local f
+	for f in atl-run atl-install atl-pm atl-check atl-open-apk atl-cacerts; do
+		install -Dm755 usr/local/bin/$f "$pkgdir"/usr/bin/$f
+	done
+	# the scripts name each other through PATH; only the entry and its helper carry a path
+	sed -i 's|^PATH=/usr/local/bin:\$PATH$|PATH=/usr/bin:$PATH|' "$pkgdir"/usr/bin/atl-open-apk
+	install -Dm644 usr/share/applications/atl-install.desktop "$pkgdir"/usr/share/applications/atl-install.desktop
+	sed -i 's|^Exec=/usr/local/bin/|Exec=/usr/bin/|' "$pkgdir"/usr/share/applications/atl-install.desktop
+	install -Dm644 usr/share/titan2/niri/atl.kdl "$pkgdir"/usr/share/titan2/niri/atl.kdl
+}
+
+sha512sums="
+"

@@ -1,0 +1,114 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# First-run checks for Android apps (ATL) on the Titan 2: everything the direct GPU path needs,
+# printed in one go, then an optional test run with a screenshot.
+#   atl-check                 the checks only (run as the user that runs niri, inside its session)
+#   atl-check run app.apk [seconds]   also start the APK, wait, take a screenshot (niri), stop it
+# Test APKs installed with the image: /usr/share/titan2/apks (Gravity Defied, gles3jni, demo_app, ...).
+set -u
+ok() { printf 'ok    %s\n' "$*"; }
+bad() { printf 'FAIL  %s\n' "$*"; }
+info() { printf '      %s\n' "$*"; }
+
+echo "== kernel, GPU"
+info "$(uname -r)"
+if ls /dev/dri/renderD* >/dev/null 2>&1; then
+	for d in /sys/class/drm/renderD*; do
+		drv=$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)" 2>/dev/null)
+		info "$(basename "$d"): driver ${drv:-?}"
+	done
+	ok "render node present"
+else
+	bad "no /dev/dri/renderD*: panthor not loaded (modprobe panthor; dmesg | grep -i panthor)"
+fi
+[ -e /sys/module/panthor ] && ok "panthor module loaded" || bad "panthor module not loaded"
+ls /lib/firmware/arm/mali/arch11.8/mali_csffw.bin >/dev/null 2>&1 && ok "Mali CSF firmware present" || bad "no /lib/firmware/arm/mali/arch11.8/mali_csffw.bin (linux-firmware-arm)"
+
+echo "== packages"
+for p in mesa mesa-dri-gallium mesa-egl mesa-gles mesa-vulkan-panfrost vulkan-loader android-translation-layer \
+	art_standalone bionic_translation libopensles-standalone libandroidfw vixl; do
+	v=$(apk info -e -v "$p" 2>/dev/null)
+	[ -n "$v" ] && info "$v" || bad "package $p missing"
+done
+m=$(apk info -e -v mesa 2>/dev/null)
+case "$m" in *26.2.5-r1*) ok "Titan 2 Mesa (v11 backport) installed" ;; *) bad "Mesa is not the Titan 2 build (need 26.2.5-r100+ with Mali-G615 support): $m" ;; esac
+ls /usr/lib/libLLVM*.so* >/dev/null 2>&1 && info "LLVM libraries present (llvmpipe still built into Mesa; only panfrost is used when the render node works)"
+
+echo "== session"
+[ -n "${WAYLAND_DISPLAY:-}" ] && ok "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" || bad "WAYLAND_DISPLAY not set: run inside the niri session (or export XDG_RUNTIME_DIR/WAYLAND_DISPLAY)"
+[ -n "${XDG_RUNTIME_DIR:-}" ] && ok "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" || bad "XDG_RUNTIME_DIR not set"
+if command -v wayland-info >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+	g=$(wayland-info 2>/dev/null)
+	for i in zwp_linux_dmabuf_v1 wl_subcompositor xdg_wm_base wp_viewporter wp_linux_drm_syncobj_manager_v1 zwp_text_input_manager_v3; do
+		printf '%s' "$g" | grep -q "interface: '$i'" && ok "compositor: $i" || info "compositor: no $i"
+	done
+else
+	info "wayland-info not available (package wayland-utils): compositor globals not checked"
+fi
+if command -v eglinfo >/dev/null 2>&1; then
+	r=$(eglinfo -B 2>/dev/null | grep -i -m1 'OpenGL ES profile renderer\|renderer')
+	info "EGL: ${r:-no renderer line}"
+	printf '%s' "$r" | grep -qi 'llvmpipe\|softpipe' && bad "EGL uses a software renderer" || :
+	printf '%s' "$r" | grep -qi 'mali\|panfrost' && ok "EGL uses the Mali/panfrost driver" || :
+else
+	info "eglinfo not available (package mesa-utils)"
+fi
+icd=/usr/share/vulkan/icd.d/panfrost_icd.aarch64.json
+[ -r "$icd" ] && ok "panvk ICD $icd" || bad "no $icd (package mesa-vulkan-panfrost)"
+[ -n "${PAN_I_WANT_A_BROKEN_VULKAN_DRIVER:-}" ] ||
+	info "PAN_I_WANT_A_BROKEN_VULKAN_DRIVER unset in this shell: panvk hides v11 (Mali-G615) without it (checked with it set below)"
+if command -v vulkaninfo >/dev/null 2>&1; then
+	# every device, not only the first (lavapipe may be listed before panvk)
+	d=$(PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 vulkaninfo --summary 2>&1 | grep 'deviceName\|driverName\|apiVersion\|INCOMPATIBLE\|not well-tested\|Unknown gpu_id')
+	printf '%s\n' "${d:-none}" | sed 's/^[[:space:]]*/      Vulkan: /'
+	printf '%s' "$d" | grep -qi 'deviceName.*mali' && ok "panvk device" || bad "no panvk device (ATL_GSK=vulkan not usable): PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 VK_LOADER_DEBUG=driver vulkaninfo --summary"
+else
+	info "vulkaninfo not available (package vulkan-tools)"
+fi
+
+echo "== keyboard"
+if command -v xkbcli >/dev/null 2>&1; then
+	xkbcli compile-keymap --keymap /etc/xkb/titan2.xkb >/dev/null 2>&1 && ok "/etc/xkb/titan2.xkb compiles" || bad "/etc/xkb/titan2.xkb does not compile"
+else
+	info "xkbcli not available (package xkbcli)"
+fi
+[ -r /usr/share/titan2/niri/atl.kdl ] && info 'niri snippet: include "/usr/share/titan2/niri/atl.kdl" in ~/.config/niri/config.kdl'
+
+[ "${1:-}" = run ] || exit 0
+apk=${2:?atl-check run app.apk [seconds]}
+secs=${3:-40}
+[ -f "$apk" ] || apk=/usr/share/titan2/apks/$apk
+[ -f "$apk" ] || { bad "no such APK: $2"; exit 1; }
+echo "== run $(basename "$apk") (GSK_RENDERER=${ATL_GSK:-gl}, $secs s)"
+log=${TMPDIR:-/tmp}/atl-check-$(basename "$apk" .apk).log
+ATL_LOGFILE=0 ATL_LOG=${ATL_LOG:-*:i} atl-run "$apk" >"$log" 2>&1 &
+pid=$!
+sleep "$secs"
+if kill -0 "$pid" 2>/dev/null; then
+	ok "still running after $secs s"
+	# outside a niri-started shell NIRI_SOCKET is unset: find the socket of this display
+	if [ -z "${NIRI_SOCKET:-}" ]; then
+		for s in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/niri.${WAYLAND_DISPLAY:-wayland-1}.*.sock; do
+			[ -S "$s" ] && export NIRI_SOCKET=$s && break
+		done
+	fi
+	shot=${TMPDIR:-/tmp}/atl-check-$(basename "$apk" .apk).png
+	if command -v grim >/dev/null 2>&1 && grim "$shot" 2>/dev/null; then
+		ok "screenshot: $shot"
+	elif command -v niri >/dev/null 2>&1 && niri msg action screenshot-screen >/dev/null 2>&1; then
+		ok "screenshot taken (niri: ~/Pictures/Screenshots)"
+	else
+		info "no screenshot (grim or niri socket missing)"
+	fi
+	if command -v niri >/dev/null 2>&1; then
+		niri msg windows 2>/dev/null | grep -q "App ID: \"$(basename "$apk" .apk | sed 's/_[0-9]*$//')" &&
+			ok "niri shows the app window" || info "no niri window with the APK's app id (or no niri socket)"
+	fi
+	kill "$pid" 2>/dev/null
+else
+	bad "exited early, log: $log"
+fi
+grep -i -m5 'llvmpipe\|softpipe\|failed to\|error' "$log" | sed 's/^/      log: /' || :
+info "log: $log"

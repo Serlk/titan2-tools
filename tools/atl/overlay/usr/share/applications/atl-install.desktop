@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+[Desktop Entry]
+Type=Application
+Name=Install Android app
+Name[ru]=Установить Android-приложение
+Exec=/usr/local/bin/atl-open-apk %F
+Icon=application-vnd.android.package-archive
+MimeType=application/vnd.android.package-archive;
+NoDisplay=true
+Terminal=false

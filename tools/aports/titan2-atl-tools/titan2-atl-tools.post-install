@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Copies of these tools put into /usr/local/bin by hand (before there was a package) would hide
+# the packaged ones: turn them into links, so launcher entries written with the old path keep working.
+for f in atl-run atl-install atl-pm atl-check atl-open-apk; do
+	if [ -f /usr/local/bin/$f ] && [ ! -L /usr/local/bin/$f ]; then
+		ln -sf /usr/bin/$f /usr/local/bin/$f
+	fi
+done
+rm -f /usr/local/share/applications/atl-install.desktop
+
+# APK files open with the installer by default. Archive managers claim the type too, so being
+# listed is not enough: name the default in the system-wide association file, unless the
+# administrator already chose one there.
+m=/etc/xdg/mimeapps.list
+t=application/vnd.android.package-archive
+mkdir -p /etc/xdg
+if ! grep -q "^$t=" "$m" 2>/dev/null; then
+	if grep -q '^\[Default Applications\]' "$m" 2>/dev/null; then
+		sed -i "/^\[Default Applications\]/a $t=atl-install.desktop" "$m"
+	else
+		printf '[Default Applications]\n%s=atl-install.desktop\n' "$t" >>"$m"
+	fi
+fi
+# the trusted roots in the layout Android applications look for
+/usr/bin/atl-cacerts >/dev/null || echo "titan2-atl-tools: /system/etc/security/cacerts was not written; run atl-cacerts" >&2
+exit 0

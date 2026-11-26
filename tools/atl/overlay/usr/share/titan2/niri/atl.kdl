@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+//
+// niri on the Titan 2: the hardware keyboard and Android apps (ATL) on the 1440x1440 screen.
+// Add to ~/.config/niri/config.kdl:   include "/usr/share/titan2/niri/atl.kdl"   (niri >= 25.08;
+// older niri: paste the blocks below into config.kdl).
+// Keymap: /etc/xkb/titan2.xkb (Sym = ISO_Level5_Shift/Mod3, Fn = XF86Fn, Menu = XF86LaunchA,
+// Back = XF86Back, Alt = the symbols printed on the keys).
+
+// Vulkan for everything niri starts (rofi, terminals, ATL): panvk shows the Mali-G615 (Valhall v11,
+// "not well-tested" in Mesa) only with this variable; niri itself renders with GLES (panfrost).
+environment {
+    PAN_I_WANT_A_BROKEN_VULKAN_DRIVER "1"
+}
+
+input {
+    keyboard {
+        xkb {
+            file "/etc/xkb/titan2.xkb"
+        }
+        repeat-delay 400
+        repeat-rate 25
+    }
+    touch {
+        map-to-output "DSI-1"
+    }
+}
+
+// One app per screen, phone style: every window opens maximized, no borders. (ATL windows carry
+// the APK package name as app-id, so there is no single app-id to match; ATL draws its own header
+// bar with the Back button.)
+window-rule {
+    open-maximized true
+    open-fullscreen false
+    border { off; }
+    focus-ring { off; }
+    draw-border-with-background false
+}
+
+binds {
+    // Menu key = switch between windows (Android "recents"), cycling around the edges
+    XF86LaunchA { focus-column-right-or-first; }
+    Shift+XF86LaunchA { focus-column-left-or-last; }
+    // Fn alone opens the launcher; Fn+Enter a terminal; Fn+Q closes the window
+    XF86Fn { spawn "rofi" "-show" "drun"; }
+    // Sym+Space is the shell's own launcher key (Mod3 = ISO_Level5_Shift)
+    Mod3+space { spawn "rofi" "-show" "drun"; }
+    // Back is passed to the focused window (ATL turns XF86Back into KEYCODE_BACK); no bind here on purpose.
+}

@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Opens APK files from a file manager (atl-install.desktop, MIME application/vnd.android.package-archive):
+# installs or updates each file with atl-install and reports the result as a desktop notification.
+# Several files given at once are installed one by one (not as a split set).
+PATH=/usr/local/bin:$PATH
+note() { command -v notify-send >/dev/null 2>&1 && notify-send -a "Android" -i application-vnd.android.package-archive "$1" "$2"; }
+[ $# -gt 0 ] || { note "Android" "No APK file given"; exit 2; }
+rc=0
+for f in "$@"; do
+	name=$(basename "$f")
+	note "$name" "Installing…"
+	out=$(atl-install "$f" 2>&1); r=$?
+	if [ $r -eq 0 ]; then
+		pkg=$(printf '%s\n' "$out" | sed -n 's/^ *package: *//p' | tail -1)
+		ver=$(printf '%s\n' "$out" | sed -n 's/^ *version name: *//p;s/^ *versionName: *//p' | tail -1)
+		note "$name" "Installed${pkg:+: $pkg}${ver:+ $ver}"
+	else
+		rc=$r
+		why=$(printf '%s\n' "$out" | grep -v -E 'dex2oat|oat_file|bionic_linker|JVM launched' | tail -2 | tr '\n' ' ')
+		note "$name" "Not installed: ${why:-error $r}"
+	fi
+done
+exit $rc

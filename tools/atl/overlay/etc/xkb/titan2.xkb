@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+//
+// Full xkb keymap for the Titan 2 hardware keyboard on mainline (Wayland).
+// Key codes are the ones the device tree sends (arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2.dts,
+// linux,keymap); xkb keycode = evdev code + 8.
+//   Sym  (evdev 202 KEY_PROG3, <I210>) -> ISO_Level5_Shift (Mod3): the shell handles Sym itself, never Super
+//   Fn   (evdev 203 KEY_PROG4, <I211>) -> XF86Fn: a plain key, bound by the compositor, never Super
+//   Alt  (evdev 100 KEY_RIGHTALT)      -> ISO_Level3_Shift: the symbols printed on the keys
+//   Back (158 KEY_BACK, <I166>)        -> XF86Back (the ATL window turns it into KEYCODE_BACK)
+//   Menu (580 KEY_APPSELECT, <I588>)   -> XF86LaunchA: bound to window switching by the compositor
+// niri: input { keyboard { xkb { file "/etc/xkb/titan2.xkb" } } }   (niri >= 25.05)
+// sway: input "type:keyboard" xkb_file /etc/xkb/titan2.xkb
+xkb_keymap {
+	xkb_keycodes { include "evdev+aliases(qwerty)" };
+	xkb_types    { include "complete" };
+	xkb_compat   { include "complete" };
+	xkb_symbols  { include "pc+inet(evdev)+titan2+level3(ralt_switch)" };
+	xkb_geometry { include "pc(pc105)" };
+};

@@ -1,0 +1,62 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# The trusted certificate authorities where Android applications look for them:
+# /system/etc/security/cacerts, one PEM file per certificate, named by the hash of its subject
+# (the old, MD5-based OpenSSL subject hash) and a counter: "5ed36f99.0". Applications list that
+# directory themselves (to hand a bundle to a TLS library or a downloader they bring along) and
+# native libraries built for Android read it.
+#
+# The certificates are those of this system (its CA bundle, kept current by ca-certificates); the
+# directory is only another layout of the same set and is rewritten whenever the bundle changes:
+# by the package's install script and trigger, or by hand after a local update-ca-certificates.
+#   atl-cacerts            write the directory (as root)
+#   atl-cacerts --check    exit 0 if the directory matches the bundle, 1 if not
+# ATL_CACERTS_DIR names another directory (tests). Java code does not need the directory: the
+# AndroidCAStore key store and the default trust manager read the bundle.
+set -eu
+dir=${ATL_CACERTS_DIR:-/system/etc/security/cacerts}
+bundle=
+for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+	[ -f "$b" ] && bundle=$b && break
+done
+[ -n "$bundle" ] || { echo "atl-cacerts: no CA bundle on this system (ca-certificates-bundle)" >&2; exit 1; }
+stamp=$(dirname "$dir")/.cacerts-source
+now="$bundle $(stat -L -c '%s %Y' "$bundle")"
+
+if [ "${1:-}" = --check ]; then
+	[ -d "$dir" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$now" ]
+	exit
+fi
+
+command -v openssl >/dev/null || { echo "atl-cacerts: openssl is not installed" >&2; exit 1; }
+tmp=$dir.new.$$
+rm -rf "$tmp"
+mkdir -p "$tmp"
+trap 'rm -rf "$tmp"' EXIT
+awk -v d="$tmp" '
+	/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/in%05d", d, n) }
+	f { print > f }
+	/-----END CERTIFICATE-----/ { if (f) close(f); f = "" }' "$bundle"
+count=0
+for f in "$tmp"/in*; do
+	[ -f "$f" ] || continue
+	if h=$(openssl x509 -in "$f" -noout -subject_hash_old 2>/dev/null) && [ -n "$h" ]; then
+		n=0
+		while [ -e "$tmp/$h.$n" ]; do n=$((n + 1)); done
+		mv "$f" "$tmp/$h.$n"
+		count=$((count + 1))
+	else
+		rm -f "$f"
+	fi
+done
+[ "$count" -gt 0 ] || { echo "atl-cacerts: no certificate could be read from $bundle" >&2; exit 1; }
+chmod 755 "$tmp"
+chmod 644 "$tmp"/*
+old=$dir.old.$$
+if [ -e "$dir" ]; then mv "$dir" "$old"; fi
+mv "$tmp" "$dir"
+rm -rf "$old"
+printf '%s\n' "$now" >"$stamp"
+echo "atl-cacerts: $count certificates from $bundle in $dir"

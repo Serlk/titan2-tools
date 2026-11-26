@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# sway on the Titan 2 (PC test harness and fallback compositor; the phone runs niri, see
+# /usr/share/titan2/niri/atl.kdl). Square 1440x1440 screen, hardware keyboard, Android apps via ATL.
+# Keymap: /etc/xkb/titan2.xkb (Sym = Mod3, Fn = XF86Fn, Menu = XF86LaunchA, Alt = printed symbols).
+# simpledrm: output Unknown-1; with the DSI driver: DSI-1. scale 2 -> logical 720x720.
+output * scale 2
+output * bg #202020 solid_color
+input "type:keyboard" {
+	xkb_file /etc/xkb/titan2.xkb
+	repeat_delay 400
+	repeat_rate 25
+}
+# one app per screen
+workspace_layout tabbed
+for_window [app_id="^android-translation-layer"] fullscreen enable
+# Menu ("recents") switches windows, Fn opens the launcher, Sym+Space too (Mod3)
+bindsym XF86LaunchA focus next
+bindsym Shift+XF86LaunchA focus prev
+bindsym XF86Fn exec fuzzel
+bindsym Mod3+space exec fuzzel
+bindsym Mod3+Return exec foot
+bindsym Mod3+q kill

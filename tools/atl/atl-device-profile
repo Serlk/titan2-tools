@@ -1,0 +1,151 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Device profile for the Android Translation Layer (ATL patch 0006): the build.prop-style file
+# that android.os.Build / SystemProperties read (/etc/atl/device.prop, or $ATL_DEVICE_PROFILE),
+# generated from the phone's own build.prop files.
+#
+#   atl-device-profile [-o OUT] [--serial S] [--cmdline FILE] ROOT
+#   atl-device-profile [-o OUT] [--serial S] [--cmdline FILE] -f system.prop [-f vendor.prop ...]
+#
+# ROOT is a tree with the phone's own partitions mounted or extracted, any of these layouts:
+#   ROOT/system_a/system/build.prop  ROOT/system/system/build.prop  ROOT/system/build.prop
+#   ROOT/system_ext_a/etc/build.prop ROOT/system_ext/etc/build.prop ROOT/system/system_ext/etc/build.prop
+#   ROOT/vendor_a/build.prop         ROOT/vendor/build.prop
+#   ROOT/odm_a/etc/build.prop        ROOT/odm/etc/build.prop        ROOT/vendor{_a,}/odm/etc/build.prop
+#   ROOT/product_a/etc/build.prop    ROOT/product/etc/build.prop    ROOT/system/product/etc/build.prop
+# (on the PC: a directory with the logical partitions of your phone's super extracted; on the
+# phone: the logical partitions of super mounted read-only).
+# -f gives the files explicitly, in Android init's load order (system, system_ext, vendor, odm,
+# product); a later definition overrides an earlier one, as init does while loading.
+#
+# Derived like Android init does: ro.product.{brand,device,manufacturer,model,name} from the
+# partition-specific values (ro.product.property_source_order), ro.build.fingerprint, and
+# ro.soc.{manufacturer,model}. From the kernel command line (/proc/cmdline and /proc/bootconfig,
+# or --cmdline FILE): androidboot.serialno -> ro.serialno, androidboot.hardware -> ro.hardware
+# (default: ro.board.platform), androidboot.bootloader -> ro.bootloader. --serial overrides the
+# serial number.
+#
+# Only ro.* properties are written. The output is device data (serial number, firmware
+# fingerprint): it belongs on the phone (/etc/atl/device.prop), never in a repository or an image
+# that others get.
+set -eu
+
+out=-
+serial=
+cmdline=
+files=
+root=
+usage() { sed -n '9,11p' "$0" | sed 's/^# //' >&2; exit 2; }
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o) out=${2:?}; shift 2 ;;
+	--serial) serial=${2:?}; shift 2 ;;
+	--cmdline) cmdline=${2:?}; shift 2 ;;
+	-f) [ -r "${2:?}" ] || { echo "atl-device-profile: cannot read $2" >&2; exit 1; }
+	    files="$files
+$2"; shift 2 ;;
+	-h|--help) usage ;;
+	-*) usage ;;
+	*) root=$1; shift ;;
+	esac
+done
+
+first() {
+	for f in "$@"; do
+		[ -r "$f" ] && { printf '%s\n' "$f"; return; }
+	done
+	return 0
+}
+
+if [ -z "$files" ]; then
+	[ -n "$root" ] && [ -d "$root" ] || usage
+	r=$root
+	files=$(
+		first "$r/system_a/system/build.prop" "$r/system/system/build.prop" "$r/system/build.prop"
+		first "$r/system_ext_a/etc/build.prop" "$r/system_ext/etc/build.prop" "$r/system/system_ext/etc/build.prop" \
+			"$r/system_a/system/system_ext/etc/build.prop"
+		first "$r/vendor_a/build.prop" "$r/vendor/build.prop"
+		first "$r/odm_a/etc/build.prop" "$r/odm/etc/build.prop" "$r/vendor_a/odm/etc/build.prop" "$r/vendor/odm/etc/build.prop"
+		first "$r/product_a/etc/build.prop" "$r/product/etc/build.prop" "$r/system/product/etc/build.prop" \
+			"$r/system_a/system/product/etc/build.prop"
+	)
+	[ -n "$files" ] || { echo "atl-device-profile: no build.prop found below $root" >&2; exit 1; }
+fi
+
+# boot parameters: "key=value" words of the command line, bootconfig lines key = "value"
+boot=$(
+	if [ -n "$cmdline" ]; then cat "$cmdline"; else cat /proc/cmdline /proc/bootconfig 2>/dev/null || true; fi |
+		tr ' ' '\n' | sed -n 's/^\(androidboot\.[a-z_.]*\)=\(.*\)$/\1=\2/p'
+	if [ -z "$cmdline" ] && [ -r /proc/bootconfig ]; then
+		sed -n 's/^\(androidboot\.[a-z_.]*\) *= *"\(.*\)"$/\1=\2/p' /proc/bootconfig
+	fi
+)
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+{
+	printf '%s\n' "$files" | while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		printf '#FILE %s\n' "$f"
+		cat "$f"
+		echo
+	done
+	printf '#BOOT\n%s\n' "$boot"
+	[ -z "$serial" ] || printf 'androidboot.serialno=%s\n' "$serial"
+} | awk '
+	function get(k) { return (k in p) ? p[k] : "" }
+	/^#FILE / { src = src " " substr($0, 7); next }
+	/^#BOOT$/ { inboot = 1; next }
+	/^[ \t]*(#|$)/ { next }
+	/^import / { next }
+	{
+		i = index($0, "="); if (i < 2) next
+		k = substr($0, 1, i - 1); v = substr($0, i + 1)
+		gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", v)
+		if (inboot) { b[k] = v; next }
+		if (k !~ /^ro\./) next
+		if (!(k in p)) order[n++] = k
+		p[k] = v
+	}
+	function set(k, v) { if (v == "") return; if (!(k in p)) order[n++] = k; p[k] = v }
+	END {
+		srcorder = get("ro.product.property_source_order")
+		if (srcorder == "") srcorder = "odm,vendor,product,system_ext,system"
+		m = split(srcorder, parts, ",")
+		split("brand device manufacturer model name", attrs, " ")
+		for (a = 1; a <= 5; a++) {
+			k = "ro.product." attrs[a]
+			if (get(k) != "") continue
+			for (j = 1; j <= m; j++) {
+				v = get("ro.product." parts[j] "." attrs[a])
+				if (v != "") { set(k, v); break }
+			}
+		}
+		if (get("ro.build.version.release_or_codename") == "")
+			set("ro.build.version.release_or_codename", get("ro.build.version.release"))
+		if (get("ro.build.fingerprint") == "")
+			set("ro.build.fingerprint", get("ro.product.brand") "/" get("ro.product.name") "/" get("ro.product.device") ":" \
+			    get("ro.build.version.release_or_codename") "/" get("ro.build.id") "/" get("ro.build.version.incremental") ":" \
+			    get("ro.build.type") "/" get("ro.build.tags"))
+		hw = ("androidboot.hardware" in b) ? b["androidboot.hardware"] : get("ro.board.platform")
+		if (get("ro.hardware") == "") set("ro.hardware", hw)
+		if ("androidboot.serialno" in b) { if ("ro.serialno" in p) p["ro.serialno"] = b["androidboot.serialno"]; else set("ro.serialno", b["androidboot.serialno"]) }
+		if ("androidboot.bootloader" in b && get("ro.bootloader") == "") set("ro.bootloader", b["androidboot.bootloader"])
+		plat = get("ro.board.platform")
+		if (get("ro.soc.manufacturer") == "" && plat ~ /^mt[0-9]+/) set("ro.soc.manufacturer", "Mediatek")
+		if (get("ro.soc.model") == "" && plat ~ /^mt[0-9]+/) set("ro.soc.model", toupper(plat))
+		print "# ATL device profile (tools/atl/atl-device-profile) from:" src
+		print "# device data: do not publish"
+		for (i = 0; i < n; i++) print order[i] "=" p[order[i]]
+	}' >"$tmp"
+
+if [ "$out" = - ]; then
+	cat "$tmp"
+else
+	mkdir -p "$(dirname "$out")"
+	cat "$tmp" >"$out"
+	chmod 0644 "$out"
+	echo "atl-device-profile: $(grep -c '^ro\.' "$out") properties -> $out" >&2
+fi

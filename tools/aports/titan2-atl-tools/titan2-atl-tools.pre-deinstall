@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# take back what post-install added
+sed -i '/^application\/vnd.android.package-archive=atl-install.desktop$/d' /etc/xdg/mimeapps.list 2>/dev/null
+for f in atl-run atl-install atl-pm atl-check atl-open-apk; do
+	[ "$(readlink /usr/local/bin/$f 2>/dev/null)" = /usr/bin/$f ] && rm -f /usr/local/bin/$f
+done
+rm -rf /system/etc/security/cacerts /system/etc/security/.cacerts-source
+rmdir /system/etc/security /system/etc /system 2>/dev/null
+exit 0
