@@ -28,7 +28,9 @@
 #                         out/t2-repo/t2-repo.rsa.pub, written by scripts/t2-repo.sh build) also
 #                         goes into /etc/apk/keys. apk checks these packages with that key;
 #                         verify-cache (Alpine key) skips them, the list is in
-#                         out/netroot/stage/packages-local.txt
+#                         out/netroot/stage/packages-local.txt. When LOCAL_REPO has titan2-sensors
+#                         (tools/aports/titan2-sensors: the sensor hub calibration loader), it is
+#                         installed too (SENSORS=0: not)
 #   ATL=1                 Android Translation Layer (Android applications): the packages ATL_PKGS
 #                         (not in v3.24: LOCAL_REPO must hold the ATL stack, see tools/atl/README.md),
 #                         the overlay tools/atl/overlay (atl-run, atl-check, the /etc/xkb/titan2.xkb
@@ -242,6 +244,12 @@ if [ -z "${ONLY_MODULES:-}" ]; then
 		echo $LREPO >>/tmp/repositories
 		tar -xzOf $LREPO/aarch64/APKINDEX.tar.gz APKINDEX |
 			sed -n "/^P:/{s/^P://;h};/^V:/{s/^V://;H;x;s/\n/ /p}" | sort >/tmp/local.pv
+		# titan2-sensors (tools/aports/titan2-sensors: the sensor hub calibration loader), when
+		# the own repository has it and SENSORS is not 0
+		if [ "${SENSORS:-1}" != 0 ] && grep -q "^titan2-sensors " /tmp/local.pv; then
+			PKGS="$PKGS titan2-sensors"
+			echo "own repository: titan2-sensors is installed (SENSORS=0: without it)"
+		fi
 	fi
 	apk add --root $R --arch aarch64 $INITDB --no-scripts --no-interactive --keys-dir /tmp/keys \
 		--repositories-file /tmp/repositories --cache-dir /out/apk-cache $PKGS
@@ -377,9 +385,9 @@ cmd_build() {
 	fi
 	mkdir -p "$D/stage"
 	docker pull -q "$ALPINE_IMG" >/dev/null
-	echo "container: $(docker image inspect "$ALPINE_IMG" --format '{{index .RepoDigests 0}}')"
+	echo "container: $(docker image inspect "$ALPINE_IMG" --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}')"
 	# the rootfs is built inside the container (not on the host disk as root), only the image comes out
-	dk -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e ATL="${ATL:-}" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
+	dk -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e ATL="${ATL:-}" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" -e SENSORS="${SENSORS:-1}" \
 		-e EXTRA_REPOS="$EXTRA_REPOS" "${EXTRA_MOUNTS[@]}" \
 		-e SIZE="${SIZE:-4G}" -e IMGREL="$IMGREL" -e MODE=new -e MODSRC="$modsrc" \
 		-e T2_DEBUG="${T2_DEBUG:-}" -e CONFIGURE="$CONFIGURE" "$ALPINE_IMG" sh -euc '
@@ -415,7 +423,7 @@ img_update() { # <modsrc> ; ONLY_MODULES=1: no packages
 	echo "adding to $IMG (copy: $IMG.part)"
 	rm -f "$IMG.part"
 	cp --reflink=auto --sparse=always "$IMG" "$IMG.part"
-	dk --privileged -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e ATL="${ATL:-}" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
+	dk --privileged -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e ATL="${ATL:-}" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" -e SENSORS="${SENSORS:-1}" \
 		-e EXTRA_REPOS="$EXTRA_REPOS" "${EXTRA_MOUNTS[@]}" \
 		-e IMGREL="$IMGREL" -e MODE=update -e MODSRC="$modsrc" -e ONLY_MODULES="${ONLY_MODULES:-}" \
 		-e T2_DEBUG="${T2_DEBUG:-}" -e CONFIGURE="$CONFIGURE" "$ALPINE_IMG" sh -euc '

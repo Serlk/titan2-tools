@@ -62,6 +62,11 @@ if [ -z "${VARIANTS:-}" ]; then
 			grep -vx 'all\|all-fb' | sort)
 	VARIANTS=$(echo $VARIANTS)
 fi
+n=$(echo $VARIANTS | wc -w)
+if [ "$n" -gt 12 ]; then
+	echo "note: $n entries in extlinux.conf; titan2-boot from 2026-11-12 on shows the first 24, older" \
+		"menus the first 12 (VARIANTS=\"all all-fb full\" for a short list)" >&2
+fi
 DEFAULT=${DEFAULT:-all}
 case " $VARIANTS " in *" $DEFAULT "*) ;; *) DEFAULT=${VARIANTS%% *} ;; esac
 C=$O/boot/extlinux/extlinux.conf
