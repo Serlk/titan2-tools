@@ -4,13 +4,13 @@
 # Test the USB console initramfs in qemu-system-aarch64 (virt) with the same kernel as for the
 # phone (arm64 defconfig enables virt). UDC is dummy_hcd (t2.udc=dummy_udc.0), the gadget host
 # side is cdc_ncm/cdc-acm in the same kernel (modules only in the test add-on).
-#   [O=out/mainline-usb] [SCEN='nokey key noudc'] tools/initramfs/qemu/run.sh
+#   [O=out/mainline-build] [SCEN='nokey key noudc'] tools/initramfs/qemu/run.sh
 # Scenarios: nokey (empty password), key (authorized_keys), noudc (no UDC -> message and
 # automatic reboot; qemu with -no-reboot exits). Logs: out/initramfs-usb/qemu/*.log
 # qemu is installed in a throwaway debian:trixie container (.deb cache in out/initramfs-dl/debian-apt).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
-O=${O:-out/mainline-usb}
+O=${O:-out/mainline-build}
 Q=out/initramfs-usb/qemu
 mkdir -p "$ROOT/$Q" "$ROOT/out/initramfs-dl/debian-apt/archives/partial" "$ROOT/out/initramfs-dl/debian-apt/lists/partial"
 run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" titan2-kbuild "$@"; }

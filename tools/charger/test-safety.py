@@ -3,13 +3,24 @@
 # Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
 """Exercise actual driver PM/CHG_EN functions with injected regmap failures.
 Not a hardware, concurrency, or full-kernel test.
+
+    tools/charger/test-safety.py [KERNEL_TREE]
+
+KERNEL_TREE: a titan2-linux checkout (default: KERNEL_SRC, else linux/ in the root of this
+repository, the SRC of scripts/build-mainline.sh).
 """
 from pathlib import Path
+import os
 import subprocess
+import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-source = (root / 'src/mainline-mt6878/drivers/power/supply/mt6375-charger.c').read_text()
+tree = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get('KERNEL_SRC', root / 'linux'))
+driver = tree / 'drivers/power/supply/mt6375-charger.c'
+if not driver.is_file():
+    sys.exit(f'{driver}: not found (pass the kernel tree: test-safety.py <titan2-linux checkout>)')
+source = driver.read_text()
 def function(name):
     start = source.index('static ', source.rfind('\n}', 0, source.index(name + '(')) + 2)
     end = source.index('\n}', source.index(name + '(')) + 2

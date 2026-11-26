@@ -4,7 +4,7 @@
 #
 # Test of the network root in qemu-system-aarch64 (virt) with the phone kernel:
 # initramfs -> netroot (NBD) -> switch_root -> Alpine (openrc) -> SSH login from the host.
-#   [O=out/mainline-netroot] tools/netroot/qemu/run.sh
+#   [O=out/mainline-build] tools/netroot/qemu/run.sh
 # Modules: if $O/modules exists (scripts/build-mainline.sh), they go into the image (MODULES=$O).
 # KEEP_IMG=1: do not rebuild the image, take the existing QIMG (default qemu-rootfs.img),
 # e.g. after adding to it (netroot-serve.sh build on an existing image).
@@ -19,7 +19,7 @@
 # (data kept); 3) no server -> after t2.root_wait stays in the initramfs, SSH.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
-O=${O:-out/mainline-netroot}
+O=${O:-out/mainline-build}
 Q=out/netroot/qemu
 QA=$ROOT/$Q
 mkdir -p "$QA" "$ROOT/out/initramfs-dl/debian-apt/archives/partial" "$ROOT/out/initramfs-dl/debian-apt/lists/partial"

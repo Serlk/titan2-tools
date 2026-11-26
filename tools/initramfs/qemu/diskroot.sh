@@ -24,6 +24,7 @@ O=${O:-out/mainline-build}
 Q=out/diskroot-qemu
 QA=$ROOT/$Q
 BASE=$ROOT/${BASE:-out/netroot/qemu-rootfs.img}
+[ -f "$BASE" ] || { echo "no $BASE: tools/netroot/qemu/run.sh makes it (or BASE=<Alpine image in out/netroot>)" >&2; exit 1; }
 KEY=$ROOT/out/netroot/qemu/id_test
 mkdir -p "$QA" "$ROOT/out/initramfs-dl/debian-apt/archives/partial" "$ROOT/out/initramfs-dl/debian-apt/lists/partial"
 [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C t2-netroot-qemu-test -f "$KEY"
