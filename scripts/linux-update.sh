@@ -75,7 +75,9 @@ C=$O/boot/extlinux/extlinux.conf
 	printf '  FDT /boot/prev/dtbs/mt6878-unihertz-titan2.dtb\n  INITRD /boot/prev/initramfs\n'
 	printf '  APPEND %s t2.root=part:linux\n' "$CMDLINE"
 } >"$C"
-tar -C "$KO/modules" -czf "$O/modules.tar.gz" "lib/modules/$REL"
+# root-owned archives: the build user's uid must not end up on /, /etc, /usr or /lib/modules
+TAR_ROOT=(--owner=0 --group=0 --numeric-owner)
+tar "${TAR_ROOT[@]}" -C "$KO/modules" -czf "$O/modules.tar.gz" "lib/modules/$REL"
 
 if [ -n "${FIRMWARE:-}" ]; then
 	mkdir -p "$O/firmware/mediatek/mt6878"
@@ -91,11 +93,11 @@ if [ -n "${FIRMWARE:-}" ]; then
 		debugfs -R "dump /APCFG/APRDEB/BT_Addr $O/firmware/mediatek/mt6878/BT_Addr" "$NV" 2>/dev/null
 		[ -s "$O/firmware/mediatek/mt6878/BT_Addr" ] || { rm -f "$O/firmware/mediatek/mt6878/BT_Addr"; echo "BT_Addr could not be read from $NV"; }
 	fi
-	tar -C "$O/firmware" -czf "$O/firmware.tar.gz" .
+	tar "${TAR_ROOT[@]}" -C "$O/firmware" -czf "$O/firmware.tar.gz" .
 fi
 
 echo "to the phone: kernel $REL, $(ls "$O/boot/dtbs" | wc -l) DTBs, entries: $VARIANTS previous"
-tar -C "$O" -cf - boot modules.tar.gz $( [ -f "$O/firmware.tar.gz" ] && echo firmware.tar.gz ) |
+tar "${TAR_ROOT[@]}" -C "$O" -cf - boot modules.tar.gz $( [ -f "$O/firmware.tar.gz" ] && echo firmware.tar.gz ) |
 	"${SSH[@]}" 'set -e
 	T=/tmp/t2-update; rm -rf $T; mkdir -p $T; tar -C $T -xf -
 	# the previous version -> /boot/prev (only if /boot holds a kernel)
@@ -111,6 +113,9 @@ tar -C "$O" -cf - boot modules.tar.gz $( [ -f "$O/firmware.tar.gz" ] && echo fir
 	rm -rf /boot/dtbs.new && cp -a $T/boot/dtbs /boot/dtbs.new && rm -rf /boot/dtbs && mv /boot/dtbs.new /boot/dtbs
 	cp $T/boot/Image.gz /boot/Image.gz.new && mv /boot/Image.gz.new /boot/Image.gz
 	cp $T/boot/initramfs /boot/initramfs.new && mv /boot/initramfs.new /boot/initramfs
+	# belt and braces: whatever the archives said, system files belong to root
+	chown -R 0:0 /lib/modules /lib/firmware /boot
+	for d in / /etc /usr /usr/local /usr/local/bin /usr/share /lib; do [ "$(stat -c %u:%g $d)" = 0:0 ] || { echo "owner of $d is $(stat -c %u:%g $d), fixing"; chown 0:0 $d; }; done
 	mkdir -p /boot/extlinux
 	# keep foreign entries (kernels in /boot/<name>/)
 	[ -f /boot/extlinux/extlinux.conf ] && awk '"'"'
