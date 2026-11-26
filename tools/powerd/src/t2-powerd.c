@@ -45,6 +45,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -1298,6 +1299,23 @@ static void handle_command(int idx, char *line)
 		in_seconds(&st.awake_until, cfg.wake_grace_user);
 		snprintf(st.awake_reason, sizeof(st.awake_reason), "activity");
 		client_send(c, "ok\n");
+	} else if (!strcmp(cmd, "wake-screen")) {
+		/*
+		 * Light the panel now, for a reason the UI did not see itself: t2-fpd after a
+		 * fingerprint match with the panel off (Android: WAKE_REASON_BIOMETRIC). The
+		 * hooks/screen-on turns the niri outputs on; the panel state goes out at once.
+		 */
+		char how[64];
+
+		snprintf(how, sizeof(how), "wake-screen %s", a1 ? a1 : "");
+		LOGI("screen on requested (%s)", a1 ? a1 : "no reason given");
+		in_seconds(&st.awake_until, cfg.wake_grace_user);
+		snprintf(st.awake_reason, sizeof(st.awake_reason), "wake-screen");
+		client_send(c, "ok\n");
+		run_hooks("screen-on", cfg.hook_timeout);
+		st.screen_from_socket = true;
+		now_mono(&st.screen_socket_at);
+		set_screen(false, how);
 	} else if (!strcmp(cmd, "gpu") && a1 && !strcmp(a1, "boost")) {
 		if (!cfg.gpu_boost || st.gpu_boost_broken) {
 			client_send(c, "error: gpu boost off\n");
@@ -2252,17 +2270,49 @@ static int ctl(int argc, char **argv)
 				break;
 		return 0;
 	}
-	while ((r = read(fd, buf, sizeof(buf) - 1)) > 0) {
-		char *end;
+	/*
+	 * The reply ends with a line "ok..." or "error...". Look at whole lines: a status line may
+	 * hold "ok" too ("level=ok"), and the old check stopped at the first "ok" in the buffer, so
+	 * a status that arrived in one read never ended (t2-powerctl status hung). A command that
+	 * sleeps ("suspend") waits as long as it takes; every other one at most 30 s.
+	 */
+	if (argc == 0 || strcmp(argv[0], "suspend")) {
+		struct timeval tv = { .tv_sec = 30 };
 
-		buf[r] = 0;
-		fputs(buf, stdout);
-		end = strstr(buf, "ok");
-		if ((end && (end == buf || end[-1] == '\n')) || strstr(buf, "error"))
-			break;
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	}
-	close(fd);
-	return 0;
+	len = 0;
+	for (;;) {
+		char *nl;
+
+		r = read(fd, buf + len, sizeof(buf) - 1 - len);
+		if (r <= 0) {
+			if (r < 0)
+				fprintf(stderr, "t2-powerctl: no complete answer: %s\n", strerror(errno));
+			fwrite(buf, 1, len, stdout);
+			close(fd);
+			return r < 0 ? 1 : 0;
+		}
+		len += r;
+		buf[len] = 0;
+		while ((nl = memchr(buf, '\n', len))) {
+			size_t l = nl - buf + 1;
+			bool last = !strncmp(buf, "ok", 2) || !strncmp(buf, "error", 5);
+
+			fwrite(buf, 1, l, stdout);
+			memmove(buf, buf + l, len - l);
+			len -= l;
+			buf[len] = 0;
+			if (last) {
+				close(fd);
+				return 0;
+			}
+		}
+		if (len >= sizeof(buf) - 1) {	/* a line longer than the buffer: pass it on */
+			fwrite(buf, 1, len, stdout);
+			len = 0;
+		}
+	}
 }
 
 static void usage(void)
@@ -2276,6 +2326,7 @@ static void usage(void)
 	      "  -f         foreground: log to stderr (default: syslog, unless a terminal)\n"
 	      "t2-powerctl COMMAND...   (or: t2-powerd ctl COMMAND...)\n"
 	      "  status | suspend [force] | screen off|on | activity | subscribe\n"
+	      "  wake-screen [REASON]   run the screen-on hooks now (t2-fpd: fingerprint match)\n"
 	      "  inhibit NAME [REASON] [-- CMD...]  hold a lease while CMD runs\n"
 	      "  block NAME SECONDS [REASON] | unblock NAME\n"
 	      "  alarm set NAME +SEC|EPOCH [quiet] | alarm clear NAME | alarm list\n"

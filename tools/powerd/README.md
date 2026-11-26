@@ -81,6 +81,9 @@ inhibit NAME [reason]          lease until the connection closes → ok
 block NAME SEC [reason]        lease for a time;  unblock NAME
 screen off|on                  screen state from the compositor (5 s priority over DRM)
 activity                       the user is active (stay awake wake_grace_user s)
+wake-screen [REASON]           switch the panel on now: the screen-on hook, "screen on" to subscribers,
+                               stay awake wake_grace_user s (e.g. after a fingerprint match with the
+                               panel off)
 gpu boost [MS]                 raise the GPU min_freq for MS (default gpu_boost_ms); the daemon does this
                                itself on every touchscreen/keyboard event (gpu_boost in the configuration)
 suspend [force]                sleep now (force: ignore the observed blockers)

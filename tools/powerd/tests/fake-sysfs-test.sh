@@ -15,7 +15,8 @@ trap 'kill $PID 2>/dev/null || true; rm -rf "$T"' EXIT INT TERM
 R=$T/root
 SOCK=$T/sock
 fail() { echo "FAIL: $*" >&2; cat "$T/log" >&2; exit 1; }
-ctl() { "$BIN" ctl "$@"; }
+# every request with a limit: a hung answer fails the test instead of stopping it for good
+ctl() { timeout 20 "$BIN" ctl "$@" || { r=$?; [ $r = 124 ] && fail "ctl $* gave no complete answer within 20 s"; return $r; }; }
 
 # a fake sysfs: a connected DSI connector, a few wakeup sources, an RTC, the LPM driver
 mkdir -p "$R/sys/class/drm/card1-DSI-1" "$R/sys/class/rtc/rtc0" "$R/sys/power" \
@@ -108,14 +109,15 @@ PID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SOCK" ] && break; sleep 0.2; done
 [ -S "$SOCK" ] || fail "no socket"
 export T2_POWERD_SOCK="$SOCK"
-ctl() { "$BIN" ctl "$@"; }
+# every request with a limit: a hung answer fails the test instead of stopping it for good
+ctl() { timeout 20 "$BIN" ctl "$@" || { r=$?; [ $r = 124 ] && fail "ctl $* gave no complete answer within 20 s"; return $r; }; }
 
 # 1. status while awake
 out=$(ctl status)
 case "$out" in *"state awake"*) ;; *) fail "status: $out";; esac
 
 # 2. a held lease blocks the sleep: screen off, wait, nothing happens
-(ctl inhibit test-lease because testing -- sleep 1234 2>/dev/null) &
+("$BIN" ctl inhibit test-lease because testing -- sleep 1234 2>/dev/null) &	# holds: no limit
 LEASEPID=$!
 sleep 0.5
 echo Off >"$R/sys/class/drm/card1-DSI-1/dpms"
@@ -215,5 +217,58 @@ grep -Eq 'resumed after 183\.[0-9] s asleep \(2\.[0-9] s in transitions\): other
 out=$(ctl status)
 case "$out" in *"asleep 183 s"*) ;; *) fail "status asleep line: $out";; esac
 case "$out" in *"backoff 0"*) ;; *) fail "back-off after a long sleep: $out";; esac
+kill $PID; wait $PID 2>/dev/null || true
+
+# 9b. a status that holds "ok" inside a line (battery level=ok) and arrives in one read: the
+#     client stops at the "ok" line, not before and not never (it used to hang)
+"$BIN" -c "$T/conf" -s "$SOCK" -r "$R" -d -f >"$T/log" 2>&1 &
+PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SOCK" ] && break; sleep 0.2; done
+sleep 1.2
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	out=$(ctl status)
+	case "$out" in *"level=ok"*"ok") ;; *) fail "status $i: no battery level=ok line or no final ok: $out";; esac
+done
+kill $PID; wait $PID 2>/dev/null || true
+
+# 9c. the same answer in one write, from a stand-in server that keeps the connection open (as
+#     t2-powerd does): the old client read past its own end and waited for ever
+if command -v python3 >/dev/null 2>&1; then
+	python3 -c '
+import os, socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)
+c, _ = s.accept(); c.recv(100)
+c.sendall(b"state awake\nbattery 80% Charging level=ok\nmaintenance level=0\nok\n")
+time.sleep(30)' "$T/one.sock" &
+	SRV=$!
+	for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$T/one.sock" ] && break; sleep 0.1; done
+	out=$(T2_POWERD_SOCK="$T/one.sock" timeout 5 "$BIN" ctl status) ||
+		fail "an answer in one read with \"level=ok\" inside: no end found ($out)"
+	case "$out" in *"level=ok"*"ok") ;; *) fail "one-read answer: $out";; esac
+	kill $SRV 2>/dev/null || true
+fi
+
+# 10. wake-screen (t2-fpd after a fingerprint match with the panel off): the screen-on hook runs,
+#     subscribers get "screen on" at once, the phone stays up
+cat >"$T/hooks/screen-on" <<EOF
+#!/bin/sh
+echo "screen-on hook" >>"$T/hooklog"
+EOF
+chmod +x "$T/hooks/screen-on"
+: >"$T/log"
+"$BIN" -c "$T/conf" -s "$SOCK" -r "$R" -d -f >"$T/log" 2>&1 &
+PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SOCK" ] && break; sleep 0.2; done
+ctl screen off >/dev/null
+( exec "$BIN" ctl subscribe >"$T/sub" 2>&1 ) &	# the client itself, so that kill reaches it
+echo $! >"$T/subpid"
+sleep 0.5
+out=$(ctl wake-screen fingerprint)
+[ "$out" = ok ] || fail "wake-screen reply: $out"
+sleep 0.5
+grep -q 'screen-on hook' "$T/hooklog" || fail "wake-screen: no screen-on hook"
+grep -q 'event screen on' "$T/sub" || fail "wake-screen: no screen on for subscribers: $(cat "$T/sub")"
+grep -q 'screen on requested (fingerprint)' "$T/log" || fail "wake-screen: not logged"
+kill "$(cat "$T/subpid")" 2>/dev/null || true
 kill $PID; wait $PID 2>/dev/null || true
 echo "t2-powerd fake-sysfs test: OK"
