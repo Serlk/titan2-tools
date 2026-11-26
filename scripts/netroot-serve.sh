@@ -29,6 +29,11 @@
 #                         goes into /etc/apk/keys. apk checks these packages with that key;
 #                         verify-cache (Alpine key) skips them, the list is in
 #                         out/netroot/stage/packages-local.txt
+#   ATL=1                 Android Translation Layer (Android applications): the packages ATL_PKGS
+#                         (not in v3.24: LOCAL_REPO must hold the ATL stack, see tools/atl/README.md),
+#                         the overlay tools/atl/overlay (atl-run, atl-check, the /etc/xkb/titan2.xkb
+#                         keymap, the niri snippet) and the test APKs of out/atl-dl/test-apks
+#                         (scripts/build-atl.sh apks), by tools/netroot/install.d/atl.sh
 #   CAMERA=1, FP=1, GNSS=1  optional subsystems from their own repositories:
 #                         CAMERA_DIR (default external/titan2-camera):
 #                           git clone https://github.com/Serlk/titan2-camera external/titan2-camera
@@ -99,8 +104,9 @@ ALPINE_IMG=alpine:${REL#v}
 # (arm/mali/arch11.8/mali_csffw.bin) for panthor. e2fsprogs-extra: resize2fs for t2-growroot
 # (a root on the linux partition is grown to the whole partition).
 # NetworkManager: Wi-Fi (the USB route stays below it, t2-defroute; no connection profiles are put
-# into the image).
-PKGS="alpine-base openrc busybox-extras dropbear dropbear-openrc dropbear-scp kbd evtest i2c-tools v4l-utils iw
+# into the image). ufw + iptables (nft backend in v3.24): the firewall of tools/netroot/t2-firewall
+# (install.d/t2-firewall.sh).
+PKGS="alpine-base openrc busybox-extras dropbear dropbear-openrc dropbear-scp kbd evtest i2c-tools v4l-utils iw ufw iptables
 iproute2 e2fsprogs e2fsprogs-extra eudev udev-init-scripts udev-init-scripts-openrc kmod seatd seatd-openrc
 chrony chrony-openrc linux-firmware-arm
 networkmanager networkmanager-openrc networkmanager-wifi networkmanager-cli wpa_supplicant dbus dbus-openrc"
@@ -118,7 +124,22 @@ GFX_PKGS="$GFX_PKGS iio-sensor-proxy iio-sensor-proxy-openrc"
 #   Bluetooth: BlueZ (bluetoothd, bluetoothctl/btmgmt; rc-update add bluetooth default) and the
 #   PipeWire module for headsets; the btmtkbgf driver needs the -all DT (bt@18800000)
 GFX_PKGS="$GFX_PKGS bluez bluez-openrc pipewire-spa-bluez"
+#   Video by software decoding (no hardware decoder driver yet). gst-libav: the ffmpeg decoders for
+#   GStreamer (H.264/HEVC/VP9, AV1 through libdav1d); gst-plugins-rs-gtk4: gtk4paintablesink, frames
+#   into GTK4 through GL (dmabuf import on panfrost, no CPU copy); mpv: the reference player
+#   (--vo=gpu, EGL/Wayland on panfrost; frame statistics for t2-perfrun video).
+GFX_PKGS="$GFX_PKGS gst-libav gst-plugins-rs-gtk4 mpv"
 [ -z "${GFX:-}" ] || PKGS="$PKGS $GFX_PKGS"
+# Android Translation Layer (ATL=1): the ATL stack from LOCAL_REPO (scripts/build-atl.sh, then
+# scripts/t2-repo.sh build), Vulkan panvk, wayland-info/eglinfo/vulkaninfo/xkbcli for atl-check;
+# rendering only through the GPU (panfrost/panvk)
+ATL_PKGS="android-translation-layer art_standalone bionic_translation libopensles-standalone libandroidfw vixl
+mesa-vulkan-panfrost vulkan-loader wayland-utils mesa-utils vulkan-tools xkbcli xkeyboard-config
+font-noto adwaita-icon-theme hicolor-icon-theme shared-mime-info"
+if [ -n "${ATL:-}" ]; then
+	[ -n "${LOCAL_REPO:-}" ] || { echo "ATL=1: needs LOCAL_REPO=out/t2-repo (scripts/build-atl.sh build, scripts/t2-repo.sh build)" >&2; exit 1; }
+	PKGS="$PKGS $ATL_PKGS"
+fi
 
 # Optional subsystems from their own repositories (see CAMERA=1, FP=1, GNSS=1 above).
 # EXTRA_REPOS: "name:host-dir" pairs, mounted at /extra/<name> in the build container.
@@ -358,7 +379,7 @@ cmd_build() {
 	docker pull -q "$ALPINE_IMG" >/dev/null
 	echo "container: $(docker image inspect "$ALPINE_IMG" --format '{{index .RepoDigests 0}}')"
 	# the rootfs is built inside the container (not on the host disk as root), only the image comes out
-	dk -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
+	dk -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e ATL="${ATL:-}" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
 		-e EXTRA_REPOS="$EXTRA_REPOS" "${EXTRA_MOUNTS[@]}" \
 		-e SIZE="${SIZE:-4G}" -e IMGREL="$IMGREL" -e MODE=new -e MODSRC="$modsrc" \
 		-e T2_DEBUG="${T2_DEBUG:-}" -e CONFIGURE="$CONFIGURE" "$ALPINE_IMG" sh -euc '
@@ -394,7 +415,7 @@ img_update() { # <modsrc> ; ONLY_MODULES=1: no packages
 	echo "adding to $IMG (copy: $IMG.part)"
 	rm -f "$IMG.part"
 	cp --reflink=auto --sparse=always "$IMG" "$IMG.part"
-	dk --privileged -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
+	dk --privileged -v "$ROOT:/work:ro" -v "$D:/out" -e REL="$REL" -e MIRROR="$MIRROR" -e PKGS="$PKGS" -e ATL="${ATL:-}" -e LREPO="$LREPO" -e LKEY="$LKEY" -e LPKGS="$LPKGS" \
 		-e EXTRA_REPOS="$EXTRA_REPOS" "${EXTRA_MOUNTS[@]}" \
 		-e IMGREL="$IMGREL" -e MODE=update -e MODSRC="$modsrc" -e ONLY_MODULES="${ONLY_MODULES:-}" \
 		-e T2_DEBUG="${T2_DEBUG:-}" -e CONFIGURE="$CONFIGURE" "$ALPINE_IMG" sh -euc '

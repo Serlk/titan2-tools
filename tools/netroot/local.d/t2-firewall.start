@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2: re-apply the firewall at boot (ufw's own service runs too, this guards a fresh
+# or updated image); T2_FIREWALL=0 in /etc/conf.d/local disables it.
+[ "${T2_FIREWALL:-1}" = 1 ] || exit 0
+[ -x /usr/local/sbin/t2-firewall ] && command -v ufw >/dev/null && /usr/local/sbin/t2-firewall >/dev/null 2>&1 || :
+exit 0

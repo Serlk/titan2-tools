@@ -1,0 +1,53 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2 firewall: ufw (iptables-nft) with nothing open to the outside.
+#   incoming: denied on every interface — the modem data links (ccmni*/wwan*), the Wi-Fi (also
+#             foreign networks) and USB alike; the only exception is SSH (22) from the trusted
+#             peers: by default the PC over the USB link (usb0, 172.16.42.0/24). Add your own
+#             LAN or narrow it to the PC's address with T2_FW_SSH_FROM in /etc/conf.d/local, e.g.
+#             T2_FW_SSH_FROM="usb0:172.16.42.2/32 wlan0:198.51.100.0/24" (your Wi-Fi network).
+#   outgoing: allowed; replies come back through conntrack (DHCP, DNS, the modem's PDN too).
+#   routed:   denied (a hotspot later adds its own `ufw route` rules).
+# So dropbear, PipeWire, the portals and everything else are unreachable from the carrier
+# network and from any Wi-Fi except SSH from the listed peers. ufw's before.rules keep ICMP echo.
+#
+#   t2-firewall            apply the rule set (idempotent: resets ufw's own rules first) and enable
+#   t2-firewall status     ufw status verbose
+# Needs the kernel with the netfilter modules (configs/mainline-titan2.config) and
+# the packages ufw iptables (scripts/netroot-serve.sh, install.d/t2-firewall.sh).
+set -eu
+case "${1:-apply}" in
+status) exec ufw status verbose ;;
+apply) ;;
+*) echo "usage: t2-firewall [apply|status]" >&2; exit 1 ;;
+esac
+
+command -v ufw >/dev/null || { echo "t2-firewall: ufw is not installed (apk add ufw iptables)" >&2; exit 1; }
+# the filter table must be loadable; without the kernel modules ufw fails half-way and may
+# leave a chain that blocks everything (iptables-nft needs nf_tables + nft_compat)
+if ! modprobe nf_tables 2>/dev/null && ! modprobe iptable_filter 2>/dev/null; then
+	echo "t2-firewall: this kernel has no netfilter tables (nf_tables / iptable_filter): not enabling" >&2
+	exit 1
+fi
+
+ufw --force reset >/dev/null
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
+ufw default deny routed >/dev/null
+ufw allow in on lo >/dev/null
+# SSH only, only from the trusted peers; nothing else on any interface
+for peer in ${T2_FW_SSH_FROM:-usb0:172.16.42.0/24}; do
+	ifc=${peer%%:*}; net=${peer#*:}
+	ufw allow in on "$ifc" from "$net" to any port 22 proto tcp comment "ssh from $net on $ifc" >/dev/null
+done
+# the phone is the DHCP server of the USB link (t2-usbnet, udhcpd): the PC's DISCOVER/REQUEST come
+# from 0.0.0.0 and its renewals from its lease, so neither matches the SSH rule above; without this
+# the PC gets no address after a re-plug or a lease renewal
+ufw allow in on usb0 to any port 67 proto udp comment "dhcp for the PC on usb0" >/dev/null
+# ICMPv6 neighbour discovery and ping are kept by ufw's before.rules
+ufw logging low >/dev/null
+ufw --force enable >/dev/null
+rc-update -q add ufw default 2>/dev/null || :
+ufw status verbose
