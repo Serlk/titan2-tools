@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Maintainer: serlk <22211586+Serlk@users.noreply.github.com>
+# The TLS provider jar of art_standalone (external/wolfssljni, wolfSSL JNI/JSSE, GPL-2.0-or-later)
+# rebuilt from the source of the packaged art_standalone with our patches
+# patches/art_standalone/0001 (session cache: no calls into freed sessions, locking) and 0002
+# (a connection the peer closed reads as end of stream, not as an I/O error). Only the
+# Java part is rebuilt: the patches change no native method, so the jar goes with the
+# libwolfssljni.so of the installed art_standalone. The jar is the same in art_standalone
+# 0_git20251009 and 0_git20261018 (identical classes.dex), so one build serves both.
+# A full rebuild (scripts/build-atl.sh build art_standalone) applies the same patches and makes
+# this package unnecessary. Built by scripts/build-atl.sh build titan2-art-wolfssljni.
+pkgname=titan2-art-wolfssljni
+pkgver=0_git20251009
+pkgrel=0
+_commit="e78bf68917bcaaf58fef3960cd88793b3b7f39cc"
+pkgdesc="art_standalone TLS provider (wolfssljni) with the session cache and end-of-stream fixes"
+url="https://gitlab.com/android_translation_layer/art_standalone"
+arch="noarch"
+license="GPL-2.0-or-later"
+depends="art_standalone"
+makedepends="art_standalone-dev openjdk8-jdk zip"
+# takes over one file of art_standalone
+replaces="art_standalone"
+replaces_priority=10
+options="!check"
+# the patches come from patches/titan2-art-wolfssljni (links to patches/art_standalone): the build
+# script adds them to source= and raises pkgrel by 100 + the number of patches
+source="https://gitlab.com/android_translation_layer/art_standalone/-/archive/$_commit/art_standalone-$_commit.tar.gz"
+builddir="$srcdir/art_standalone-$_commit"
+
+build() {
+	cd "$builddir"/external/wolfssljni
+	# as external/wolfssljni/Android.mk: all Java sources but the JDK 8 helper
+	find src/java -name '*.java' ! -name WolfSSLJDK8Helper.java | sort >srcs
+	mkdir -p cls
+	/usr/lib/jvm/java-1.8-openjdk/bin/javac -nowarn -source 1.8 -target 1.8 -encoding UTF-8 \
+		-bootclasspath /usr/lib/java/core-all_classes.jar -d cls @srcs
+	/usr/lib/jvm/java-1.8-openjdk/bin/java -jar /usr/lib/java/dx.jar --dex --min-sdk-version=27 --output=classes.dex cls
+	mkdir -p META-INF
+	printf 'Manifest-Version: 1.0\r\nCreated-By: titan2-art-wolfssljni\r\n\r\n' >META-INF/MANIFEST.MF
+	rm -f wolfssljni-hostdex.jar
+	zip -q -X wolfssljni-hostdex.jar META-INF/MANIFEST.MF classes.dex
+}
+
+package() {
+	install -Dm755 "$builddir"/external/wolfssljni/wolfssljni-hostdex.jar \
+		"$pkgdir"/usr/lib/java/dex/art/wolfssljni-hostdex.jar
+}
+
+sha512sums="
+75ef56d63dfc7661a7928191441d4672d612b6a8d27c3957764d324e4f622a42c132c34540f6a89556b1971964df8be2eced0b8a599d5a793ab3039cfb9c48a2  art_standalone-e78bf68917bcaaf58fef3960cd88793b3b7f39cc.tar.gz
+"

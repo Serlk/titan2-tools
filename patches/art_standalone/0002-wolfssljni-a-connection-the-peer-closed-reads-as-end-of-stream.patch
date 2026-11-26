@@ -1,0 +1,82 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] wolfssljni: a connection the peer closed reads as end of stream
+
+external/wolfssljni is the wolfSSL JNI/JSSE provider (Copyright (C) wolfSSL
+Inc., GPL-2.0-or-later); this changes one of its files under the same
+licence.
+
+When the peer closes the TCP connection without a close_notify alert (or
+resets it), native wolfSSL_read() returns 0 with SOCKET_PEER_CLOSED_E.
+WolfSSLInputStream.read() tests for exactly that to report the end of the
+stream, but a native library built with the OpenSSL compatibility layer
+reports the error as SSL_ERROR_SYSCALL (5): the test missed, read()
+returned 0, and the caller's next read() failed with
+"Native wolfSSL_read() error: fatal I/O error in TLS layer (error code: 5)"
+because wolfSSL refuses to read in an error state. An HTTP client thus saw
+an odd I/O error where the server had simply closed the connection.
+
+read() now takes SSL_ERROR_SYSCALL with a return value of 0 as the end of
+the stream too, remembers the end (further reads return -1 without calling
+into the native object), and the single-byte read() returns -1 at the end
+instead of a zero byte.
+
+---
+ .../com/wolfssl/provider/jsse/WolfSSLSocket.java   | 23 ++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLSocket.java b/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLSocket.java
+index 8b4671e..85c7da7 100644
+--- a/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLSocket.java
++++ b/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLSocket.java
+@@ -1732,6 +1732,8 @@ public class WolfSSLSocket extends SSLSocket {
+         private WolfSSLSession ssl;
+         private WolfSSLSocket  socket;
+         final private Object readLock = new Object();
++        /* set under readLock once the peer has ended the stream */
++        private boolean endOfStream = false;
+ 
+         public WolfSSLInputStream(WolfSSLSession ssl, WolfSSLSocket socket) {
+             this.ssl = ssl;
+@@ -1754,6 +1756,11 @@ public class WolfSSLSocket extends SSLSocket {
+                 throw new IndexOutOfBoundsException(ioe.toString());
+             }
+ 
++            /* end of stream is -1, not a zero byte */
++            if (ret < 0) {
++                return -1;
++            }
++
+             return (data[0] & 0xFF);
+         }
+ 
+@@ -1787,6 +1794,12 @@ public class WolfSSLSocket extends SSLSocket {
+                     }
+                 }
+ 
++                /* the peer has ended the stream: it stays ended. Native
++                 * wolfSSL_read() refuses further calls with an error. */
++                if (this.endOfStream) {
++                    return -1;
++                }
++
+                 /* do handshake if not completed yet, handles synchronization */
+                 try {
+                     /* do handshake if not completed yet, handles synchronization */
+@@ -1826,9 +1839,15 @@ public class WolfSSLSocket extends SSLSocket {
+                     WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
+                         "ssl.read() ret = " + ret + ", err = " + err);
+ 
+-                    /* check for end of stream */
++                    /* check for end of stream. A peer that closes the
++                     * connection without a close_notify alert makes native
++                     * wolfSSL_read() return 0 with SOCKET_PEER_CLOSED_E; a
++                     * native library with the OpenSSL compatibility layer
++                     * reports that error as SSL_ERROR_SYSCALL. */
+                     if ((err == WolfSSL.SSL_ERROR_ZERO_RETURN) ||
+-                        ((err == WolfSSL.SSL_ERROR_SOCKET_PEER_CLOSED) && (ret == 0))) {
++                        ((err == WolfSSL.SSL_ERROR_SOCKET_PEER_CLOSED) && (ret == 0)) ||
++                        ((err == WolfSSL.SSL_ERROR_SYSCALL) && (ret == 0))) {
++                        this.endOfStream = true;
+                         WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
+                             "ssl.read() got SSL_ERROR_ZERO_RETURN, " + err +
+                             ", end of stream");

@@ -1,0 +1,387 @@
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Subject: [PATCH] wolfssljni: session cache without freed sessions and races
+
+external/wolfssljni is the wolfSSL JNI/JSSE provider (Copyright (C) wolfSSL
+Inc., GPL-2.0-or-later); this changes three of its files under the same
+licence.
+
+SSLSessionContext.setSessionTimeout() threw
+"IllegalStateException: Object has been freed" as soon as the session
+cache held a session whose connection had been closed: the cache keeps
+such sessions for resumption, their WOLFSSL object is freed with the
+connection, and updateTimeouts() called into that object for every entry.
+An application that sets the timeout per connection (in its hostname
+verifier, for one) failed on every connection after the first closed one.
+The cache table itself, a LinkedHashMap, was read and written by all
+connection threads without any lock.
+
+- WolfSSLAuthStore: every access to the session table holds one lock
+  (lookup and resume, insert, the id listings, the timeout walk, resize).
+  The timeout walk removes timed-out and invalidated sessions from the
+  table and does not touch their native session; a lookup that finds an
+  invalidated entry removes it, so the peer's next good session can be
+  stored. resizeCache() copied the empty new table into the old one and
+  lost every session; it keeps them now.
+- WolfSSLImplementSSLSession: a session without a live WOLFSSL object
+  keeps a timeout it is given and applies it when it is attached to a
+  connection again (resume). getId() returns the id the session had
+  instead of printing a stack trace and returning null once the
+  connection is gone.
+- WolfSSLSession: setSessTimeout()/getSessTimeout() are synchronized like
+  freeSSL(), so the object cannot be freed between the check and the
+  native call; setSessTimeoutIfActive() reports a freed object through its
+  return value for callers that share the object with other threads.
+---
+  external/wolfssljni/src/java/com/wolfssl/WolfSSLSession.java    |  47 ++++++++++-
+  .../src/java/com/wolfssl/provider/jsse/WolfSSLAuthStore.java    | 118 +++++++++++++++++++---------
+  .../com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java   |  42 ++++++++--
+  3 files changed, 161 insertions(+), 46 deletions(-)
+
+diff --git a/external/wolfssljni/src/java/com/wolfssl/WolfSSLSession.java b/external/wolfssljni/src/java/com/wolfssl/WolfSSLSession.java
+index a0d38a7..1ffcc5a 100644
+--- a/external/wolfssljni/src/java/com/wolfssl/WolfSSLSession.java
++++ b/external/wolfssljni/src/java/com/wolfssl/WolfSSLSession.java
+@@ -1050,10 +1050,13 @@ public class WolfSSLSession {
+      * @see         #setSession(long)
+      * @see         #getSession(long)
+      */
+-    public long setSessTimeout(long t) throws IllegalStateException {
++    public synchronized long setSessTimeout(long t)
++        throws IllegalStateException {
+ 
+         long session;
+ 
++        /* synchronized like freeSSL(): the native object cannot be freed
++         * between this check and the native calls below */
+         if (this.active == false)
+             throw new IllegalStateException("Object has been freed");
+ 
+@@ -1075,7 +1078,7 @@ public class WolfSSLSession {
+      * @see         #setSession(long)
+      * @see         #getSession(long)
+      */
+-    public long getSessTimeout() throws IllegalStateException {
++    public synchronized long getSessTimeout() throws IllegalStateException {
+ 
+         if (this.active == false)
+             throw new IllegalStateException("Object has been freed");
+@@ -1083,6 +1086,46 @@ public class WolfSSLSession {
+         return getSessTimeout(this.getSession());
+     }
+ 
++    /**
++     * Sets the timeout in seconds in the WOLFSSL_SESSION of this object,
++     * if this object has not been freed.
++     * <p>
++     * For callers that hold a reference to an object another thread may
++     * free at any time (a session cache walking its entries): the check
++     * and the native call are one step with respect to
++     * <code>freeSSL()</code>, and a freed object is reported through the
++     * return value.
++     *
++     * @param t time in seconds to set
++     * @return WolfSSL.SSL_SUCCESS on success,
++     *         WolfSSL.JNI_SESSION_UNAVAILABLE if this object has been freed
++     *         or its session is unavailable, or negative values on failure.
++     */
++    public synchronized long setSessTimeoutIfActive(long t) {
++
++        long session;
++
++        if (this.active == false)
++            return WolfSSL.JNI_SESSION_UNAVAILABLE;
++
++        session = getSession(getSessionPtr());
++        if (session == 0)
++            return WolfSSL.JNI_SESSION_UNAVAILABLE;
++
++        return setSessTimeout(session, t);
++    }
++
++    /**
++     * Tells if the native object behind this one is still allocated.
++     * The answer can be outdated as soon as it is returned, unless the
++     * caller keeps other threads from calling <code>freeSSL()</code>.
++     *
++     * @return true if <code>freeSSL()</code> has not been called
++     */
++    public synchronized boolean isActive() {
++        return this.active;
++    }
++
+     /**
+      * Sets the timeout in seconds in the given SSL object.
+      *
+diff --git a/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLAuthStore.java b/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLAuthStore.java
+index 57538b8..644ed62 100644
+--- a/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLAuthStore.java
++++ b/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLAuthStore.java
+@@ -43,6 +43,7 @@ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Date;
+ import java.util.Enumeration;
++import java.util.Iterator;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -59,6 +60,10 @@ public class WolfSSLAuthStore {
+     private SecureRandom sr = null;
+     private String alias = null;
+     private SessionStore<Integer, WolfSSLImplementSSLSession> store;
++    /* The session table is read and changed by every connection of every
++     * thread that uses this context; all access to it holds this lock.
++     * Lock order: storeLock, then a session, then its WolfSSLSession. */
++    private final Object storeLock = new Object();
+     private WolfSSLSessionContext serverCtx = null;
+     private WolfSSLSessionContext clientCtx = null;
+ 
+@@ -269,8 +274,12 @@ public class WolfSSLAuthStore {
+                     new SessionStore<Integer, WolfSSLImplementSSLSession>(sz);
+ 
+         //@TODO check for side server/client, currently a resize is for all
+-        store.putAll(newStore);
+-        store = newStore;
++        synchronized (storeLock) {
++            /* keep the cached sessions (the newest ones, if the table
++             * shrinks: the table drops its eldest entry when it is full) */
++            newStore.putAll(store);
++            store = newStore;
++        }
+     }
+ 
+     /** Returns either an existing session to use or creates a new session. Can
+@@ -301,21 +310,28 @@ public class WolfSSLAuthStore {
+ 
+         /* check if is in table */
+         toHash = host.concat(Integer.toString(port));
+-        ses = store.get(toHash.hashCode());
+-        if (ses != null && !ses.isValid())
+-            ses = null;
+-        if (ses == null) {
+-            WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
+-                    "session not found in cache table, creating new");
+-            /* not found in stored sessions create a new one */
+-            ses = new WolfSSLImplementSSLSession(ssl, port, host, this);
+-            ses.setValid(true); /* new sessions marked as valid */
+-            ses.setPseudoSessionId(Integer.toString(ssl.hashCode()).getBytes());
+-        }
+-        else {
+-            WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
+-                    "session found in cache, trying to resume");
+-            ses.resume(ssl);
++        synchronized (storeLock) {
++            ses = store.get(toHash.hashCode());
++            if (ses != null && !ses.isValid()) {
++                /* an invalidated session is of no use to anyone: drop it,
++                 * so that the next good session of this peer can be stored */
++                store.remove(toHash.hashCode());
++                ses = null;
++            }
++            if (ses == null) {
++                WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
++                        "session not found in cache table, creating new");
++                /* not found in stored sessions create a new one */
++                ses = new WolfSSLImplementSSLSession(ssl, port, host, this);
++                ses.setValid(true); /* new sessions marked as valid */
++                ses.setPseudoSessionId(
++                        Integer.toString(ssl.hashCode()).getBytes());
++            }
++            else {
++                WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
++                        "session found in cache, trying to resume");
++                ses.resume(ssl);
++            }
+         }
+         return ses;
+     }
+@@ -357,13 +373,16 @@ public class WolfSSLAuthStore {
+                 hashCode = Arrays.toString(session.getId()).hashCode();
+         }
+ 
+-        if (hashCode != 0 && store.containsKey(hashCode) != true) {
+-            WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
+-                    "stored session in cache table (host: " +
+-                    session.getPeerHost() + ", port: " +
+-                    session.getPeerPort() + ") " +
+-                    "hashCode = " + hashCode + " side = " + session.getSide());
++        synchronized (storeLock) {
++            if (hashCode != 0 && store.containsKey(hashCode) != true) {
++                WolfSSLDebug.log(getClass(), WolfSSLDebug.INFO,
++                        "stored session in cache table (host: " +
++                        session.getPeerHost() + ", port: " +
++                        session.getPeerPort() + ") " +
++                        "hashCode = " + hashCode + " side = " +
++                        session.getSide());
+                 store.put(hashCode, session);
++            }
+         }
+         return WolfSSL.SSL_SUCCESS;
+     }
+@@ -377,10 +396,13 @@ public class WolfSSLAuthStore {
+     protected Enumeration<byte[]> getAllIDs(int side) {
+         List<byte[]> ret = new ArrayList<byte[]>();
+ 
+-        for (Object obj : store.values()) {
+-            WolfSSLImplementSSLSession current = (WolfSSLImplementSSLSession)obj;
+-            if (current.getSide() == side) {
+-                ret.add(current.getId());
++        synchronized (storeLock) {
++            for (Object obj : store.values()) {
++                WolfSSLImplementSSLSession current =
++                    (WolfSSLImplementSSLSession)obj;
++                if (current.getSide() == side && current.isValid()) {
++                    ret.add(current.getId());
++                }
+             }
+         }
+         return Collections.enumeration(ret);
+@@ -396,12 +418,15 @@ public class WolfSSLAuthStore {
+     protected WolfSSLImplementSSLSession getSession(byte[] ID, int side) {
+         WolfSSLImplementSSLSession ret = null;
+ 
+-        for (Object obj : store.values()) {
+-            WolfSSLImplementSSLSession current = (WolfSSLImplementSSLSession)obj;
+-            if (current.getSide() == side &&
+-                    java.util.Arrays.equals(ID, current.getId())) {
+-                ret = current;
+-                break;
++        synchronized (storeLock) {
++            for (Object obj : store.values()) {
++                WolfSSLImplementSSLSession current =
++                    (WolfSSLImplementSSLSession)obj;
++                if (current.getSide() == side &&
++                        java.util.Arrays.equals(ID, current.getId())) {
++                    ret = current;
++                    break;
++                }
+             }
+         }
+         return ret;
+@@ -418,12 +443,18 @@ public class WolfSSLAuthStore {
+         Date currentDate = new Date();
+         long now = currentDate.getTime();
+ 
+-        for (Object obj : store.values()) {
+-            long diff;
+-            WolfSSLImplementSSLSession current =
+-                (WolfSSLImplementSSLSession)obj;
++        synchronized (storeLock) {
++            Iterator<WolfSSLImplementSSLSession> it =
++                store.values().iterator();
++
++            while (it.hasNext()) {
++                long diff;
++                WolfSSLImplementSSLSession current = it.next();
++
++                if (current.getSide() != side) {
++                    continue;
++                }
+ 
+-            if (current.getSide() == side) {
+                 /* difference in seconds */
+                 diff = (now - current.creation.getTime()) / 1000;
+ 
+@@ -435,6 +466,17 @@ public class WolfSSLAuthStore {
+                 if (in > 0 && diff > in) {
+                     current.invalidate();
+                 }
++
++                if (!current.isValid()) {
++                    /* timed out or invalidated: it leaves the table and
++                     * its native session is not touched any more */
++                    it.remove();
++                    continue;
++                }
++
++                /* A session whose connection is closed has no live native
++                 * object; it keeps the value for when it is resumed, see
++                 * WolfSSLImplementSSLSession.setNativeTimeout(). */
+                 current.setNativeTimeout(in);
+             }
+         }
+diff --git a/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java b/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java
+index e5eb1a9..c92bcdd 100644
+--- a/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java
++++ b/external/wolfssljni/src/java/com/wolfssl/provider/jsse/WolfSSLImplementSSLSession.java
+@@ -66,6 +66,13 @@ public class WolfSSLImplementSSLSession implements SSLSession {
+     protected boolean fromTable = false;
+ 
+     private long sesPtr = 0;
++    /* Timeout given while no live WOLFSSL object was attached to this
++     * session; applied when the session is attached to one again. */
++    private long pendingTimeout = 0;
++    private boolean timeoutPending = false;
++    /* Session ID as last read from the WOLFSSL object, for the time after
++     * that object has been freed. */
++    private byte[] lastId = null;
+     private String nullCipher = "SSL_NULL_WITH_NULL_NULL";
+     private String nullProtocol = "NONE";
+ 
+@@ -140,15 +147,17 @@ public class WolfSSLImplementSSLSession implements SSLSession {
+             /* use pseudo session ID if session tickets are being used */
+             if (this.ssl.getVersion().equals("TLSv1.3") ||
+                 this.ssl.sessionTicketsEnabled()) {
+-                 return this.pseudoSessionID;
++                this.lastId = this.pseudoSessionID;
+             }
+             else {
+-                return this.ssl.getSessionID();
++                this.lastId = this.ssl.getSessionID();
+             }
+         } catch (IllegalStateException | WolfSSLJNIException e) {
+-            e.printStackTrace();
+-            return null;
++            /* The connection this session came from is closed and its
++             * WOLFSSL object freed: a session waiting in the cache to be
++             * resumed keeps the ID it had. */
+         }
++        return (this.lastId != null) ? this.lastId : new byte[0];
+     }
+ 
+     /**
+@@ -533,6 +542,13 @@ public class WolfSSLImplementSSLSession implements SSLSession {
+     protected synchronized void resume(WolfSSLSession in) {
+         ssl = in;
+         ssl.setSession(this.sesPtr);
++        if (this.timeoutPending) {
++            /* a timeout set while the session had no live WOLFSSL object */
++            if (ssl.setSessTimeoutIfActive(this.pendingTimeout) ==
++                    WolfSSL.SSL_SUCCESS) {
++                this.timeoutPending = false;
++            }
++        }
+     }
+ 
+ 
+@@ -541,6 +557,8 @@ public class WolfSSLImplementSSLSession implements SSLSession {
+      */
+     protected synchronized void setResume() {
+         if (ssl != null) {
++            /* last chance to read the ID before the WOLFSSL object goes */
++            getId();
+             this.sesPtr = ssl.getSession();
+         }
+     }
+@@ -549,8 +567,20 @@ public class WolfSSLImplementSSLSession implements SSLSession {
+      * Sets the native WOLFSSL_SESSION timeout
+      * @param in timeout in seconds
+      */
+-    protected void setNativeTimeout(long in) {
+-        ssl.setSessTimeout(in);
++    protected synchronized void setNativeTimeout(long in) {
++        /* A session stays in the cache after its connection was closed and
++         * the WOLFSSL object freed, so that a later connection can resume
++         * it. Such a session has no native object to take the timeout now:
++         * keep the value and apply it in resume(). The same holds if the
++         * object is freed by another thread while this runs. */
++        if (ssl == null ||
++            ssl.setSessTimeoutIfActive(in) != WolfSSL.SSL_SUCCESS) {
++            this.pendingTimeout = in;
++            this.timeoutPending = true;
++        }
++        else {
++            this.timeoutPending = false;
++        }
+     }
+ 
+ 
