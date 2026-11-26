@@ -75,6 +75,12 @@ The Alpine package is `tools/aports/titan2-vendor-runtime` (`-dev` carries the t
 bionic_exe sources and headers under `/usr/share/titan2-vendor-runtime/src`, which the
 Makefiles of titan2-fingerprint and titan2-gnss use as `VENDOR_RUNTIME`). It needs
 `bionic_translation` with the patches above (Alpine's package rebuilt with 0001–0008, pkgrel 108).
+Both, in this order, from the root of titan2-tools (`scripts/build-atl.sh build` takes the patches
+from `patches/bionic_translation/` here and raises pkgrel to 108 itself):
+
+```
+scripts/t2-repo.sh aport bionic_translation tools/aports/titan2-vendor-runtime
+```
 
 ## Related repositories
 

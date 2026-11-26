@@ -8,38 +8,48 @@
 #
 #   scripts/t2-repo.sh keygen        create the signing key out/t2-repo-keys/t2-repo.rsa(.pub)
 #                                    (once; keep it, the phone trusts its public half)
-#   scripts/t2-repo.sh aport DIR...  build our own aports (DIR = a directory with an APKBUILD, e.g.
-#                                    tools/aports/titan2-vendor-runtime, or the aports of another
-#                                    repository, e.g. external/titan2-gnss/aports/titan2-gnss)
-#                                    for aarch64 -> out/t2-packages/<arch>/*.apk
+#   scripts/t2-repo.sh aport PKG|DIR...
+#                                    build aarch64 packages with scripts/build-atl.sh build: DIR is
+#                                    a directory with an APKBUILD (tools/aports/titan2-sensors, or
+#                                    the aports of another repository, ../titan2-gnss/aports/titan2-gnss),
+#                                    PKG a name of tools/aports/ or an Alpine aport that build-atl.sh
+#                                    knows (bionic_translation, with our patches) ->
+#                                    out/atl/packages/aports/aarch64, signed with the key above.
+#                                    Built in the order given; every package sees the ones built
+#                                    before it (that directory is a local repository), e.g.
+#                                    aport bionic_translation tools/aports/titan2-vendor-runtime \
+#                                          ../titan2-fingerprint/aports/titan2-fingerprint
 #   scripts/t2-repo.sh build         collect the packages -> out/t2-repo/aarch64/*.apk + APKINDEX.tar.gz
-#                                    signed with the key above
+#                                    signed with the key above (a new index on every call)
 #   scripts/t2-repo.sh list          what the index contains
 #
-# An aport may have a file "tarball" naming a directory, relative to the root of the git
-# repository that holds the aport (e.g. tools/titan2-vendor-runtime); it is packed as
-# <pkgname>.tar.gz next to the APKBUILD. The sha512 of every *.tar.gz next to the APKBUILD (that
+# An aport may have a file "tarball" naming a directory to pack as <pkgname>.tar.gz next to the
+# APKBUILD (a bare name is a directory under tools/ of the git checkout that holds the aport, a
+# path with "/" is relative to its root). The sha512 of every *.tar.gz next to the APKBUILD (that
 # one, or archives made beforehand: "make dist" in titan2-fingerprint and titan2-gnss) is written
-# into the staged APKBUILD.
-# "aport" runs abuild in an alpine aarch64 container (docker --platform linux/arm64): the host
-# needs qemu-user binfmt support for aarch64 (e.g. the qemu-user-static package).
+# into the staged APKBUILD. "aport" runs under emulation in a container like build-atl.sh (docker
+# and a host kernel >= 6.7; qemu-aarch64 in a private binfmt_misc, nothing on the host changes).
 #
 # Sources of "build" (all optional; missing ones are skipped with a note):
-#   out/t2-packages/aarch64, out/t2-packages/noarch   our aports ("aport" above)
-#   EXTRA_APK_DIRS="dir ..."   more directories with *.apk inside this repository, e.g. a Mesa or
-#                              libcamera build
+#   out/t2-packages/aarch64, out/t2-packages/noarch   e.g. Mesa (scripts/build-mesa.sh build)
+#   out/atl/packages/aports/aarch64                   "aport" above, scripts/build-atl.sh build
+#   out/libcamera/packages/aports/aarch64             titan2-camera's scripts/build-libcamera.sh
+#                                                     with OUT=../titan2-tools/out/libcamera
+#   EXTRA_APK_DIRS="dir ..."   more directories with *.apk inside this repository (all of them in
+#                              the same call: each call makes the index anew)
 # Package signatures stay as they are (Alpine's key for pinned Alpine binaries, ours for our
-# builds); only the index is signed with our key. apk picks the highest version of a name, so
-# rebuilds with a higher pkgrel win over Alpine copies of the same name.
+# builds); only the index is signed with our key. Every package must be signed by one of the two
+# keys (apk on the phone checks them). apk picks the highest version of a name, so rebuilds with
+# a higher pkgrel win over Alpine copies of the same name.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$ROOT/out/t2-repo
-PKG=$ROOT/out/t2-packages
 KEYS=$ROOT/out/t2-repo-keys
 KEY=t2-repo.rsa
 REL=${ALPINE_RELEASE:-v3.24}
 IMG=alpine:${REL#v}
-SRC_DIRS="out/t2-packages/aarch64 out/t2-packages/noarch ${EXTRA_APK_DIRS:-}"
+SRC_DIRS="out/t2-packages/aarch64 out/t2-packages/noarch out/atl/packages/aports/aarch64
+out/libcamera/packages/aports/aarch64 ${EXTRA_APK_DIRS:-}"
 
 need_key() {
 	[ -f "$KEYS/$KEY" ] && [ -f "$KEYS/$KEY.pub" ] ||
@@ -58,71 +68,10 @@ cmd_keygen() {
 	echo "key: $KEYS/$KEY (+ .pub)"
 }
 
-# one aport -> a staging copy (with the tarball) in out/t2-packages/src/<name>
-stage_aport() {
-	local a=$1 p d src top sum
-	a=$(realpath -m "$a")
-	[ -f "$a/APKBUILD" ] || { echo "$a: no APKBUILD" >&2; exit 1; }
-	p=$(basename "$a")
-	d=$PKG/src/$p
-	rm -rf "$d" && mkdir -p "$d"
-	cp "$a"/* "$d/"
-	if [ -f "$a/tarball" ]; then
-		top=$(git -C "$a" rev-parse --show-toplevel 2>/dev/null) ||
-			{ echo "$a: not inside a git checkout, cannot resolve the tarball path" >&2; exit 1; }
-		src=$(cat "$a/tarball")
-		[ -d "$top/$src" ] || { echo "aport $p: no $top/$src" >&2; exit 1; }
-		rm -f "$d/tarball"
-		tar -C "$top/$(dirname "$src")" --exclude='*.o' --exclude='__pycache__' --exclude='*.pyc' \
-			--exclude='*.orig' --exclude='*.rej' --exclude='*~' --exclude='build' \
-			--owner=0 --group=0 --mtime=@0 --sort=name \
-			-czf "$d/$p.tar.gz" "$(basename "$src")"
-	fi
-	# local source archives (the packed tarball, or one made beforehand, e.g. by "make dist" of
-	# titan2-fingerprint/titan2-gnss): their sha512 replaces the sha512sums of the APKBUILD
-	sum=$(cd "$d" && for f in *.tar.gz; do [ ! -f "$f" ] || sha512sum "$f"; done)
-	if [ -n "$sum" ]; then
-		awk -v s="$sum" '/^sha512sums="/ {print; print s; skip=1; next}
-			skip && /^"/ {skip=0} !skip {print}' "$d/APKBUILD" >"$d/APKBUILD.new" &&
-			mv "$d/APKBUILD.new" "$d/APKBUILD"
-	fi
-	echo "$p"
-}
-
 cmd_aport() {
-	[ $# -ge 1 ] || { echo "aport DIR..." >&2; exit 2; }
+	[ $# -ge 1 ] || { echo "aport PKG|DIR..." >&2; exit 2; }
 	need_key
-	docker run --rm --platform linux/arm64 "$IMG" true 2>/dev/null || {
-		echo "cannot run arm64 containers: the host needs qemu-user binfmt support for aarch64" >&2
-		exit 1
-	}
-	local names=() a
-	for a in "$@"; do names+=("$(stage_aport "$a")"); done
-	mkdir -p "$PKG"
-	# abuild runs as an unprivileged user inside the container; the source checksums of
-	# downloaded sources are verified by abuild against the APKBUILD
-	docker run --rm --platform linux/arm64 -v "$PKG:/pkg" -v "$KEYS:/keys:ro" \
-		-v "$ROOT/tools/initramfs/keys:/akeys:ro" -e UIDGID="$(id -u):$(id -g)" -e NAMES="${names[*]}" \
-		"$IMG" sh -euc '
-		apk add -q alpine-sdk >/dev/null
-		adduser -D -h /build b && addgroup b abuild
-		mkdir -p /build/.abuild /out
-		cp /keys/'"$KEY"' /keys/'"$KEY"'.pub /build/.abuild/
-		cp /keys/'"$KEY"'.pub /etc/apk/keys/
-		echo "PACKAGER_PRIVKEY=/build/.abuild/'"$KEY"'" >/build/.abuild/abuild.conf
-		echo "REPODEST=/out" >>/build/.abuild/abuild.conf
-		chown -R b:b /build /out
-		for p in $NAMES; do
-			cp -r /pkg/src/$p /build/$p && chown -R b:b /build/$p
-			su b -c "cd /build/$p && abuild -r"
-		done
-		for a in /out/*/*; do
-			[ -d "$a" ] || continue
-			mkdir -p /pkg/${a##*/}
-			cp "$a"/*.apk /pkg/${a##*/}/
-		done
-		chown -R "$UIDGID" /pkg'
-	ls -l "$PKG"/*/*.apk
+	KEYS=$KEYS KEY=$KEY "$ROOT/scripts/build-atl.sh" build "$@"
 }
 
 cmd_build() {
@@ -171,5 +120,5 @@ keygen) cmd_keygen ;;
 aport) shift; cmd_aport "$@" ;;
 build) cmd_build ;;
 list) cmd_list ;;
-*) sed -n '5,30p' "$0"; exit 2 ;;
+*) sed -n '5,43p' "$0"; exit 2 ;;
 esac

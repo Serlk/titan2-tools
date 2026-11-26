@@ -44,17 +44,24 @@ from the GitLab API).
 ## Build
 
 ```sh
+scripts/t2-repo.sh keygen                         # once: the key of the Titan 2 apk repository
 scripts/build-atl.sh rootfs                       # Alpine aarch64 rootfs with ATL from edge/testing -> out/atl
 scripts/build-atl.sh apks                         # verified test APKs -> out/atl-dl/test-apks
 scripts/build-atl.sh build android-translation-layer   # ATL + patches/android-translation-layer (hours)
 scripts/build-atl.sh build titan2-art-wolfssljni titan2-atl-tools
-EXTRA_APK_DIRS="out/atl/apks out/atl/packages/aports/aarch64" scripts/t2-repo.sh build
+EXTRA_APK_DIRS=out/atl/apks scripts/t2-repo.sh build
 LOCAL_REPO=out/t2-repo GFX=1 ATL=1 scripts/netroot-serve.sh build
 ```
 
 `out/atl/apks` holds the unmodified edge/testing packages ATL needs (art_standalone,
 bionic_translation, libopensles-standalone, libandroidfw, vixl); they keep Alpine's signatures.
-The packages built here are signed with a local key made on the first build
-(`out/atl/build-keys`). On the phone, as the user of the niri session: `atl-check`, then
+The packages built here (`out/atl/packages/aports/aarch64`, which `scripts/t2-repo.sh build`
+indexes by default) are signed with the key of the Titan 2 apk repository,
+`out/t2-repo-keys/t2-repo.rsa` (`KEYS=<dir>` and `KEY=<file name>` for another key;
+`build-atl.sh build` runs `scripts/t2-repo.sh keygen` when the default key does not exist yet).
+`PACKAGER="Name <address>"` sets the packager field (default `titan2 builder <builder@localhost>`).
+`scripts/t2-repo.sh build` makes a new index from scratch on every call: give it every
+`EXTRA_APK_DIRS` directory you want in the repository (Mesa, libcamera, `out/atl/apks`) in one call.
+On the phone, as the user of the niri session: `atl-check`, then
 `atl-check run org.happysanta.gd_29.apk`, or `atl-install app.apk` and start it from the launcher.
 The device profile: `atl-device-profile -o /etc/atl/device.prop <root of your mounted partitions>`.

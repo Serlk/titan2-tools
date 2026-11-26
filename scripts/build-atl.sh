@@ -12,11 +12,21 @@
 #                                        run in the rootfs: cage headless 1440x1440 + llvmpipe,
 #                                        grim screenshots -> out/atl/shots (TIMEOUT=900 SHOTS=60 GSK=cairo|gl)
 #   scripts/build-atl.sh shell [-c COMMAND] aarch64 shell in out/atl/rootfs
-#   scripts/build-atl.sh build [pkg..]   rebuild from the aports APKBUILD (+ patches/<pkg>) for v3.24
-#                                        under emulation -> out/atl/packages (slow; default:
-#                                        android-translation-layer). A package with its own recipe
-#                                        in tools/aports/<pkg> (titan2-atl-tools,
-#                                        titan2-art-wolfssljni) is built from that recipe.
+#   scripts/build-atl.sh build [pkg|DIR..]
+#                                        rebuild from the aports APKBUILD (+ our patches, below) for
+#                                        v3.24 under emulation -> out/atl/packages/aports/aarch64
+#                                        (slow; default: android-translation-layer). A package with
+#                                        its own recipe in tools/aports/<pkg> (titan2-atl-tools,
+#                                        titan2-sensors, titan2-vendor-runtime, ...) is built from that
+#                                        recipe; DIR (a path with "/") is any directory with an
+#                                        APKBUILD, e.g. ../titan2-gnss/aports/titan2-gnss. The packages
+#                                        are built in the order given; each one sees the packages built
+#                                        before it (out/atl/packages/aports is a local repository), so
+#                                        give dependencies first.
+#                                        Our patches of an Alpine package: patches/<pkg>/*.patch, or
+#                                        tools/titan2-vendor-runtime/patches/<pkg>/*.patch
+#                                        (bionic_translation); pkgrel becomes 100 + its own + the number
+#                                        of patches.
 #                                        MAKEDEPENDS_PIN="bionic_translation-dev=0_git20260317-r108": build
 #                                        against exactly this version of a dependency (our rebuild, not edge)
 #   scripts/build-atl.sh local [pkg..]   install what was built (out/atl/packages) into out/atl/rootfs
@@ -32,9 +42,11 @@
 # Test APKs: atl_test_apks (ATL on GitLab), checked by the git blob sha1 from the GitLab API;
 # F-Droid: the sha256 from index-v1.jar, whose signature tools/atl/fdroid-verify.py checks
 # (the F-Droid repository certificate by its known fingerprint). No APK is part of this repository.
-# The packages are signed with a local key made on the first build (out/atl/build-keys); to put
-# them into the Titan 2 apk repository:
-#   EXTRA_APK_DIRS=out/atl/packages/aports/aarch64 scripts/t2-repo.sh build
+# The packages are signed with the key of the Titan 2 apk repository, KEYS=out/t2-repo-keys
+# (t2-repo.rsa; made by scripts/t2-repo.sh keygen when it does not exist yet, KEY=<file name> for
+# another one), so scripts/t2-repo.sh build takes them as they are (it indexes
+# out/atl/packages/aports/aarch64 by default). PACKAGER="Name <address>" goes into the packages
+# (default "titan2 builder <builder@localhost>").
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$ROOT/out/atl
@@ -42,6 +54,8 @@ DL=$ROOT/out/atl-dl
 REL=${ALPINE_RELEASE:-v3.24}
 IMG=alpine:${REL#v}
 PYIMG=titan2-atl-py:${REL#v}  # alpine + python3 + openssl (local image)
+KEYS=$(realpath -m "${KEYS:-$ROOT/out/t2-repo-keys}")
+KEY=${KEY:-t2-repo.rsa}
 mkdir -p "$OUT/shots" "$DL/apk-cache-x86" "$DL/apk-cache" "$DL/test-apks"
 
 dk() {
@@ -49,7 +63,20 @@ dk() {
 		--cap-add SYS_ADMIN -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
 		-e ALPINE_RELEASE="$REL" -e EXTRA_PKGS="${EXTRA_PKGS:-}" -e TIMEOUT="${TIMEOUT:-900}" \
 		-e SHOTS="${SHOTS:-60}" -e GSK="${GSK:-}" -e ATL_COMMIT="${ATL_COMMIT:-}" -e MAKEDEPENDS_PIN="${MAKEDEPENDS_PIN:-}" -e ATL_LOG="${ATL_LOG:-}" -e TERM="${TERM:-xterm}" \
+		-e KEY="$KEY" -e PACKAGER="${PACKAGER:-titan2 builder <builder@localhost>}" \
+		${KEYS_MOUNT:+-v "$KEYS:/keys:ro"} \
 		-v "$ROOT:/work:ro" -v "$OUT:/out" -v "$DL:/dl" "$IMG" sh /work/tools/atl/inner.sh "$@"
+}
+
+# the signing key for "build" (scripts/t2-repo.sh keygen makes it when it does not exist)
+need_key() {
+	if [ ! -f "$KEYS/$KEY" ]; then
+		[ "$KEYS" = "$ROOT/out/t2-repo-keys" ] && [ "$KEY" = t2-repo.rsa ] ||
+			{ echo "no signing key $KEYS/$KEY" >&2; exit 1; }
+		"$ROOT/scripts/t2-repo.sh" keygen
+	fi
+	[ -f "$KEYS/$KEY.pub" ] || { echo "no $KEYS/$KEY.pub" >&2; exit 1; }
+	KEYS_MOUNT=1
 }
 
 # the host's python3 is not used: the checks run in the container (python3 -I, /work read-only)
@@ -154,19 +181,28 @@ fetch_aports() {
 	echo "aports testing/$p @ ${c:0:12}: $(ls "$d" | tr '\n' ' ')"
 }
 
-# our own packages: tools/aports/<pkg>/APKBUILD (+ file "tarball" naming the directory to pack
-# as <pkg>.tar.gz: a bare name is a directory under tools/, a path with "/" is relative to the
-# repository root (tools/atl/overlay); its sha512 is written into the APKBUILD).
-# Caches and editor/patch leftovers never go into the tarball.
+# our own packages: an aport directory <a> (tools/aports/<pkg>, or the aports of another
+# repository: ../titan2-gnss/aports/titan2-gnss). A file "tarball" in it names the directory to
+# pack as <pkg>.tar.gz, relative to the root of the git checkout that holds <a>: a bare name is a
+# directory under tools/, a path with "/" is relative to that root (tools/atl/overlay). Caches
+# and editor/patch leftovers never go into the tarball. The sha512 of every local *.tar.gz (that
+# tarball, or archives made beforehand: "make dist" in titan2-fingerprint and titan2-gnss) is
+# written into the staged APKBUILD, as "abuild checksum" would.
 local_aports() {
-	local p=$1 d=$DL/src/aports-$1 src sum base
+	local a=$1 p d src sum base top
+	a=$(realpath -m "$a")
+	[ -f "$a/APKBUILD" ] || { echo "$a: no APKBUILD" >&2; exit 1; }
+	p=$(basename "$a")
+	d=$DL/src/aports-$p
 	rm -rf "$d" && mkdir -p "$d"
-	cp "$ROOT/tools/aports/$p"/* "$d/"
-	if [ -f "$ROOT/tools/aports/$p/tarball" ]; then
-		src=$(cat "$ROOT/tools/aports/$p/tarball")
+	cp "$a"/* "$d/"
+	if [ -f "$a/tarball" ]; then
+		top=$(git -C "$a" rev-parse --show-toplevel 2>/dev/null) ||
+			{ echo "local aports $p: $a is not inside a git checkout (tarball path)" >&2; exit 1; }
+		src=$(cat "$a/tarball")
 		case "$src" in
-		*/*) base=$ROOT/$(dirname "$src"); src=$(basename "$src") ;;
-		*) base=$ROOT/tools ;;
+		*/*) base=$top/$(dirname "$src"); src=$(basename "$src") ;;
+		*) base=$top/tools ;;
 		esac
 		[ -d "$base/$src" ] || { echo "local aports $p: no $base/$src" >&2; exit 1; }
 		rm -f "$d/tarball"
@@ -174,11 +210,15 @@ local_aports() {
 			--exclude='*.orig' --exclude='*.orig[0-9]' --exclude='*.rej' --exclude='*.pre-silence*' \
 			--exclude='*~' --owner=0 --group=0 --mtime=@0 --sort=name \
 			-czf "$d/$p.tar.gz" "$src"
-		sum=$(sha512sum "$d/$p.tar.gz" | cut -d' ' -f1)
-		awk -v f="$p.tar.gz" -v s="$sum" '/^sha512sums="/ {print; print s "  " f; skip=1; next} skip && /^"/ {skip=0} !skip {print}' \
+	fi
+	sum=$(cd "$d" && for f in *.tar.gz; do [ ! -f "$f" ] || sha512sum "$f"; done)
+	if [ -n "$sum" ]; then
+		awk -v s="$sum" '/^sha512sums="/ {print; print s; skip=1; next} skip && /^"/ {skip=0} !skip {print}' \
 			"$d/APKBUILD" >"$d/APKBUILD.new" && mv "$d/APKBUILD.new" "$d/APKBUILD"
 	fi
+	grep -q '^sha512sums=' "$d/APKBUILD" || { echo "local aports $p: no sha512sums= in the APKBUILD" >&2; exit 1; }
 	echo "local aports $p: $(ls "$d" | tr '\n' ' ')"
+	STAGED=$p
 }
 
 cmd_status() {
@@ -207,15 +247,24 @@ build)
 	need_kernel
 	shift
 	[ $# -ge 1 ] || set -- android-translation-layer
+	need_key
+	names=()
 	for p in "$@"; do
-		if [ -f "$ROOT/tools/aports/$p/APKBUILD" ]; then local_aports "$p"; else fetch_aports "$p"; fi
+		case "$p" in
+		*/*) local_aports "$p"; names+=("$STAGED") ;;
+		*)
+			if [ -f "$ROOT/tools/aports/$p/APKBUILD" ]; then local_aports "$ROOT/tools/aports/$p"
+			else fetch_aports "$p"
+			fi
+			names+=("$p") ;;
+		esac
 	done
 	[ -z "${ATL_COMMIT:-}" ] || cmd_jars
-	dk build "$@" ;;
+	dk build "${names[@]}" ;;
 local) need_kernel; shift; dk local "$@" ;;
 status) cmd_status ;;
 clean)
 	# the rootfs files belong to the user and to uid 100000+ (user namespace): remove them in a container
 	docker run --rm -v "$OUT:/out" "$IMG" sh -c 'rm -rf /out/rootfs /out/buildroot' ;;
-*) sed -n '5,37p' "$0"; exit 2 ;;
+*) sed -n '5,49p' "$0"; exit 2 ;;
 esac

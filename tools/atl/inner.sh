@@ -108,13 +108,25 @@ cmd_test() {
 }
 
 # --- rebuild from aports for v3.24 (emulated: slow) ---
-# /dl/src/aports-<pkg>/APKBUILD (fetched by build-atl.sh from aports at the pinned commit), our
-# patches patches/<pkg>/*.patch are added to source= (the checksums are recomputed only after
-# abuild verify of the original APKBUILD: the upstream archive matched the sha512 from aports).
-# The packages are signed with the local key out/atl/build-keys (on the phone: add its .pub to
-# /etc/apk/keys); result: /out/packages/<arch-repo>/aarch64/*.apk + APKINDEX.
+# /dl/src/aports-<pkg>/APKBUILD (fetched by build-atl.sh from aports at the pinned commit, or our
+# own aport staged by it), our patches (patchdir below) are added to source= (the checksums are
+# recomputed only after abuild verify of the original APKBUILD: the upstream archive matched the
+# sha512 from aports). The packages are signed with the key /keys/$KEY (build-atl.sh: KEYS,
+# default out/t2-repo-keys/t2-repo.rsa, the key of scripts/t2-repo.sh); its .pub is also copied
+# to /out/build-keys for the rootfs and VM modes. Every package built here goes into the local
+# repository /out/packages/aports, which abuild uses for the dependencies of the next ones.
+# Result: /out/packages/aports/aarch64/*.apk + APKINDEX.
+patchdir() {
+	local d
+	for d in /work/patches/$1 /work/tools/titan2-vendor-runtime/patches/$1; do
+		if ls $d/*.patch >/dev/null 2>&1; then echo $d; return 0; fi
+	done
+	return 1
+}
+
 cmd_build() {
-	local B=/out/buildroot p d
+	local B=/out/buildroot p d pd
+	[ -f /keys/"${KEY:?}" ] || { echo "inner.sh build: no signing key /keys/$KEY" >&2; exit 1; }
 	mkdir -p $B/etc/apk/keys /out/build-keys /out/packages
 	cp /work/tools/initramfs/keys/*.rsa.pub $B/etc/apk/keys/
 	# edge/testing without a tag: it has none of the main/community packages, only the missing -dev
@@ -125,18 +137,16 @@ cmd_build() {
 		--repositories-file $B/etc/apk/repositories --cache-dir /dl/apk-cache \
 		alpine-base alpine-sdk sudo
 	mkdir -p $B/keys
-	mount --bind /out/build-keys $B/keys
+	mount --bind /keys $B/keys
 	mkdir -p $B/home/build/packages
 	mount --bind /out/packages $B/home/build/packages
-	if ! ls /out/build-keys/*.rsa >/dev/null 2>&1; then
-		chroot $B sh -c 'cd /keys && openssl genrsa -out titan2-atl.rsa 4096 2>/dev/null &&
-			openssl rsa -in titan2-atl.rsa -pubout -out titan2-atl.rsa.pub 2>/dev/null'
-	fi
+	cp /keys/$KEY.pub /out/build-keys/
+	# the .pub of earlier builds stay trusted too (packages of the local repository signed with them)
 	cp /out/build-keys/*.rsa.pub $B/etc/apk/keys/
 	chroot $B apk update -q
 	mkdir -p $B/root/.abuild
-	printf 'PACKAGER="serlk <22211586+Serlk@users.noreply.github.com>"\nPACKAGER_PRIVKEY=/keys/titan2-atl.rsa\nREPODEST=/home/build/packages\nJOBS=%s\nMAKEFLAGS=-j%s\n' \
-		"$(nproc)" "$(nproc)" >$B/root/.abuild/abuild.conf
+	printf 'PACKAGER="%s"\nPACKAGER_PRIVKEY=/keys/%s\nREPODEST=/home/build/packages\nJOBS=%s\nMAKEFLAGS=-j%s\n' \
+		"${PACKAGER:-titan2 builder <builder@localhost>}" "$KEY" "$(nproc)" "$(nproc)" >$B/root/.abuild/abuild.conf
 	for p in "$@"; do
 		d=$B/home/build/aports/$p
 		rm -rf "$d" && mkdir -p "$d"
@@ -154,16 +164,18 @@ cmd_build() {
 			sed -i -e "/abuild-meson/s|abuild-meson|abuild-meson $jar_opts|" \
 				-e 's/^\tmeson$/\tmeson\n\tpython3\n\tlibsecret-dev/' "$d/APKBUILD"
 		fi
-		if ls /work/patches/$p/*.patch >/dev/null 2>&1; then
-			cp /work/patches/$p/*.patch "$d/"
+		if pd=$(patchdir $p); then
+			cp $pd/*.patch "$d/"
+			echo "$p: $(ls $pd/*.patch | wc -l) patches from ${pd#/work/}"
 			# pkgrel +100+N (N = number of our patches): the Titan 2 package is newer than the one of the
 			# same name in edge/testing (apk picks it), and each new patch gives a new version; otherwise apk
 			# takes the rebuilt package for "already installed" and does not reinstall it
-			npatch=$(ls /work/patches/$p/*.patch | wc -l)
+			# (bionic_translation: pkgrel 0 + 100 + 8 = r108, the version our packages pin)
+			npatch=$(ls $pd/*.patch | wc -l)
 			awk -v n="$npatch" '/^pkgrel=/ {sub(/=.*/, "=" substr($0, 8) + 100 + n)} {print}' "$d/APKBUILD" >"$d/APKBUILD.new" &&
 				mv "$d/APKBUILD.new" "$d/APKBUILD"
 			# add our patches to source= (before the closing quote; the aports' own patches are there already)
-			awk -v list="$(cd /work/patches/$p && ls *.patch | tr '\n' ' ')" '
+			awk -v list="$(cd $pd && ls *.patch | tr '\n' ' ')" '
 				/^source="/ {insrc=1}
 				insrc && /"$/ {sub(/"$/, "\n\t" list "\""); insrc=0}
 				{print}' "$d/APKBUILD" >"$d/APKBUILD.new" && mv "$d/APKBUILD.new" "$d/APKBUILD"
@@ -180,7 +192,7 @@ cmd_build() {
 	find /out/packages -name '*.apk' | sort
 }
 
-# --- built packages (out/packages, key out/build-keys) -> test rootfs ---
+# --- built packages (out/packages, keys out/build-keys) -> test rootfs ---
 cmd_local() {
 	mounts
 	cp /out/build-keys/*.rsa.pub $R/etc/apk/keys/
