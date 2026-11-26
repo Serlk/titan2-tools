@@ -108,7 +108,7 @@ Phone (Alpine aarch64, musl; dynamically linked against `libdbus-1.so.3` from th
 package, which comes with `dbus`), with `$REPO` the checkout of this repository:
 
     SR=$REPO/out/musl-aarch64/sysroot
-    PATH=$REPO/toolchains/clang-r574158/bin:$PATH \
+    PATH=${CLANG_DIR:-$REPO/toolchains/clang-r574158}/bin:$PATH \
     make BIN=t2-powerd-aarch64 \
          CC="clang --target=aarch64-alpine-linux-musl --sysroot=$SR -fuse-ld=lld --gcc-toolchain=$SR/usr" \
          DBUS_CFLAGS="-I$SR/usr/include/dbus-1.0 -I$SR/usr/lib/dbus-1.0/include" DBUS_LIBS="-ldbus-1"

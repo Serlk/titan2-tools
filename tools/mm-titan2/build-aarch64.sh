@@ -21,7 +21,10 @@
 #   a ModemManager checkout at fcc9d19f (Alpine's _commit), default src/ModemManager:
 #     git clone https://gitlab.freedesktop.org/mobile-broadband/ModemManager.git src/ModemManager
 #     git -C src/ModemManager checkout fcc9d19f
-#   AOSP clang r574158 in toolchains/clang-r574158 (or TC=<dir with clang, lld, llvm-ar>).
+#   clang 21 with lld and llvm-ar: CLANG_DIR=<dir with bin/clang> as for scripts/build-mainline.sh
+#   (default toolchains/clang-r574158), or TC=<dir with clang, lld, llvm-ar>. This build runs on
+#   the host: ld.lld of the LLVM 21.1.8 release from GitHub needs the host's libxml2.so.2 (Debian
+#   and Ubuntu: libxml2; Arch Linux: libxml2-legacy); AOSP clang r574158 is self-contained.
 #
 # Usage: tools/mm-titan2/build-aarch64.sh [MM_TREE]   (or MM_TREE=..., SR=..., TC=..., OUT=...)
 # Output: $OUT/dist/ (default out/mm-aarch64/dist/: plugin .so, helper, udev rules, sha256sums);
@@ -32,7 +35,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 mm=${1:-${MM_TREE:-$repo/src/ModemManager}}
 SR=${SR:-$repo/out/mm-aarch64/sysroot}
-TC=${TC:-$repo/toolchains/clang-r574158/bin}
+TC=${TC:-${CLANG_DIR:-$repo/toolchains/clang-r574158}/bin}
 # OUT: where cross.ini, the helper and dist/ go (default out/mm-aarch64);
 # the sysroot stays where SR points
 out=${OUT:-$repo/out/mm-aarch64}
@@ -41,6 +44,8 @@ dist=$out/dist
 command -v patchelf >/dev/null || { echo "patchelf is required to remove build-tree library paths" >&2; exit 1; }
 [ -d "$SR/usr/lib/pkgconfig" ] || { echo "sysroot $SR is not populated (see the header of this script)" >&2; exit 1; }
 [ -x "$TC/clang" ] || { echo "clang not found in $TC" >&2; exit 1; }
+"$TC/ld.lld" --version >/dev/null 2>&1 ||
+	{ echo "$TC/ld.lld does not run on this host (LLVM 21.1.8 from GitHub needs libxml2.so.2)" >&2; exit 1; }
 gccdir=$(ls -d "$SR"/usr/lib/gcc/aarch64-alpine-linux-musl/* 2>/dev/null | head -1)
 [ -n "$gccdir" ] || { echo "the sysroot needs the gcc package (crt files, libgcc)" >&2; exit 1; }
 

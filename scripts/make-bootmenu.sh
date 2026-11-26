@@ -25,6 +25,10 @@
 #   DEFAULT=android|linux|linux-<variant>|ufs, TIMEOUT=5 (seconds; 0: the default entry at once)
 #   NO_LINUX=1   Android only
 #   OUT=out/bootmenu
+#   CLANG_DIR=<dir with bin/clang>: the clang 21 toolchain for titan2-boot (as for
+#                  scripts/build-mainline.sh; default toolchains/clang-r574158). titan2-boot is
+#                  built in the titan2-kbuild container, so the host needs no libraries of its own
+#                  for that toolchain (LLVM 21.1.8 from GitHub needs libxml2.so.2)
 # Output: $OUT/boot.img (for boot_a), $OUT/pack.bin (unpacked image), $OUT/extlinux.conf.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -37,16 +41,22 @@ TB=$ROOT/${TITAN2_BOOT:-titan2-boot}
 [ -f "$TB/tools/mkpack.py" ] || { echo "no titan2-boot in $TB (git clone it there, or set TITAN2_BOOT)" >&2; exit 1; }
 ANDROID_BOOT=$(realpath -m "$ANDROID_BOOT")
 case "$ANDROID_BOOT" in "$ROOT"/*) ;; *) echo "ANDROID_BOOT must be inside $ROOT" >&2; exit 1 ;; esac
-TC=$ROOT/toolchains/clang-r574158
+CLANG_DIR=${CLANG_DIR:-$ROOT/toolchains/clang-r574158}
+[ -x "$CLANG_DIR/bin/clang" ] || { echo "CLANG_DIR: no $CLANG_DIR/bin/clang (clang 21, see scripts/build-mainline.sh)" >&2; exit 1; }
+CLANG_DIR=$(realpath "$CLANG_DIR")
 DEFAULT=${DEFAULT:-android}
 TIMEOUT=${TIMEOUT:-5}
 case "$O" in "$ROOT"/*) ;; *) echo "OUT must be inside $ROOT" >&2; exit 1 ;; esac
 mkdir -p "$O/files/android" "$O/files/linux"
 rm -f "$O"/files/android/* "$O"/files/linux/*
-run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" titan2-kbuild "$@"; }
+run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" -v "$CLANG_DIR:/clang:ro" titan2-kbuild "$@"; }
 w() { echo "/work${1#$ROOT}"; }
 
-make -s -C "$TB" TOOLCHAIN="$TC"
+# OUT=out is explicit: this script's own OUT must not reach titan2-boot's Makefile (OUT ?= out),
+# or the menu would be built elsewhere and an old $TB/out/titan2-boot.bin packed
+TB=$(realpath -m "$TB")
+case "$TB" in "$ROOT"/*) ;; *) echo "TITAN2_BOOT must be inside $ROOT" >&2; exit 1 ;; esac
+run make -s -C "$(w "$TB")" OUT=out TOOLCHAIN=/clang
 C=$O/extlinux.conf
 cat >"$C" <<EOF
 # titan2-boot menu, made by scripts/make-bootmenu.sh

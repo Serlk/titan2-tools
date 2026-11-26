@@ -41,7 +41,7 @@ For the phone (Alpine aarch64, musl, static), as `tools/ccci-rpcd` does; the res
 `t2-modemd-aarch64` so the host binary is not overwritten:
 
     SR=$REPO/out/musl-aarch64/sysroot
-    PATH=$REPO/toolchains/clang-r574158/bin:$PATH \
+    PATH=${CLANG_DIR:-$REPO/toolchains/clang-r574158}/bin:$PATH \
     make BIN=t2-modemd-aarch64 \
          CC="clang --target=aarch64-alpine-linux-musl --sysroot=$SR -fuse-ld=lld --gcc-toolchain=$SR/usr" \
          LDFLAGS=-static

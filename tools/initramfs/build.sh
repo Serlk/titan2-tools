@@ -6,6 +6,8 @@
 # Alpine (aarch64) packages are downloaded to out/initramfs-dl and verified (APKINDEX signature,
 # control sha1, data sha256). OFFLINE=1: no network, only verify what is already downloaded.
 # Python runs in the titan2-kbuild container (python on the host is broken).
+# CLANG_DIR=<dir with bin/clang>: the clang for t2-reboot, as for scripts/build-mainline.sh
+# (default toolchains/clang-r574158); it runs in the container too.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 REL=${ALPINE_RELEASE:-v3.24}
@@ -35,14 +37,20 @@ else
 	T2_AUTHORIZED_KEYS=/work/out/initramfs-dl/none
 fi
 export T2_AUTHORIZED_KEYS
-run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" -e T2_AUTHORIZED_KEYS -e SOURCE_DATE_EPOCH titan2-kbuild "$@"; }
+CLANG_DIR=${CLANG_DIR:-$ROOT/toolchains/clang-r574158}
+CLANG_DIR=$(realpath -m "$CLANG_DIR")
+# mounted only when it exists (docker would create a missing directory as root)
+CLANG_MOUNT=()
+[ ! -d "$CLANG_DIR" ] || CLANG_MOUNT=(-v "$CLANG_DIR:/clang:ro")
+run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" "${CLANG_MOUNT[@]}" -e T2_AUTHORIZED_KEYS -e SOURCE_DATE_EPOCH titan2-kbuild "$@"; }
 run python3 -I /work/tools/initramfs/apk.py "$([ -n "${OFFLINE:-}" ] && echo list || echo fetch)" \
 	/work/out/initramfs-dl "$REL" $PKGS
-# t2-reboot: no libc (raw syscalls), clang from toolchains (as for the kernel); rebuilt when the
+# t2-reboot: no libc (raw syscalls), clang from CLANG_DIR (as for the kernel); rebuilt when the
 # source is newer
 T2R=$ROOT/tools/t2-reboot
 if [ ! -x "$T2R/t2-reboot" ] || [ "$T2R/t2-reboot.c" -nt "$T2R/t2-reboot" ]; then
-	run /work/toolchains/clang-r574158/bin/clang --target=aarch64-linux-gnu -Os -ffreestanding \
+	[ -x "$CLANG_DIR/bin/clang" ] || { echo "CLANG_DIR: no $CLANG_DIR/bin/clang (clang 21, see scripts/build-mainline.sh)" >&2; exit 1; }
+	run /clang/bin/clang --target=aarch64-linux-gnu -Os -ffreestanding \
 		-fno-stack-protector -fno-asynchronous-unwind-tables -nostdlib -static -fuse-ld=lld \
 		-Wl,--build-id=none -s -Wall -Werror -o /work/tools/t2-reboot/t2-reboot /work/tools/t2-reboot/t2-reboot.c
 fi

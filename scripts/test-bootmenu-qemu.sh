@@ -18,18 +18,25 @@
 # Success: a kernel line from earlycon (Android: Linux version 6.1; mainline: the Titan 2 model).
 # After that the kernels crash on virt (it is not the phone), as expected.
 #   ANDROID_BOOT=<boot.img> LK_FDT=<LK FDT> scripts/test-bootmenu-qemu.sh [android linux disk bootb recovery]
-#   (TITAN2_BOOT=<dir in the repo>, default titan2-boot; the mainline build in out/mainline-build)
+#   (TITAN2_BOOT=<dir in the repo>, default titan2-boot; the mainline build in out/mainline-build;
+#   CLANG_DIR=<dir with bin/clang> as for scripts/build-mainline.sh, default toolchains/clang-r574158)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 Q=out/bootmenu-qemu
 O=$ROOT/$Q
 SCEN=${*:-android linux disk bootb recovery}
 mkdir -p "$O" "$ROOT/out/initramfs-dl/debian-apt/archives/partial" "$ROOT/out/initramfs-dl/debian-apt/lists/partial"
-run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" titan2-kbuild "$@"; }
+CLANG_DIR=${CLANG_DIR:-$ROOT/toolchains/clang-r574158}
+[ -x "$CLANG_DIR/bin/clang" ] || { echo "CLANG_DIR: no $CLANG_DIR/bin/clang (clang 21, see scripts/build-mainline.sh)" >&2; exit 1; }
+CLANG_DIR=$(realpath "$CLANG_DIR")
+run() { docker run --rm -u "$(id -u):$(id -g)" -v "$ROOT:/work" -v "$CLANG_DIR:/clang:ro" titan2-kbuild "$@"; }
 
 TB=$ROOT/${TITAN2_BOOT:-titan2-boot}
 [ -n "${ANDROID_BOOT:-}" ] && [ -n "${LK_FDT:-}" ] || { echo "ANDROID_BOOT=<boot.img> and LK_FDT=<FDT of your phone> are required" >&2; exit 1; }
-make -s -C "$TB" qemu TOOLCHAIN="$ROOT/toolchains/clang-r574158" >/dev/null
+TB=$(realpath -m "$TB")
+case "$TB" in "$ROOT"/*) ;; *) echo "TITAN2_BOOT must be inside $ROOT" >&2; exit 1 ;; esac
+# in the build container (the toolchain at /clang): no host libraries needed for it
+run make -s -C "/work${TB#$ROOT}" qemu TOOLCHAIN=/clang >/dev/null
 ksize=$(od -An -t u4 -j 8 -N 4 "$ANDROID_BOOT" | tr -d ' ')
 dd if="$ANDROID_BOOT" of="$O/android.Image" iflag=skip_bytes,count_bytes skip=4096 count="$ksize" status=none
 : | cpio -o -H newc --quiet | gzip -9n >"$O/empty.cpio.gz"
