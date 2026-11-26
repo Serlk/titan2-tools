@@ -1,0 +1,74 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2 sensor hub calibration, boot step. The records live in a local
+# directory ($T2_SENSORS_CALI_STATE/cali); the nvcfg partition of the
+# Android install is never mounted (the system refuses to mount it): its
+# sensor/ is read with debugfs straight from the block device, read-only,
+# and a record is taken over only when there is no local copy or the nvcfg
+# file changed since the last import (t2-sensors-cali import). Then every
+# sensor gets its complete word list through hub_cali of the mtk-hf-iio
+# devices (t2-sensors-cali load), before iio-sensor-proxy enables any.
+# "rc-service t2-sensors-cali reimport" takes every nvcfg record again.
+description="Titan 2: send the sensor calibration records to the sensor hub"
+
+: "${T2_SENSORS_CALI_STATE:=/var/lib/titan2-sensors}"
+: "${T2_SENSORS_CALI_IMPORT:=yes}"
+: "${T2_SENSORS_CALI_LOAD:=yes}"
+: "${T2_SENSORS_CALI_WAIT:=60}"
+
+extra_started_commands="reimport"
+description_reimport="Take every record from nvcfg again (local learned values are replaced) and send them to the hub"
+
+depend() {
+	need localmount
+	after modules udev udev-trigger udev-settle
+	before iio-sensor-proxy
+}
+
+nvcfg_dev() {
+	local d=/dev/disk/by-partlabel/nvcfg
+	[ -b "$d" ] && { echo "$d"; return 0; }
+	d=$(blkid -t PARTLABEL=nvcfg -o device 2>/dev/null | head -n1)
+	[ -n "$d" ] && [ -b "$d" ] && { echo "$d"; return 0; }
+	return 1
+}
+
+cali_import() {	# [-F]
+	local dev
+	dev=$(nvcfg_dev) || { ewarn "no nvcfg partition: the local records stay as they are"; return 0; }
+	command -v debugfs >/dev/null || { ewarn "no debugfs (e2fsprogs-extra): no import from nvcfg"; return 0; }
+	/usr/bin/t2-sensors-cali import "$@" -p "$dev" -d "$T2_SENSORS_CALI_STATE/cali" \
+		-N "$T2_SENSORS_CALI_STATE/nvcfg" ||
+		ewarn "import from nvcfg failed: the local records stay as they are"
+}
+
+cali_load() {
+	ebegin "Sending the sensor calibration records to the hub"
+	/usr/bin/t2-sensors-cali load -d "$T2_SENSORS_CALI_STATE/cali" -w "$T2_SENSORS_CALI_WAIT"
+	case $? in
+	0) eend 0 ;;
+	2) ewarn "no hub sensors (mtk-hf-iio loaded? SCP up?)"; eend 0 ;;	# nothing to calibrate is no error
+	*) eend 1 "some sensors refused their record (dmesg | grep mtk-hf-iio)" ;;
+	esac
+}
+
+start() {
+	checkpath -d -m 0755 "$T2_SENSORS_CALI_STATE" "$T2_SENSORS_CALI_STATE/cali" "$T2_SENSORS_CALI_STATE/nvcfg"
+	yesno "$T2_SENSORS_CALI_IMPORT" && cali_import
+	yesno "$T2_SENSORS_CALI_LOAD" || { einfo "loading off (T2_SENSORS_CALI_LOAD=no)"; return 0; }
+	cali_load
+}
+
+reimport() {
+	local saver=
+	# the writer first writes what it holds, so the import is not overwritten afterwards
+	if rc-service -q t2-sensors-calisave status 2>/dev/null; then
+		saver=1
+		rc-service t2-sensors-calisave stop
+	fi
+	cali_import -F
+	cali_load
+	[ -z "$saver" ] || rc-service t2-sensors-calisave start
+}

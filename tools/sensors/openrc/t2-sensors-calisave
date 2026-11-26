@@ -1,0 +1,41 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+#
+# Titan 2 sensor hub calibration, write-back: t2-sensors-cali watch listens on
+# /dev/hf_manager for the BIAS/TEMP/CALI results the hub reports (gyroscope
+# bias, magnetometer hard-iron offset, results of a calibration run) and
+# rewrites the LOCAL records ($T2_SENSORS_CALI_STATE/cali; never nvcfg), at
+# most every T2_SENSORS_CALI_INTERVAL seconds per record and once more when it
+# stops. On by default; T2_SENSORS_CALI_WRITEBACK=no in
+# /etc/conf.d/t2-sensors-cali turns it off.
+description="Titan 2: keep what the sensor hub learns in the local calibration records"
+
+[ -r /etc/conf.d/t2-sensors-cali ] && . /etc/conf.d/t2-sensors-cali
+: "${T2_SENSORS_CALI_STATE:=/var/lib/titan2-sensors}"
+: "${T2_SENSORS_CALI_WRITEBACK:=yes}"
+: "${T2_SENSORS_CALI_INTERVAL:=600}"
+
+command=/usr/bin/t2-sensors-cali
+command_args="watch -d $T2_SENSORS_CALI_STATE/cali -i $T2_SENSORS_CALI_INTERVAL"
+supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=5
+respawn_period=600
+pidfile=/run/t2-sensors-calisave.pid
+# the writer flushes what it has on SIGTERM: give it time
+retry="TERM/10/KILL/5"
+
+depend() {
+	need t2-sensors-cali
+	after iio-sensor-proxy
+}
+
+start_pre() {
+	if ! yesno "$T2_SENSORS_CALI_WRITEBACK"; then
+		eerror "write-back is off (T2_SENSORS_CALI_WRITEBACK=no in /etc/conf.d/t2-sensors-cali)"
+		return 1
+	fi
+	checkpath -d -m 0755 "$T2_SENSORS_CALI_STATE/cali"
+	[ -c /dev/hf_manager ] || { eerror "no /dev/hf_manager (hf_manager module)"; return 1; }
+}

@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# boot: import + load of the records; default: the writer that keeps what the hub learns
+rc-update add t2-sensors-cali boot >/dev/null 2>&1 || true
+rc-update add t2-sensors-calisave default >/dev/null 2>&1 || true
+exit 0

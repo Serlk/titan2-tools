@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Maintainer: serlk <22211586+Serlk@users.noreply.github.com>
+# Titan 2 sensors (SCP sensor hub -> mtk-hf-iio -> IIO): udev rules for iio-sensor-proxy and the
+# calibration records of the hub (t2-sensors-cali: read-only import from the nvcfg partition with
+# debugfs into /var/lib/titan2-sensors, boot-time load into the hub, write-back of what the hub
+# learns into the local copy; OpenRC t2-sensors-cali, t2-sensors-calisave).
+# Built by scripts/build-atl.sh build titan2-sensors from tools/sensors (tarball made there).
+pkgname=titan2-sensors
+pkgver=0.1
+pkgrel=0
+pkgdesc="Unihertz Titan 2 sensors: udev rules and sensor hub calibration loader"
+url="https://github.com/Serlk/titan2-tools"
+arch="aarch64"
+license="GPL-2.0-or-later"
+# debugfs (e2fsprogs-extra) reads nvcfg without mounting it; blkid finds the partition when
+# /dev/disk/by-partlabel is missing
+depends="openrc iio-sensor-proxy e2fsprogs-extra blkid"
+makedepends="linux-headers"
+install="$pkgname.post-install"
+options="!check"
+source="titan2-sensors.tar.gz"
+builddir="$srcdir/sensors"
+
+build() {
+	# the tarball is packed from the working tree: drop host builds that may be in it
+	make clean
+	make
+}
+
+package() {
+	make DESTDIR="$pkgdir" PREFIX=/usr install
+}
+
+sha512sums="
+"

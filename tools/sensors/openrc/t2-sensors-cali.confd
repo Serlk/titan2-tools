@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# /etc/conf.d/t2-sensors-cali: calibration records of the sensor hub
+# (services t2-sensors-cali and t2-sensors-calisave; CALIBRATION.md)
+
+# local state: cali/ = the records used and updated here, nvcfg/ = byte copies of what
+# the last import took from the nvcfg partition (the import rule compares against them)
+#T2_SENSORS_CALI_STATE=/var/lib/titan2-sensors
+
+# at boot, import records from nvcfg (read-only with debugfs, nothing is mounted): a record
+# is taken when there is no local copy or the nvcfg file changed since the last import
+# (the Android install wrote it); otherwise the local copy, with what was learned here,
+# stays. "rc-service t2-sensors-cali reimport" takes every nvcfg record again.
+#T2_SENSORS_CALI_IMPORT=yes
+
+# send the local records to the hub at boot
+#T2_SENSORS_CALI_LOAD=yes
+
+# seconds the boot step waits for the hub's IIO devices (the SCP firmware may be slow)
+#T2_SENSORS_CALI_WAIT=60
+
+# keep what the hub learns (gyroscope bias, magnetometer offset, calibration results) in
+# the local records (service t2-sensors-calisave); nvcfg is never written
+#T2_SENSORS_CALI_WRITEBACK=yes
+
+# least seconds between two rewrites of a record that the hub keeps updating (the
+# gyroscope bias arrives every couple of seconds while the gyroscope runs); all
+# pending values are also written when the service stops. Keep it at 60 or more.
+#T2_SENSORS_CALI_INTERVAL=600
