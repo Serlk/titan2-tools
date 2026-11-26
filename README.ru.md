@@ -155,6 +155,16 @@ i2c-tools, evtest, musl и другие) и проверяет их подпис
 репозитории камер, отпечатка и GNSS), есть только в английском [README.md](README.md):
 разделы «Since alpha1» и «Related repositories».
 
+Коротко о добавленном к 26.11.2026: плагин ModemManager показывает обе SIM как два модема
+(DSDS) и шлёт стартовые запросы LTE; служба модема проверяет рабочую копию NVRAM перед
+стартом; межсетевой экран (ufw, снаружи открыт только SSH
+по USB); t2-powerd следит за батареей; настройки GPU для плавности (нижняя частота, syncobj).
+
+- **Android-приложения (ATL)**: наши патчи к Android Translation Layer (`patches/android-translation-layer`, GPL-3.0-only,
+  как у ATL), исправления wolfSSL JNI в art_standalone, инструменты `tools/atl` (пакеты `titan2-atl-tools`,
+  `titan2-art-wolfssljni`), сборка `scripts/build-atl.sh`, стенд ВМ `scripts/atl-vm.sh`, ключ образа `ATL=1`.
+  APK и компонентов Google/microG в репозитории нет. Состояние и сборка: tools/atl/README.md (на английском).
+
 ## Связанные репозитории
 
 - [titan2-linux](https://github.com/Serlk/titan2-linux): ядро, ветка `titan2`. Ядерные части камеры, отпечатка и GNSS в него не входят: это серии патчей в `kernel/patches/` их собственных репозиториев (`git am` поверх `titan2`).
